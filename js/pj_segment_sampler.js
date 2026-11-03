@@ -21,13 +21,22 @@ const WIDGET_LABELS = {
     "seg2_seed_offset": "第2段种子偏移",
     "seg3_seed_offset": "第3段种子偏移",
     "seg4_seed_offset": "第4段种子偏移",
+    "seg5_seed_offset": "第5段种子偏移",
+    "seg6_seed_offset": "第6段种子偏移",
+    "seg7_seed_offset": "第7段种子偏移",
+    "seg8_seed_offset": "第8段种子偏移",
 
     // 运行重抽与缓存锁
     "run_mode": "运行重抽模式",
+    "custom_rerun_segments": "自定义重抽段号",
     "seg1_lock": "锁定第1段",
     "seg2_lock": "锁定第2段",
     "seg3_lock": "锁定第3段",
     "seg4_lock": "锁定第4段",
+    "seg5_lock": "锁定第5段",
+    "seg6_lock": "锁定第6段",
+    "seg7_lock": "锁定第7段",
+    "seg8_lock": "锁定第8段",
 
     // 算法与系统控制
     "blend_mode": "平滑过渡算法",
@@ -141,7 +150,7 @@ function localizeAndSanitizeNode(node, isFirstPass) {
                 }
             }
 
-            // 清洗与汉化 run_mode (防止旧工作流残留布尔值 true/false)
+            // 清洗与汉化 run_mode (支持到第8段及自定义输入)
             if (w.name === "run_mode") {
                 if (w.value === true || w.value === "true" || w.value === false || w.value === "false" || typeof w.value === "boolean") {
                     w.value = isFirstPass ? "智能缓存(仅重跑未锁定分段)" : "全部精修(刷新全部缓存)";
@@ -153,14 +162,24 @@ function localizeAndSanitizeNode(node, isFirstPass) {
                         "仅重抽第1段",
                         "仅重抽第2段",
                         "仅重抽第3段",
-                        "仅重抽第4段"
+                        "仅重抽第4段",
+                        "仅重抽第5段",
+                        "仅重抽第6段",
+                        "仅重抽第7段",
+                        "仅重抽第8段",
+                        "自定义指定分段(下方输入)"
                     ] : [
                         "智能缓存(仅重跑未锁定分段)",
                         "全部精修(刷新全部缓存)",
                         "仅精修第1段",
                         "仅精修第2段",
                         "仅精修第3段",
-                        "仅精修第4段"
+                        "仅精修第4段",
+                        "仅精修第5段",
+                        "仅精修第6段",
+                        "仅精修第7段",
+                        "仅精修第8段",
+                        "自定义指定分段(下方输入)"
                     ];
                 }
             }
@@ -221,12 +240,14 @@ function updateFirstPassVisibility(node) {
 
     const modeWidget = node.widgets.find(w => w.name === "split_mode");
     const runModeWidget = node.widgets.find(w => w.name === "run_mode");
+    const customRerun = node.widgets.find(w => w.name === "custom_rerun_segments");
 
     const chunkSec = node.widgets.find(w => w.name === "chunk_seconds");
     const overlapSec = node.widgets.find(w => w.name === "overlap_seconds");
     const numSeg = node.widgets.find(w => w.name === "num_segments");
     const customCuts = node.widgets.find(w => w.name === "custom_cuts");
 
+    let maxSeg = 8;
     if (modeWidget) {
         const mode = modeWidget.value;
         if (mode === "按秒自动切分" || mode === "auto_by_seconds") {
@@ -234,76 +255,62 @@ function updateFirstPassVisibility(node) {
             toggleWidget(node, overlapSec, true);
             toggleWidget(node, numSeg, false);
             toggleWidget(node, customCuts, false);
+            maxSeg = 8;
         } else if (mode === "固定分段数" || mode === "fixed_segments") {
             toggleWidget(node, chunkSec, false);
             toggleWidget(node, overlapSec, true);
             toggleWidget(node, numSeg, true);
             toggleWidget(node, customCuts, false);
+            maxSeg = Math.min(8, Math.max(1, parseInt(numSeg?.value) || 8));
         } else if (mode === "自定义切点" || mode === "custom_cuts") {
             toggleWidget(node, chunkSec, false);
             toggleWidget(node, overlapSec, false);
             toggleWidget(node, numSeg, false);
             toggleWidget(node, customCuts, true);
+            maxSeg = 8;
         }
     }
 
-    if (runModeWidget) {
-        const runMode = runModeWidget.value;
-        const seg1Lock = node.widgets.find(w => w.name === "seg1_lock");
-        const seg1Offset = node.widgets.find(w => w.name === "seg1_seed_offset");
-        const seg2Lock = node.widgets.find(w => w.name === "seg2_lock");
-        const seg2Offset = node.widgets.find(w => w.name === "seg2_seed_offset");
-        const seg3Lock = node.widgets.find(w => w.name === "seg3_lock");
-        const seg3Offset = node.widgets.find(w => w.name === "seg3_seed_offset");
-        const seg4Lock = node.widgets.find(w => w.name === "seg4_lock");
-        const seg4Offset = node.widgets.find(w => w.name === "seg4_seed_offset");
+    const segLocks = [];
+    const segOffsets = [];
+    for (let i = 1; i <= 8; i++) {
+        segLocks.push(node.widgets.find(w => w.name === `seg${i}_lock`));
+        segOffsets.push(node.widgets.find(w => w.name === `seg${i}_seed_offset`));
+    }
 
-        if (runMode === "仅重抽第1段") {
-            toggleWidget(node, seg1Lock, false);
-            toggleWidget(node, seg1Offset, true);
-            toggleWidget(node, seg2Lock, false);
-            toggleWidget(node, seg2Offset, false);
-            toggleWidget(node, seg3Lock, false);
-            toggleWidget(node, seg3Offset, false);
-            toggleWidget(node, seg4Lock, false);
-            toggleWidget(node, seg4Offset, false);
-        } else if (runMode === "仅重抽第2段") {
-            toggleWidget(node, seg1Lock, false);
-            toggleWidget(node, seg1Offset, false);
-            toggleWidget(node, seg2Lock, false);
-            toggleWidget(node, seg2Offset, true);
-            toggleWidget(node, seg3Lock, false);
-            toggleWidget(node, seg3Offset, false);
-            toggleWidget(node, seg4Lock, false);
-            toggleWidget(node, seg4Offset, false);
-        } else if (runMode === "仅重抽第3段") {
-            toggleWidget(node, seg1Lock, false);
-            toggleWidget(node, seg1Offset, false);
-            toggleWidget(node, seg2Lock, false);
-            toggleWidget(node, seg2Offset, false);
-            toggleWidget(node, seg3Lock, false);
-            toggleWidget(node, seg3Offset, true);
-            toggleWidget(node, seg4Lock, false);
-            toggleWidget(node, seg4Offset, false);
+    if (runModeWidget) {
+        const runMode = String(runModeWidget.value || "");
+
+        if (runMode.includes("自定义")) {
+            // 自定义模式：显示输入框，隐藏所有锁定开关
+            toggleWidget(node, customRerun, true);
+            for (let i = 0; i < 8; i++) {
+                toggleWidget(node, segLocks[i], false);
+                toggleWidget(node, segOffsets[i], i < maxSeg);
+            }
+        } else if (runMode.startsWith("仅重抽第")) {
+            // 单段重抽：隐藏所有锁定，仅显示当前指定分段的独立种子偏移
+            toggleWidget(node, customRerun, false);
+            const targetSeg = parseInt(runMode.replace("仅重抽第", "").replace("段", "").trim()) || 1;
+            for (let i = 0; i < 8; i++) {
+                toggleWidget(node, segLocks[i], false);
+                toggleWidget(node, segOffsets[i], (i + 1) === targetSeg);
+            }
         } else if (runMode === "全部重新采样(刷新全部缓存)") {
-            toggleWidget(node, seg1Lock, false);
-            toggleWidget(node, seg1Offset, true);
-            toggleWidget(node, seg2Lock, false);
-            toggleWidget(node, seg2Offset, true);
-            toggleWidget(node, seg3Lock, false);
-            toggleWidget(node, seg3Offset, true);
-            toggleWidget(node, seg4Lock, false);
-            toggleWidget(node, seg4Offset, true);
+            // 全重抽：隐藏所有锁定，显示所有有效段的种子偏移
+            toggleWidget(node, customRerun, false);
+            for (let i = 0; i < 8; i++) {
+                toggleWidget(node, segLocks[i], false);
+                toggleWidget(node, segOffsets[i], i < maxSeg);
+            }
         } else {
-            // 智能缓存模式
-            toggleWidget(node, seg1Lock, true);
-            toggleWidget(node, seg1Offset, true);
-            toggleWidget(node, seg2Lock, true);
-            toggleWidget(node, seg2Offset, true);
-            toggleWidget(node, seg3Lock, true);
-            toggleWidget(node, seg3Offset, true);
-            toggleWidget(node, seg4Lock, true);
-            toggleWidget(node, seg4Offset, true);
+            // 智能缓存模式：显示对应分段数量以内的锁定与种子偏移
+            toggleWidget(node, customRerun, false);
+            for (let i = 0; i < 8; i++) {
+                const show = i < maxSeg;
+                toggleWidget(node, segLocks[i], show);
+                toggleWidget(node, segOffsets[i], show);
+            }
         }
     }
 
@@ -320,12 +327,14 @@ function updateSecondPassVisibility(node) {
 
     const modeWidget = node.widgets.find(w => w.name === "split_mode");
     const runModeWidget = node.widgets.find(w => w.name === "run_mode");
+    const customRerun = node.widgets.find(w => w.name === "custom_rerun_segments");
 
     const chunkSec = node.widgets.find(w => w.name === "chunk_seconds");
     const overlapSec = node.widgets.find(w => w.name === "overlap_seconds");
     const numSeg = node.widgets.find(w => w.name === "num_segments");
     const customCuts = node.widgets.find(w => w.name === "custom_cuts");
 
+    let maxSeg = 8;
     if (modeWidget) {
         const mode = modeWidget.value;
         if (mode === "按秒自动切分" || mode === "auto_by_seconds") {
@@ -333,42 +342,48 @@ function updateSecondPassVisibility(node) {
             toggleWidget(node, overlapSec, true);
             toggleWidget(node, numSeg, false);
             toggleWidget(node, customCuts, false);
+            maxSeg = 8;
         } else if (mode === "固定分段数" || mode === "fixed_segments") {
             toggleWidget(node, chunkSec, false);
             toggleWidget(node, overlapSec, true);
             toggleWidget(node, numSeg, true);
             toggleWidget(node, customCuts, false);
+            maxSeg = Math.min(8, Math.max(1, parseInt(numSeg?.value) || 8));
         } else if (mode === "自定义切点" || mode === "custom_cuts") {
             toggleWidget(node, chunkSec, false);
             toggleWidget(node, overlapSec, false);
             toggleWidget(node, numSeg, false);
             toggleWidget(node, customCuts, true);
+            maxSeg = 8;
         }
     }
 
-    if (runModeWidget) {
-        const runMode = runModeWidget.value;
-        const seg1Lock = node.widgets.find(w => w.name === "seg1_lock");
-        const seg2Lock = node.widgets.find(w => w.name === "seg2_lock");
-        const seg3Lock = node.widgets.find(w => w.name === "seg3_lock");
-        const seg4Lock = node.widgets.find(w => w.name === "seg4_lock");
+    const segLocks = [];
+    for (let i = 1; i <= 8; i++) {
+        segLocks.push(node.widgets.find(w => w.name === `seg${i}_lock`));
+    }
 
-        if (runMode === "全部精修(刷新全部缓存)") {
-            toggleWidget(node, seg1Lock, false);
-            toggleWidget(node, seg2Lock, false);
-            toggleWidget(node, seg3Lock, false);
-            toggleWidget(node, seg4Lock, false);
-        } else if (runMode === "仅精修第1段" || runMode === "仅精修第2段" || runMode === "仅精修第3段" || runMode === "仅精修第4段") {
-            toggleWidget(node, seg1Lock, false);
-            toggleWidget(node, seg2Lock, false);
-            toggleWidget(node, seg3Lock, false);
-            toggleWidget(node, seg4Lock, false);
+    if (runModeWidget) {
+        const runMode = String(runModeWidget.value || "");
+
+        if (runMode.includes("自定义")) {
+            // 自定义模式：显示输入框，隐藏所有锁定开关
+            toggleWidget(node, customRerun, true);
+            for (let i = 0; i < 8; i++) {
+                toggleWidget(node, segLocks[i], false);
+            }
+        } else if (runMode.startsWith("仅精修第") || runMode === "全部精修(刷新全部缓存)") {
+            // 单段或全部精修：隐藏锁定开关
+            toggleWidget(node, customRerun, false);
+            for (let i = 0; i < 8; i++) {
+                toggleWidget(node, segLocks[i], false);
+            }
         } else {
-            // 智能缓存模式
-            toggleWidget(node, seg1Lock, true);
-            toggleWidget(node, seg2Lock, true);
-            toggleWidget(node, seg3Lock, true);
-            toggleWidget(node, seg4Lock, true);
+            // 智能缓存模式：显示对应分段数量以内的锁定开关
+            toggleWidget(node, customRerun, false);
+            for (let i = 0; i < 8; i++) {
+                toggleWidget(node, segLocks[i], i < maxSeg);
+            }
         }
     }
 
@@ -387,6 +402,17 @@ function attachFirstPassHandlers(node) {
         modeWidget._pj_attached = true;
         const origCallback = modeWidget.callback;
         modeWidget.callback = function () {
+            const res = origCallback?.apply(this, arguments);
+            updateFirstPassVisibility(node);
+            return res;
+        };
+    }
+
+    const numSegWidget = node.widgets.find(w => w.name === "num_segments");
+    if (numSegWidget && !numSegWidget._pj_attached) {
+        numSegWidget._pj_attached = true;
+        const origCallback = numSegWidget.callback;
+        numSegWidget.callback = function () {
             const res = origCallback?.apply(this, arguments);
             updateFirstPassVisibility(node);
             return res;
@@ -418,6 +444,17 @@ function attachSecondPassHandlers(node) {
         modeWidget._pj_attached = true;
         const origCallback = modeWidget.callback;
         modeWidget.callback = function () {
+            const res = origCallback?.apply(this, arguments);
+            updateSecondPassVisibility(node);
+            return res;
+        };
+    }
+
+    const numSegWidget = node.widgets.find(w => w.name === "num_segments");
+    if (numSegWidget && !numSegWidget._pj_attached) {
+        numSegWidget._pj_attached = true;
+        const origCallback = numSegWidget.callback;
+        numSegWidget.callback = function () {
             const res = origCallback?.apply(this, arguments);
             updateSecondPassVisibility(node);
             return res;

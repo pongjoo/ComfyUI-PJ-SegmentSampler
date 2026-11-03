@@ -145,10 +145,23 @@ class PJ_FirstPass_SegmentSampler:
                         "仅重抽第2段",
                         "仅重抽第3段",
                         "仅重抽第4段",
+                        "仅重抽第5段",
+                        "仅重抽第6段",
+                        "仅重抽第7段",
+                        "仅重抽第8段",
+                        "自定义指定分段(下方输入)",
                     ],
                     {
                         "default": "智能缓存(仅重跑未锁定分段)",
                         "tooltip": "【重抽控制台】哪段一采不满意直接选该段单独重抽，其余段0秒提取缓存，极速出片！",
+                    },
+                ),
+                "custom_rerun_segments": (
+                    "STRING",
+                    {
+                        "default": "5",
+                        "multiline": False,
+                        "tooltip": "自定义重抽分段编号，支持单段或多段逗号分隔，例如：5 或 2, 5, 7",
                     },
                 ),
                 "base_seed": (
@@ -189,6 +202,38 @@ class PJ_FirstPass_SegmentSampler:
                     {"default": 3, "min": 0, "max": 999999, "step": 1, "tooltip": "第4段种子偏移"},
                 ),
                 "seg4_lock": (
+                    "BOOLEAN",
+                    {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "打勾锁定后跳过计算，0秒读缓存"},
+                ),
+                "seg5_seed_offset": (
+                    "INT",
+                    {"default": 4, "min": 0, "max": 999999, "step": 1, "tooltip": "第5段种子偏移"},
+                ),
+                "seg5_lock": (
+                    "BOOLEAN",
+                    {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "打勾锁定后跳过计算，0秒读缓存"},
+                ),
+                "seg6_seed_offset": (
+                    "INT",
+                    {"default": 5, "min": 0, "max": 999999, "step": 1, "tooltip": "第6段种子偏移"},
+                ),
+                "seg6_lock": (
+                    "BOOLEAN",
+                    {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "打勾锁定后跳过计算，0秒读缓存"},
+                ),
+                "seg7_seed_offset": (
+                    "INT",
+                    {"default": 6, "min": 0, "max": 999999, "step": 1, "tooltip": "第7段种子偏移"},
+                ),
+                "seg7_lock": (
+                    "BOOLEAN",
+                    {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "打勾锁定后跳过计算，0秒读缓存"},
+                ),
+                "seg8_seed_offset": (
+                    "INT",
+                    {"default": 7, "min": 0, "max": 999999, "step": 1, "tooltip": "第8段种子偏移"},
+                ),
+                "seg8_lock": (
                     "BOOLEAN",
                     {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "打勾锁定后跳过计算，0秒读缓存"},
                 ),
@@ -335,6 +380,7 @@ class PJ_FirstPass_SegmentSampler:
         align_51_frames=False,
         sync_ref_video=True,
         run_mode="智能缓存(仅重跑未锁定分段)",
+        custom_rerun_segments="5",
         base_seed=0,
         seg1_seed_offset=0,
         seg1_lock=False,
@@ -344,6 +390,14 @@ class PJ_FirstPass_SegmentSampler:
         seg3_lock=False,
         seg4_seed_offset=3,
         seg4_lock=False,
+        seg5_seed_offset=4,
+        seg5_lock=False,
+        seg6_seed_offset=5,
+        seg6_lock=False,
+        seg7_seed_offset=6,
+        seg7_lock=False,
+        seg8_seed_offset=7,
+        seg8_lock=False,
         blend_mode="余弦平滑(推荐)",
         unload_model_after_sampling=False,
         fps=24.0,
@@ -397,8 +451,14 @@ class PJ_FirstPass_SegmentSampler:
         print("=" * 65)
 
         # Segment control configuration
-        locks = [seg1_lock, seg2_lock, seg3_lock, seg4_lock]
-        offsets = [seg1_seed_offset, seg2_seed_offset, seg3_seed_offset, seg4_seed_offset]
+        locks = [
+            seg1_lock, seg2_lock, seg3_lock, seg4_lock,
+            seg5_lock, seg6_lock, seg7_lock, seg8_lock
+        ]
+        offsets = [
+            seg1_seed_offset, seg2_seed_offset, seg3_seed_offset, seg4_seed_offset,
+            seg5_seed_offset, seg6_seed_offset, seg7_seed_offset, seg8_seed_offset
+        ]
 
         # Resolve effective base seed
         seed_val = getattr(noise, "seed", None)
@@ -431,6 +491,12 @@ class PJ_FirstPass_SegmentSampler:
             elif run_mode.startswith("仅重抽第"):
                 target_seg_num = int(run_mode.replace("仅重抽第", "").replace("段", "").strip())
                 should_resample = (idx + 1) == target_seg_num
+            elif "自定义" in run_mode:
+                try:
+                    targets = [int(s.strip()) for s in str(custom_rerun_segments).split(",") if s.strip().isdigit()]
+                    should_resample = (idx + 1) in targets
+                except Exception:
+                    should_resample = True
             elif run_mode == "智能缓存(仅重跑未锁定分段)":
                 if seg_lock and cache_key in _FIRST_PASS_CACHE:
                     should_resample = False

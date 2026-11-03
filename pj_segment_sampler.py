@@ -90,16 +90,29 @@ class PJ_SegmentSampler:
                 ),
                 "run_mode": (
                     [
-                        "全部精修(刷新全部缓存)",
                         "智能缓存(仅重跑未锁定分段)",
+                        "全部精修(刷新全部缓存)",
                         "仅精修第1段",
                         "仅精修第2段",
                         "仅精修第3段",
                         "仅精修第4段",
+                        "仅精修第5段",
+                        "仅精修第6段",
+                        "仅精修第7段",
+                        "仅精修第8段",
+                        "自定义指定分段(下方输入)",
                     ],
                     {
                         "default": "智能缓存(仅重跑未锁定分段)",
                         "tooltip": "二采精修控制台：可选择只对某一段进行二采重采样，其余段直接从缓存复用",
+                    },
+                ),
+                "custom_rerun_segments": (
+                    "STRING",
+                    {
+                        "default": "5",
+                        "multiline": False,
+                        "tooltip": "自定义重抽分段编号，支持单段或多段逗号分隔，例如：5 或 2, 5, 7",
                     },
                 ),
                 "seg1_lock": (
@@ -117,6 +130,22 @@ class PJ_SegmentSampler:
                 "seg4_lock": (
                     "BOOLEAN",
                     {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "打勾后，跳过第4段二采计算直接读缓存"},
+                ),
+                "seg5_lock": (
+                    "BOOLEAN",
+                    {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "打勾后，跳过第5段二采计算直接读缓存"},
+                ),
+                "seg6_lock": (
+                    "BOOLEAN",
+                    {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "打勾后，跳过第6段二采计算直接读缓存"},
+                ),
+                "seg7_lock": (
+                    "BOOLEAN",
+                    {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "打勾后，跳过第7段二采计算直接读缓存"},
+                ),
+                "seg8_lock": (
+                    "BOOLEAN",
+                    {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "打勾后，跳过第8段二采计算直接读缓存"},
                 ),
                 "blend_mode": (
                     ["余弦平滑(推荐)", "线性过渡", "硬切"],
@@ -269,10 +298,15 @@ class PJ_SegmentSampler:
         custom_cuts="0-8, 6-14, 12-20",
         align_51_frames=False,
         run_mode="全部精修(刷新全部缓存)",
+        custom_rerun_segments="5",
         seg1_lock=False,
         seg2_lock=False,
         seg3_lock=False,
         seg4_lock=False,
+        seg5_lock=False,
+        seg6_lock=False,
+        seg7_lock=False,
+        seg8_lock=False,
         blend_mode="余弦平滑(推荐)",
         keep_original_audio=True,
         unload_model_after_sampling=True,
@@ -333,7 +367,10 @@ class PJ_SegmentSampler:
             print(f"  - 分段 {i + 1}/{n_chunks}: 视频潜空间 [{vs}:{ve}], 音频 [{as_}:{ae}]")
         print("=" * 65)
 
-        locks = [seg1_lock, seg2_lock, seg3_lock, seg4_lock]
+        locks = [
+            seg1_lock, seg2_lock, seg3_lock, seg4_lock,
+            seg5_lock, seg6_lock, seg7_lock, seg8_lock
+        ]
 
         # Generate global noise
         global_noise = noise.generate_noise(latent)
@@ -360,6 +397,12 @@ class PJ_SegmentSampler:
             elif run_mode.startswith("仅精修第"):
                 target_seg_num = int(run_mode.replace("仅精修第", "").replace("段", "").strip())
                 should_resample = (idx + 1) == target_seg_num
+            elif "自定义" in run_mode:
+                try:
+                    targets = [int(s.strip()) for s in str(custom_rerun_segments).split(",") if s.strip().isdigit()]
+                    should_resample = (idx + 1) in targets
+                except Exception:
+                    should_resample = True
             elif run_mode == "智能缓存(仅重跑未锁定分段)":
                 if seg_lock and cache_key in _SECOND_PASS_CACHE:
                     should_resample = False
