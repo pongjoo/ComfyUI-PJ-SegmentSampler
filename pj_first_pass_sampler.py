@@ -106,7 +106,7 @@ class PJ_FirstPass_SegmentSampler:
                     {
                         "default": 3,
                         "min": 2,
-                        "max": 10,
+                        "max": 20,
                         "step": 1,
                         "tooltip": "固定分段数模式下的切分数量",
                     },
@@ -149,6 +149,10 @@ class PJ_FirstPass_SegmentSampler:
                         "仅重抽第6段",
                         "仅重抽第7段",
                         "仅重抽第8段",
+                        "仅重抽第9段",
+                        "仅重抽第10段",
+                        "仅重抽第11段",
+                        "仅重抽第12段",
                         "自定义指定分段(下方输入)",
                     ],
                     {
