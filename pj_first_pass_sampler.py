@@ -120,12 +120,12 @@ class PJ_FirstPass_SegmentSampler:
                     },
                 ),
                 "run_mode": (
-                    ["智能缓存(仅重跑未锁定分段)", "全部重新采样(刷新全部缓存)"]
+                    ["智能缓存(仅重跑未锁定分段)", "整段全量采样(一采不分段)", "全部重新采样(刷新全部缓存)"]
                     + [f"仅重抽第{i}段" for i in range(1, 21)]
                     + ["按缺陷秒数重抽 (下方输入秒数)", "自定义指定分段(下方输入)"],
                     {
                         "default": "智能缓存(仅重跑未锁定分段)",
-                        "tooltip": "【重抽控制台】哪段一采不满意直接选该段单独重抽，其余段0秒提取缓存，极速出片！",
+                        "tooltip": "【重抽控制台】哪段一采不满意直接选该段单独重抽；若选【整段全量采样(一采不分段)】则一采一口气整段生成！",
                     },
                 ),
                 "target_time_second": (
@@ -372,7 +372,12 @@ class PJ_FirstPass_SegmentSampler:
 
         # Plan chunks (优先从上游【PJ分段规划器】总线继承，保证绝对时序统一)
         fps = 24.0
-        if segment_plan is not None and isinstance(segment_plan, dict) and "chunks" in segment_plan:
+        if "不分段" in str(run_mode) or "全量采样" in str(run_mode):
+            chunks = [(0, total_v, 0, total_a)]
+            if segment_plan is not None and isinstance(segment_plan, dict) and "fps" in segment_plan and segment_plan["fps"]:
+                fps = float(segment_plan["fps"])
+            print(f"[PJ一采分段采样器] 🚀 当前处于【整段全量采样(一采不分段)】模式，全量采样整段潜空间 (0~{total_v}潜步)，不进行切片！")
+        elif segment_plan is not None and isinstance(segment_plan, dict) and "chunks" in segment_plan:
             chunks = segment_plan["chunks"]
             if "fps" in segment_plan and segment_plan["fps"]:
                 fps = float(segment_plan["fps"])

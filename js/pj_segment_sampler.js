@@ -276,6 +276,7 @@ function syncSamplerSegmentCount(node, isFirstPass) {
 
         const newOptions = [
             "智能缓存(仅重跑未锁定分段)",
+            ...(isFirstPass ? ["整段全量采样(一采不分段)"] : []),
             allAction,
             ...Array.from({ length: maxSeg }, (_, i) => `${prefix}${i + 1}段`),
             defectAction,
@@ -299,12 +300,12 @@ function syncSamplerSegmentCount(node, isFirstPass) {
     toggleWidget(node, customRerun, runMode.includes("自定义"));
     toggleWidget(node, targetTime, runMode.includes("缺陷秒数"));
 
-    // 关键修正：1~maxSeg 的锁定开关始终显示！无论在任何模式下，用户都能直观看到并控制当前所有分段！
+    // 关键修正：1~maxSeg 的锁定开关始终显示（整段不分段模式除外）
     for (let i = 1; i <= 20; i++) {
         const lockW = node.widgets?.find(w => w.name === `seg${i}_lock`);
         const offsetW = node.widgets?.find(w => w.name === `seg${i}_seed_offset`);
 
-        const inRange = i <= maxSeg;
+        const inRange = (isFirstPass && runMode.includes("不分段")) ? false : (i <= maxSeg);
 
         // 锁定开关：在当前分段数内始终展示，超出部分严格隐藏
         toggleWidget(node, lockW, inRange);
@@ -324,9 +325,12 @@ function ensureSyncButton(node, isFirstPass) {
 
     const isConnected = isSegmentPlanConnected(node);
     const maxSeg = resolveTargetSegmentCount(node);
-    const targetBtnName = isConnected
-        ? `🔗 读取规划器参数 (当前共 ${maxSeg} 段)`
-        : `🔄 读取规划参数 (当前共 ${maxSeg} 段)`;
+    const runModeVal = String(node.widgets?.find(w => w.name === "run_mode")?.value || "");
+    const targetBtnName = (isFirstPass && runModeVal.includes("不分段"))
+        ? `⚡ 一采当前为整段采样模式 (共 1 整段)`
+        : (isConnected
+            ? `🔗 读取规划器参数 (当前共 ${maxSeg} 段)`
+            : `🔄 读取规划参数 (当前共 ${maxSeg} 段)`);
 
     const handleButtonClick = (widget) => {
         syncSamplerSegmentCount(node, isFirstPass);
