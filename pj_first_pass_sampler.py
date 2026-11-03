@@ -377,11 +377,23 @@ class PJ_FirstPass_SegmentSampler:
             if segment_plan is not None and isinstance(segment_plan, dict) and "fps" in segment_plan and segment_plan["fps"]:
                 fps = float(segment_plan["fps"])
             print(f"[PJ一采分段采样器] 🚀 当前处于【整段全量采样(一采不分段)】模式，全量采样整段潜空间 (0~{total_v}潜步)，不进行切片！")
-        elif segment_plan is not None and isinstance(segment_plan, dict) and "chunks" in segment_plan:
-            chunks = segment_plan["chunks"]
-            if "fps" in segment_plan and segment_plan["fps"]:
-                fps = float(segment_plan["fps"])
-            print(f"[PJ一采分段采样器] 🔗 成功读取上游【PJ分段规划器】总线，直接继承 {len(chunks)} 个切片分段 (FPS: {fps})！")
+        elif segment_plan is not None and isinstance(segment_plan, dict):
+            fps = float(segment_plan.get("fps", 24.0))
+            eff_split = segment_plan.get("split_mode", "按秒自动切分")
+            eff_chunk = float(segment_plan.get("chunk_seconds", 6.0))
+            eff_ov = float(segment_plan.get("overlap_seconds", 1.5))
+            eff_num = int(segment_plan.get("num_segments", 3))
+            eff_cuts = segment_plan.get("custom_cuts", "0-6, 4.5-10.5, 9-15")
+            eff_align = bool(segment_plan.get("align_51_frames", False))
+
+            if segment_plan.get("has_media") and segment_plan.get("total_v") == total_v and "chunks" in segment_plan:
+                chunks = segment_plan["chunks"]
+                print(f"[PJ一采分段采样器] 🔗 成功读取上游【PJ分段规划器】总线，直接继承精确切片分段 ({len(chunks)} 段, FPS: {fps})！")
+            else:
+                chunks = self.plan_segments(
+                    total_v, total_a, eff_split, eff_chunk, eff_ov, eff_num, eff_cuts, fps, align_51_frames=eff_align
+                )
+                print(f"[PJ一采分段采样器] 🎯 成功读取上游【PJ分段规划器】规则，根据输入潜空间实际长度 ({total_v} 潜步, ~{total_v / (fps / 3.4):.2f}s) 动态规划出 {len(chunks)} 个分段！")
         else:
             eff_split = kwargs.get("split_mode", "按秒自动切分")
             eff_chunk = float(kwargs.get("chunk_seconds", 6.0))

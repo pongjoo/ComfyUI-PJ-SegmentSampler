@@ -125,24 +125,15 @@ def _generate_preview_mp4(images, audio, fps):
 class PJ_SegmentPlanner:
     """
     PJ分段规划器 (时钟计算 / 时序总控与分段播放器)
-    将视频总时长或总帧数集中前置计算，输出统一的 PJ_SEGMENT_PLAN，
+    作为独立的分段参数前置设定器，输出统一的 PJ_SEGMENT_PLAN 总线，
     直接连接到一采和二采采样器，一处修改全局自动同步！
-    支持输入原视频帧与音频，在画布节点内实时渲染分段仪表盘与点击分段试听播放。
+    支持可选接入潜空间(LATENT)或视频图像(IMAGE)，在画布内实时渲染交互式分段仪表盘与试听播放器。
     """
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
-            "required": {},
-            "optional": {
-                "images": (
-                    "IMAGE",
-                    {"tooltip": "（可选）输入视频帧张量，连接后节点内可直接显示可视播放器并点击分段播放"},
-                ),
-                "audio": (
-                    "AUDIO",
-                    {"tooltip": "（可选）输入音频，连接后播放器可直接播放原声"},
-                ),
+            "required": {
                 "fps": (
                     "FLOAT",
                     {
@@ -150,17 +141,7 @@ class PJ_SegmentPlanner:
                         "min": 1.0,
                         "max": 120.0,
                         "step": 1.0,
-                        "tooltip": "视频帧率，用于将连接的总帧数换算为秒数以匹配分段，MiniMax H3 官方为 24.0",
-                    },
-                ),
-                "duration_seconds": (
-                    "FLOAT",
-                    {
-                        "default": 15.0,
-                        "min": 0.0,
-                        "max": 600.0,
-                        "step": 0.5,
-                        "tooltip": "默认视频总时长（秒），当外部未连接总帧数输入连接点时生效",
+                        "tooltip": "视频帧率，用于换算秒数与潜空间步数，MiniMax H3 官方为 24.0",
                     },
                 ),
                 "split_mode": (
@@ -216,29 +197,22 @@ class PJ_SegmentPlanner:
                 ),
             },
             "optional": {
-                "total_frames": (
-                    "INT",
-                    {
-                        "forceInput": True,
-                        "tooltip": "【帧数输入连接点】直接接入外部总帧数控制，结合面板FPS自动计算总秒数以匹配分段设置",
-                    },
-                ),
                 "latent": (
                     "LATENT",
                     {
-                        "tooltip": "【可选】接入采样器处理的潜空间，未连帧数时直接读取其实际长度自动规划",
+                        "tooltip": "【可选】接入采样器处理的潜空间。接入后直接读取其实际长度并呈现100%精准分段预览",
                     },
                 ),
                 "images": (
                     "IMAGE",
                     {
-                        "tooltip": "【可选】接入参考视频图像，自动根据视频实际帧数与FPS计算",
+                        "tooltip": "【可选】接入参考视频图像，按视频实际帧数生成分段与播放器预览",
                     },
                 ),
                 "audio": (
                     "AUDIO",
                     {
-                        "tooltip": "【可选】音频透传",
+                        "tooltip": "【可选】接入音频原声，供播放器同步试听与透传",
                     },
                 ),
             },
@@ -252,32 +226,24 @@ class PJ_SegmentPlanner:
 
     def plan(
         self,
-        total_frames=None,
-        latent=None,
-        images=None,
-        audio=None,
         fps=24.0,
-        duration_seconds=15.0,
         split_mode="按秒自动切分",
         chunk_seconds=6.0,
         overlap_seconds=1.5,
         num_segments=3,
         custom_cuts="0-6, 4.5-10.5, 9-15",
         align_51_frames=False,
+        latent=None,
+        images=None,
+        audio=None,
         **kwargs,
     ):
-        # 兼容 kwargs 传参
-        if total_frames is None:
-            total_frames = kwargs.get("total_frames_in", None)
+        # 1. 确定视频总帧数与时长 (秒)
+        has_media = False
+        mode_desc = ""
 
-        # 1. 确定实际视频总帧数与时长 (秒)
-        # 规则：通过连接的总帧数和面板 FPS 去匹配按多少秒分段的设置
-        if total_frames is not None and int(total_frames) > 0:
-            eff_total_frames = int(total_frames)
-            effective_seconds = float(eff_total_frames) / float(fps)
-            print(f"[PJ分段规划器] 🎯 采用外部接入的【总帧数】: {eff_total_frames} 帧，结合 FPS={fps} 换算总时长为 {effective_seconds:.2f} 秒")
-        elif latent is not None and isinstance(latent, dict) and "samples" in latent:
-            # 自动读取传入的实际 Latent 长度 (等于原来二采前置设置直接嗅探 Latent)
+        if latent is not None and isinstance(latent, dict) and "samples" in latent:
+            # 自动读取传入的实际 Latent 长度
             samples = latent["samples"]
             if hasattr(samples, "is_nested") and samples.is_nested:
                 v_stream = list(samples.unbind())[0]
@@ -287,22 +253,30 @@ class PJ_SegmentPlanner:
             v_fps = fps / 3.4
             effective_seconds = float(total_v) / float(v_fps)
             eff_total_frames = int(round(effective_seconds * fps))
-            print(f"[PJ分段规划器] 🚀 未接帧数输入，直接按采样器实际 Latent 长度规划: {total_v} 潜步 (~{effective_seconds:.2f}秒, {eff_total_frames} 帧)")
+            has_media = True
+            mode_desc = f"直连潜空间 ({total_v} 潜步, ~{effective_seconds:.2f}s)"
+            print(f"[PJ分段规划器] 🚀 读取接入的实际 Latent 长度: {total_v} 潜步 (~{effective_seconds:.2f}秒, {eff_total_frames} 帧)")
         elif images is not None and hasattr(images, "shape") and len(images.shape) >= 1:
             eff_total_frames = int(images.shape[0])
             effective_seconds = float(eff_total_frames) / float(fps)
+            v_fps = fps / 3.4
+            total_v = int(round(effective_seconds * v_fps))
+            has_media = True
+            mode_desc = f"直连视频图像 ({eff_total_frames} 帧, ~{effective_seconds:.2f}s)"
             print(f"[PJ分段规划器] 🎬 采用输入图像序列实际帧数: {eff_total_frames} 帧 (~{effective_seconds:.2f}秒)")
         else:
-            effective_seconds = max(0.1, float(duration_seconds))
+            # 未连潜空间或视频：规则待命模式
+            # 采用 15 秒（或旧工作流传入的 duration_seconds）作为参考时长生成预览规则
+            effective_seconds = max(0.1, float(kwargs.get("duration_seconds", 15.0)))
             eff_total_frames = int(round(effective_seconds * fps))
-            print(f"[PJ分段规划器] ⚙️ 未连外部输入，采用面板默认时长: {effective_seconds:.2f} 秒 ({eff_total_frames} 帧)")
+            v_fps = fps / 3.4
+            total_v = int(round(effective_seconds * v_fps))
+            has_media = False
+            mode_desc = "规则待命模式 (未直连潜空间，下游采样器将按其各自输入的潜空间长度动态适配)"
+            print(f"[PJ分段规划器] ⚙️ 未直连潜空间输入，按参考基准 {effective_seconds:.2f} 秒 ({eff_total_frames} 帧) 预览分段规则")
 
         total_frames = eff_total_frames
-
-        v_fps = fps / 3.4
         a_fps = 40.0
-
-        total_v = int(round(effective_seconds * v_fps))
         total_a = int(round(effective_seconds * a_fps))
 
         chunks = []
@@ -400,10 +374,17 @@ class PJ_SegmentPlanner:
         chunks_sec_info = []
         summary_lines = [
             f"📊 【PJ分段时序总控仪表盘】",
-            f"• 视频总长: {effective_seconds:.2f}秒 ({total_frames} 帧, 潜空间 {total_v} 步)",
-            f"• 规划模式: {split_mode} | 总计切分: {n_chunks} 个分段 | FPS: {fps}",
-            f"--------------------------------------------------",
         ]
+        if not has_media:
+            summary_lines.append(f"• 状态提示: ⚙️ 规则待命模式（未直连潜空间，下游采样器将按其输入潜空间实际长度动态切分）")
+            summary_lines.append(f"• 参考基准: {effective_seconds:.2f}秒 ({total_frames} 帧, 潜空间 {total_v} 步)")
+        else:
+            summary_lines.append(f"• 状态提示: 🎬 已直连媒体 ({mode_desc})")
+            summary_lines.append(f"• 视频总长: {effective_seconds:.2f}秒 ({total_frames} 帧, 潜空间 {total_v} 步)")
+
+        summary_lines.append(f"• 规划模式: {split_mode} | 总计切分: {n_chunks} 个分段 | FPS: {fps}")
+        summary_lines.append("--------------------------------------------------")
+
         for i, (vs, ve, as_, ae) in enumerate(chunks):
             s_sec = vs / v_fps
             e_sec = ve / v_fps
@@ -435,6 +416,7 @@ class PJ_SegmentPlanner:
         video_filename = _generate_preview_mp4(images, audio, fps) if images is not None else None
 
         plan_dict = {
+            "has_media": has_media,
             "chunks": chunks,
             "chunks_sec_info": chunks_sec_info,
             "n_chunks": n_chunks,
@@ -458,12 +440,14 @@ class PJ_SegmentPlanner:
             "preview_data": [{
                 "video_filename": video_filename,
                 "has_video": video_filename is not None,
+                "has_media": has_media,
                 "fps": fps,
                 "total_frames": total_frames,
                 "effective_seconds": round(effective_seconds, 2),
                 "n_chunks": n_chunks,
                 "chunks": chunks_sec_info,
                 "summary": summary_text,
+                "mode_desc": mode_desc,
             }]
         }
 

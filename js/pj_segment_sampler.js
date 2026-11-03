@@ -39,11 +39,9 @@ for (let i = 1; i <= 20; i++) {
 }
 
 const INPUT_LABELS = {
-    "total_frames": "视频总帧数输入",
-    "total_frames_in": "视频总帧数输入",
-    "latent": "潜空间(可选)",
-    "images": "视频图像",
-    "audio": "音频原声",
+    "latent": "输入潜空间(可选)",
+    "images": "视频图像(可选)",
+    "audio": "音频原声(可选)",
     "noise": "随机噪声",
     "guider": "引导器",
     "sampler": "采样算法",
@@ -215,6 +213,14 @@ function resolveTargetSegmentCount(node) {
     // 1. 优先实时读取上游 PJ_SegmentPlanner 最新控件值
     const originNode = getUpstreamPlannerNode(node);
     if (originNode) {
+        // 次级缓存读取：上游规划器已执行或有预览缓存时直接获取
+        if (originNode.pj_cached_n_chunks) {
+            return Math.min(20, Math.max(1, originNode.pj_cached_n_chunks));
+        }
+        if (originNode.properties?.["pj_preview_cache"]?.n_chunks) {
+            return Math.min(20, Math.max(1, originNode.properties["pj_preview_cache"].n_chunks));
+        }
+
         const mode = originNode.widgets?.find(w => w.name === "split_mode")?.value;
         if (mode === "固定分段数" || mode === "fixed_segments") {
             const upNumSeg = originNode.widgets?.find(w => w.name === "num_segments")?.value;
@@ -224,22 +230,13 @@ function resolveTargetSegmentCount(node) {
             const count = cuts.split(",").filter(s => s.includes("-")).length;
             if (count > 0) return Math.min(20, count);
         } else {
-            // 按秒自动切分模式：根据时长与窗口步长实时估算
-            let dur = parseFloat(originNode.widgets?.find(w => w.name === "duration_seconds")?.value || 15);
-            const fps = parseFloat(originNode.widgets?.find(w => w.name === "fps")?.value || 24);
+            // 按秒自动切分模式：根据默认参考时长 15 秒与窗口步长实时估算
+            let dur = 15.0;
             const chunk = parseFloat(originNode.widgets?.find(w => w.name === "chunk_seconds")?.value || 6);
             const ov = parseFloat(originNode.widgets?.find(w => w.name === "overlap_seconds")?.value || 1.5);
             const step = Math.max(0.5, chunk - ov);
             const est = Math.ceil(dur / step);
             return Math.min(20, Math.max(1, est));
-        }
-
-        // 次级缓存读取
-        if (originNode.pj_cached_n_chunks) {
-            return Math.min(20, Math.max(1, originNode.pj_cached_n_chunks));
-        }
-        if (originNode.properties?.["pj_preview_cache"]?.n_chunks) {
-            return Math.min(20, Math.max(1, originNode.properties["pj_preview_cache"].n_chunks));
         }
     }
 
@@ -524,13 +521,12 @@ function setupPlannerNode(node) {
     }
 
     const plannerWatchNames = [
+        "fps",
         "split_mode",
         "chunk_seconds",
         "overlap_seconds",
         "num_segments",
         "custom_cuts",
-        "duration_seconds",
-        "fps",
         "align_51_frames"
     ];
     for (const name of plannerWatchNames) {
@@ -594,6 +590,7 @@ function renderPlannerDashboard(node, data) {
     container.innerHTML = "";
 
     // 1. 顶部时序统计横幅
+    const isReference = data.has_media === false;
     const topBanner = document.createElement("div");
     topBanner.style.display = "flex";
     topBanner.style.justifyContent = "space-between";
@@ -604,7 +601,7 @@ function renderPlannerDashboard(node, data) {
     topBanner.style.fontSize = "12px";
     topBanner.style.fontWeight = "bold";
     topBanner.innerHTML = `
-        <span style="color: #38bdf8;">🎬 总时长: ${data.effective_seconds}s (${data.total_frames}帧)</span>
+        <span style="color: #38bdf8;">${isReference ? '📐 规则参考时长: ' : '🎬 媒体总时长: '}${data.effective_seconds}s (${data.total_frames}帧)</span>
         <span style="color: #34d399;">📐 规划切分: ${data.n_chunks} 个分段</span>
         <span style="color: #fbbf24;">⚡ ${data.fps} FPS</span>
     `;
@@ -639,13 +636,17 @@ function renderPlannerDashboard(node, data) {
     } else {
         const tipEl = document.createElement("div");
         tipEl.style.padding = "8px 10px";
-        tipEl.style.background = "rgba(59, 130, 246, 0.1)";
-        tipEl.style.border = "1px dashed #3b82f6";
+        tipEl.style.background = isReference ? "rgba(59, 130, 246, 0.12)" : "rgba(16, 185, 129, 0.1)";
+        tipEl.style.border = isReference ? "1px dashed #3b82f6" : "1px dashed #10b981";
         tipEl.style.borderRadius = "6px";
-        tipEl.style.color = "#93c5fd";
+        tipEl.style.color = isReference ? "#93c5fd" : "#6ee7b7";
         tipEl.style.fontSize = "11px";
         tipEl.style.lineHeight = "1.5";
-        tipEl.innerHTML = `💡 <b>提示</b>：连接上方 <code>images</code> 与 <code>audio</code> 端口后，此处将自动渲染内置试听播放器，支持精准截取任意分段一键试听！`;
+        if (isReference) {
+            tipEl.innerHTML = `💡 <b>规则待命模式</b>：当前规划器未直连潜空间或视频，已按参考时长生成预览规则。实际采样时一采与二采将以其各自输入的潜空间长度自动动态切分！<br><span style="color:#60a5fa;">（若需100%物理潜步预览或启用播放器，可直接将潜空间或视频接入上方端口）</span>`;
+        } else {
+            tipEl.innerHTML = `💡 <b>提示</b>：连接上方 <code>images</code> 与 <code>audio</code> 端口后，此处将自动渲染内置试听播放器，支持精准截取任意分段一键试听！`;
+        }
         container.appendChild(tipEl);
     }
 
@@ -815,19 +816,27 @@ app.registerExtension({
                 return r;
             };
 
-            const origConfigure = nodeType.prototype.configure;
-            nodeType.prototype.configure = function (info) {
+            function sanitizePlannerWidgets(info) {
                 if (info && info.widgets_values && Array.isArray(info.widgets_values)) {
-                    // 兼容旧版 workflow:
-                    // 1. 若第1项为 string (临时 duration_control)，剔除它
-                    if (typeof info.widgets_values[1] === "string") {
-                        info.widgets_values.splice(1, 1);
+                    // 兼容旧版 workflow 结构清洗:
+                    // 目标 7 个控件: [fps, split_mode, chunk_seconds, overlap_seconds, num_segments, custom_cuts, align_51_frames]
+                    const modes = ["按秒自动切分", "固定分段数", "自定义切点"];
+                    if (typeof info.widgets_values[0] === "string" && modes.includes(info.widgets_values[0])) {
+                        const fpsVal = info.widgets_values[6] ?? 24.0;
+                        info.widgets_values = [fpsVal, ...info.widgets_values.slice(0, 6)];
+                        return;
                     }
-                    // 2. 若依然超过 8 项且第2项为 number (旧版 total_frames widget 已变为输入连接点)，平滑移除
-                    if (info.widgets_values.length > 8 && typeof info.widgets_values[2] === "number") {
-                        info.widgets_values.splice(2, 1);
+                    if (typeof info.widgets_values[0] === "number") {
+                        while (info.widgets_values.length > 2 && !modes.includes(info.widgets_values[1])) {
+                            info.widgets_values.splice(1, 1);
+                        }
                     }
                 }
+            }
+
+            const origConfigure = nodeType.prototype.configure;
+            nodeType.prototype.configure = function (info) {
+                sanitizePlannerWidgets(info);
                 const r = origConfigure ? origConfigure.apply(this, arguments) : undefined;
                 setupPlannerNode(this);
                 if (this.properties?.["pj_preview_cache"]) {
@@ -838,14 +847,7 @@ app.registerExtension({
 
             const onConfigure = nodeType.prototype.onConfigure;
             nodeType.prototype.onConfigure = function (info) {
-                if (info && info.widgets_values && Array.isArray(info.widgets_values)) {
-                    if (typeof info.widgets_values[1] === "string") {
-                        info.widgets_values.splice(1, 1);
-                    }
-                    if (info.widgets_values.length > 8 && typeof info.widgets_values[2] === "number") {
-                        info.widgets_values.splice(2, 1);
-                    }
-                }
+                sanitizePlannerWidgets(info);
                 const r = onConfigure ? onConfigure.apply(this, arguments) : undefined;
                 setupPlannerNode(this);
                 if (this.properties?.["pj_preview_cache"]) {
