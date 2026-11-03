@@ -274,14 +274,36 @@ function syncSamplerSegmentCount(node, isFirstPass) {
     autoResizeNode(node);
 }
 
-// 为采样器注入便捷的“刷新分段适配”按钮
+// 为采样器注入便捷的“刷新分段适配”按钮 (单例且自动清除任何历史多余重复项)
 function ensureSyncButton(node, isFirstPass) {
     if (!node.widgets) return;
-    if (node.widgets.some(w => w.name === "pj_btn_refresh_segments")) return;
 
-    node.addWidget("button", "🔄 刷新分段适配 (按当前分段数自适应)", null, () => {
-        syncSamplerSegmentCount(node, isFirstPass);
-    }, { name: "pj_btn_refresh_segments" });
+    let keptOne = false;
+    const cleanWidgets = [];
+    for (const w of node.widgets) {
+        if (w.name && w.name.includes("刷新分段适配")) {
+            if (!keptOne) {
+                // 保留且仅保留第一个，重置其名称与回调
+                keptOne = true;
+                w.name = "🔄 刷新分段适配 (按当前分段数自适应)";
+                w.callback = () => {
+                    syncSamplerSegmentCount(node, isFirstPass);
+                };
+                cleanWidgets.push(w);
+            }
+            // 其它多余的历史重复按钮 (#1, #2, ... #11 等) 全部剔除！
+        } else {
+            cleanWidgets.push(w);
+        }
+    }
+    node.widgets = cleanWidgets;
+
+    // 如果之前一个都没有，才新增一个
+    if (!keptOne) {
+        node.addWidget("button", "🔄 刷新分段适配 (按当前分段数自适应)", null, () => {
+            syncSamplerSegmentCount(node, isFirstPass);
+        });
+    }
 }
 
 // ==========================================
@@ -384,15 +406,18 @@ function attachSamplerHandlers(node, isFirstPass) {
     }
 
     // 监听连接变化 (若连上上游分段规划器，自动同步)
-    const origOnConnectionsChange = node.onConnectionsChange;
-    node.onConnectionsChange = function () {
-        const res = origOnConnectionsChange?.apply(this, arguments);
-        setTimeout(() => {
-            if (isFirstPass) updateFirstPassVisibility(node);
-            else updateSecondPassVisibility(node);
-        }, 100);
-        return res;
-    };
+    if (!node._pj_conn_attached) {
+        node._pj_conn_attached = true;
+        const origOnConnectionsChange = node.onConnectionsChange;
+        node.onConnectionsChange = function () {
+            const res = origOnConnectionsChange?.apply(this, arguments);
+            setTimeout(() => {
+                if (isFirstPass) updateFirstPassVisibility(node);
+                else updateSecondPassVisibility(node);
+            }, 100);
+            return res;
+        };
+    }
 
     setTimeout(() => {
         if (isFirstPass) updateFirstPassVisibility(node);
