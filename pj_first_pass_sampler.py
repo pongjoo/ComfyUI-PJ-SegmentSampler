@@ -77,6 +77,12 @@ class PJ_FirstPass_SegmentSampler:
                 "latent_image": ("LATENT", {"tooltip": "一采空潜空间 (来自 EmptyMiniMaxH3LatentAV)"}),
             },
             "optional": {
+                "segment_plan": (
+                    "PJ_SEGMENT_PLAN",
+                    {
+                        "tooltip": "连接来自【PJ分段规划器】的时钟总线，连接后一采将自动继承其切片与分段设置，实现绝对同步",
+                    },
+                ),
                 "split_mode": (
                     ["按秒自动切分", "固定分段数", "自定义切点"],
                     {"default": "按秒自动切分", "tooltip": "分段规划策略"},
@@ -138,26 +144,22 @@ class PJ_FirstPass_SegmentSampler:
                     },
                 ),
                 "run_mode": (
-                    [
-                        "智能缓存(仅重跑未锁定分段)",
-                        "全部重新采样(刷新全部缓存)",
-                        "仅重抽第1段",
-                        "仅重抽第2段",
-                        "仅重抽第3段",
-                        "仅重抽第4段",
-                        "仅重抽第5段",
-                        "仅重抽第6段",
-                        "仅重抽第7段",
-                        "仅重抽第8段",
-                        "仅重抽第9段",
-                        "仅重抽第10段",
-                        "仅重抽第11段",
-                        "仅重抽第12段",
-                        "自定义指定分段(下方输入)",
-                    ],
+                    ["智能缓存(仅重跑未锁定分段)", "全部重新采样(刷新全部缓存)"]
+                    + [f"仅重抽第{i}段" for i in range(1, 21)]
+                    + ["按缺陷秒数重抽 (下方输入秒数)", "自定义指定分段(下方输入)"],
                     {
                         "default": "智能缓存(仅重跑未锁定分段)",
                         "tooltip": "【重抽控制台】哪段一采不满意直接选该段单独重抽，其余段0秒提取缓存，极速出片！",
+                    },
+                ),
+                "target_time_second": (
+                    "FLOAT",
+                    {
+                        "default": 0.0,
+                        "min": 0.0,
+                        "max": 600.0,
+                        "step": 0.5,
+                        "tooltip": "若选择【按缺陷秒数重抽】，直接输入画面异常的秒数（如12.5s），节点自动识别所属分段并执行重抽！",
                     },
                 ),
                 "custom_rerun_segments": (
@@ -177,70 +179,46 @@ class PJ_FirstPass_SegmentSampler:
                         "tooltip": "全局基础随机种子 (若连接了 noise 输入端口，将优先以其种子为基准)",
                     },
                 ),
-                "seg1_seed_offset": (
-                    "INT",
-                    {"default": 0, "min": 0, "max": 999999, "step": 1, "tooltip": "第1段种子偏移 (实际种子 = 基础种子 + 偏移)"},
-                ),
-                "seg1_lock": (
-                    "BOOLEAN",
-                    {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "打勾锁定后跳过计算，0秒读缓存"},
-                ),
-                "seg2_seed_offset": (
-                    "INT",
-                    {"default": 1, "min": 0, "max": 999999, "step": 1, "tooltip": "第2段种子偏移"},
-                ),
-                "seg2_lock": (
-                    "BOOLEAN",
-                    {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "打勾锁定后跳过计算，0秒读缓存"},
-                ),
-                "seg3_seed_offset": (
-                    "INT",
-                    {"default": 2, "min": 0, "max": 999999, "step": 1, "tooltip": "第3段种子偏移"},
-                ),
-                "seg3_lock": (
-                    "BOOLEAN",
-                    {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "打勾锁定后跳过计算，0秒读缓存"},
-                ),
-                "seg4_seed_offset": (
-                    "INT",
-                    {"default": 3, "min": 0, "max": 999999, "step": 1, "tooltip": "第4段种子偏移"},
-                ),
-                "seg4_lock": (
-                    "BOOLEAN",
-                    {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "打勾锁定后跳过计算，0秒读缓存"},
-                ),
-                "seg5_seed_offset": (
-                    "INT",
-                    {"default": 4, "min": 0, "max": 999999, "step": 1, "tooltip": "第5段种子偏移"},
-                ),
-                "seg5_lock": (
-                    "BOOLEAN",
-                    {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "打勾锁定后跳过计算，0秒读缓存"},
-                ),
-                "seg6_seed_offset": (
-                    "INT",
-                    {"default": 5, "min": 0, "max": 999999, "step": 1, "tooltip": "第6段种子偏移"},
-                ),
-                "seg6_lock": (
-                    "BOOLEAN",
-                    {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "打勾锁定后跳过计算，0秒读缓存"},
-                ),
-                "seg7_seed_offset": (
-                    "INT",
-                    {"default": 6, "min": 0, "max": 999999, "step": 1, "tooltip": "第7段种子偏移"},
-                ),
-                "seg7_lock": (
-                    "BOOLEAN",
-                    {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "打勾锁定后跳过计算，0秒读缓存"},
-                ),
-                "seg8_seed_offset": (
-                    "INT",
-                    {"default": 7, "min": 0, "max": 999999, "step": 1, "tooltip": "第8段种子偏移"},
-                ),
-                "seg8_lock": (
-                    "BOOLEAN",
-                    {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "打勾锁定后跳过计算，0秒读缓存"},
-                ),
+                "seg1_seed_offset": ("INT", {"default": 0, "min": 0, "max": 999999, "step": 1, "tooltip": "第1段种子偏移 (实际种子 = 基础种子 + 偏移)"}),
+                "seg1_lock": ("BOOLEAN", {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "打勾锁定后跳过计算，0秒读缓存"}),
+                "seg2_seed_offset": ("INT", {"default": 1, "min": 0, "max": 999999, "step": 1, "tooltip": "第2段种子偏移"}),
+                "seg2_lock": ("BOOLEAN", {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "打勾锁定后跳过计算，0秒读缓存"}),
+                "seg3_seed_offset": ("INT", {"default": 2, "min": 0, "max": 999999, "step": 1, "tooltip": "第3段种子偏移"}),
+                "seg3_lock": ("BOOLEAN", {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "打勾锁定后跳过计算，0秒读缓存"}),
+                "seg4_seed_offset": ("INT", {"default": 3, "min": 0, "max": 999999, "step": 1, "tooltip": "第4段种子偏移"}),
+                "seg4_lock": ("BOOLEAN", {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "打勾锁定后跳过计算，0秒读缓存"}),
+                "seg5_seed_offset": ("INT", {"default": 4, "min": 0, "max": 999999, "step": 1, "tooltip": "第5段种子偏移"}),
+                "seg5_lock": ("BOOLEAN", {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "打勾锁定后跳过计算，0秒读缓存"}),
+                "seg6_seed_offset": ("INT", {"default": 5, "min": 0, "max": 999999, "step": 1, "tooltip": "第6段种子偏移"}),
+                "seg6_lock": ("BOOLEAN", {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "打勾锁定后跳过计算，0秒读缓存"}),
+                "seg7_seed_offset": ("INT", {"default": 6, "min": 0, "max": 999999, "step": 1, "tooltip": "第7段种子偏移"}),
+                "seg7_lock": ("BOOLEAN", {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "打勾锁定后跳过计算，0秒读缓存"}),
+                "seg8_seed_offset": ("INT", {"default": 7, "min": 0, "max": 999999, "step": 1, "tooltip": "第8段种子偏移"}),
+                "seg8_lock": ("BOOLEAN", {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "打勾锁定后跳过计算，0秒读缓存"}),
+                "seg9_seed_offset": ("INT", {"default": 8, "min": 0, "max": 999999, "step": 1, "tooltip": "第9段种子偏移"}),
+                "seg9_lock": ("BOOLEAN", {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "打勾锁定后跳过计算，0秒读缓存"}),
+                "seg10_seed_offset": ("INT", {"default": 9, "min": 0, "max": 999999, "step": 1, "tooltip": "第10段种子偏移"}),
+                "seg10_lock": ("BOOLEAN", {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "打勾锁定后跳过计算，0秒读缓存"}),
+                "seg11_seed_offset": ("INT", {"default": 10, "min": 0, "max": 999999, "step": 1, "tooltip": "第11段种子偏移"}),
+                "seg11_lock": ("BOOLEAN", {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "打勾锁定后跳过计算，0秒读缓存"}),
+                "seg12_seed_offset": ("INT", {"default": 11, "min": 0, "max": 999999, "step": 1, "tooltip": "第12段种子偏移"}),
+                "seg12_lock": ("BOOLEAN", {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "打勾锁定后跳过计算，0秒读缓存"}),
+                "seg13_seed_offset": ("INT", {"default": 12, "min": 0, "max": 999999, "step": 1, "tooltip": "第13段种子偏移"}),
+                "seg13_lock": ("BOOLEAN", {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "打勾锁定后跳过计算，0秒读缓存"}),
+                "seg14_seed_offset": ("INT", {"default": 13, "min": 0, "max": 999999, "step": 1, "tooltip": "第14段种子偏移"}),
+                "seg14_lock": ("BOOLEAN", {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "打勾锁定后跳过计算，0秒读缓存"}),
+                "seg15_seed_offset": ("INT", {"default": 14, "min": 0, "max": 999999, "step": 1, "tooltip": "第15段种子偏移"}),
+                "seg15_lock": ("BOOLEAN", {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "打勾锁定后跳过计算，0秒读缓存"}),
+                "seg16_seed_offset": ("INT", {"default": 15, "min": 0, "max": 999999, "step": 1, "tooltip": "第16段种子偏移"}),
+                "seg16_lock": ("BOOLEAN", {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "打勾锁定后跳过计算，0秒读缓存"}),
+                "seg17_seed_offset": ("INT", {"default": 16, "min": 0, "max": 999999, "step": 1, "tooltip": "第17段种子偏移"}),
+                "seg17_lock": ("BOOLEAN", {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "打勾锁定后跳过计算，0秒读缓存"}),
+                "seg18_seed_offset": ("INT", {"default": 17, "min": 0, "max": 999999, "step": 1, "tooltip": "第18段种子偏移"}),
+                "seg18_lock": ("BOOLEAN", {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "打勾锁定后跳过计算，0秒读缓存"}),
+                "seg19_seed_offset": ("INT", {"default": 18, "min": 0, "max": 999999, "step": 1, "tooltip": "第19段种子偏移"}),
+                "seg19_lock": ("BOOLEAN", {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "打勾锁定后跳过计算，0秒读缓存"}),
+                "seg20_seed_offset": ("INT", {"default": 19, "min": 0, "max": 999999, "step": 1, "tooltip": "第20段种子偏移"}),
+                "seg20_lock": ("BOOLEAN", {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "打勾锁定后跳过计算，0秒读缓存"}),
                 "blend_mode": (
                     ["余弦平滑(推荐)", "线性过渡", "硬切"],
                     {"default": "余弦平滑(推荐)", "tooltip": "重叠过渡区无缝平滑算法"},
@@ -376,6 +354,7 @@ class PJ_FirstPass_SegmentSampler:
         sampler,
         sigmas,
         latent_image,
+        segment_plan=None,
         split_mode="按秒自动切分",
         chunk_seconds=6.0,
         overlap_seconds=1.5,
@@ -384,27 +363,13 @@ class PJ_FirstPass_SegmentSampler:
         align_51_frames=False,
         sync_ref_video=True,
         run_mode="智能缓存(仅重跑未锁定分段)",
+        target_time_second=0.0,
         custom_rerun_segments="5",
         base_seed=0,
-        seg1_seed_offset=0,
-        seg1_lock=False,
-        seg2_seed_offset=1,
-        seg2_lock=False,
-        seg3_seed_offset=2,
-        seg3_lock=False,
-        seg4_seed_offset=3,
-        seg4_lock=False,
-        seg5_seed_offset=4,
-        seg5_lock=False,
-        seg6_seed_offset=5,
-        seg6_lock=False,
-        seg7_seed_offset=6,
-        seg7_lock=False,
-        seg8_seed_offset=7,
-        seg8_lock=False,
         blend_mode="余弦平滑(推荐)",
         unload_model_after_sampling=False,
         fps=24.0,
+        **kwargs,
     ):
         global _FIRST_PASS_CACHE
 
@@ -433,18 +398,22 @@ class PJ_FirstPass_SegmentSampler:
         total_v = full_video.shape[2]
         total_a = full_audio.shape[-1] if full_audio is not None else 0
 
-        # Plan chunks
-        chunks = self.plan_segments(
-            total_v,
-            total_a,
-            split_mode,
-            chunk_seconds,
-            overlap_seconds,
-            num_segments,
-            custom_cuts,
-            fps,
-            align_51_frames=align_51_frames,
-        )
+        # Plan chunks (优先从上游【PJ分段规划器】总线继承，保证绝对时序统一)
+        if segment_plan is not None and isinstance(segment_plan, dict) and "chunks" in segment_plan:
+            chunks = segment_plan["chunks"]
+            print(f"[PJ一采分段采样器] 🔗 成功读取上游【PJ分段规划器】总线，直接继承 {len(chunks)} 个切片分段！")
+        else:
+            chunks = self.plan_segments(
+                total_v,
+                total_a,
+                split_mode,
+                chunk_seconds,
+                overlap_seconds,
+                num_segments,
+                custom_cuts,
+                fps,
+                align_51_frames=align_51_frames,
+            )
         n_chunks = len(chunks)
 
         print("\n" + "=" * 65)
@@ -454,14 +423,20 @@ class PJ_FirstPass_SegmentSampler:
             print(f"  - 分段 {i + 1}/{n_chunks}: 视频潜空间 [{vs}:{ve}], 音频 [{as_}:{ae}]")
         print("=" * 65)
 
-        # Segment control configuration
+        # Segment control configuration (支持到 20 段)
         locks = [
-            seg1_lock, seg2_lock, seg3_lock, seg4_lock,
-            seg5_lock, seg6_lock, seg7_lock, seg8_lock
+            kwargs.get(f"seg{i}_lock", False) if i > 8 else [
+                None, seg1_lock, seg2_lock, seg3_lock, seg4_lock,
+                seg5_lock, seg6_lock, seg7_lock, seg8_lock
+            ][i]
+            for i in range(1, 21)
         ]
         offsets = [
-            seg1_seed_offset, seg2_seed_offset, seg3_seed_offset, seg4_seed_offset,
-            seg5_seed_offset, seg6_seed_offset, seg7_seed_offset, seg8_seed_offset
+            kwargs.get(f"seg{i}_seed_offset", i - 1) if i > 8 else [
+                None, seg1_seed_offset, seg2_seed_offset, seg3_seed_offset, seg4_seed_offset,
+                seg5_seed_offset, seg6_seed_offset, seg7_seed_offset, seg8_seed_offset
+            ][i]
+            for i in range(1, 21)
         ]
 
         # Resolve effective base seed
@@ -479,6 +454,22 @@ class PJ_FirstPass_SegmentSampler:
             gn_video = global_noise
             gn_audio = None
 
+        # 计算目标缺陷秒数所属的分段编号 (如果处于缺陷秒数重抽模式)
+        target_defect_seg = None
+        if "缺陷秒数" in str(run_mode):
+            v_fps = fps / 3.4
+            for seg_i, (vs, ve, as_, ae) in enumerate(chunks):
+                s_sec = vs / v_fps
+                e_sec = ve / v_fps
+                if s_sec <= target_time_second <= e_sec:
+                    target_defect_seg = seg_i + 1
+                    break
+            if target_defect_seg is not None:
+                print(f"[PJ一采分段采样器] 🎯 目标秒数 {target_time_second:.2f}s 自动匹配到第 {target_defect_seg} 段，将仅对该段重抽！")
+            else:
+                target_defect_seg = 1
+                print(f"[PJ一采分段采样器] ⚠️ 目标秒数 {target_time_second:.2f}s 超出范围，默认重抽第 1 段")
+
         sampled_chunks = []
         disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
 
@@ -492,6 +483,8 @@ class PJ_FirstPass_SegmentSampler:
             should_resample = True
             if run_mode == "全部重新采样(刷新全部缓存)":
                 should_resample = True
+            elif "缺陷秒数" in str(run_mode):
+                should_resample = (idx + 1) == target_defect_seg
             elif run_mode.startswith("仅重抽第"):
                 target_seg_num = int(run_mode.replace("仅重抽第", "").replace("段", "").strip())
                 should_resample = (idx + 1) == target_seg_num
