@@ -176,29 +176,71 @@ function localizeAndSanitizeCommon(node) {
     }
 }
 
+// 溯源查找上游【分段规划器】节点（智能穿透 Reroute 路由节点）
+function getUpstreamPlannerNode(node) {
+    if (!node.inputs || !app.graph) return null;
+    const planInput = node.inputs.find(i => i.name === "segment_plan" || i.label === "分段规划总线" || i.type === "PJ_SEGMENT_PLAN");
+    if (!planInput || planInput.link == null) return null;
+
+    let link = app.graph.links[planInput.link];
+    let visited = new Set();
+    while (link && link.origin_id != null) {
+        if (visited.has(link.origin_id)) break;
+        visited.add(link.origin_id);
+        const origin = app.graph.getNodeById(link.origin_id);
+        if (!origin) break;
+        if (origin.type === "Reroute" || origin.type === "ReroutePrimitive") {
+            const rInput = origin.inputs?.[0];
+            if (rInput && rInput.link != null) {
+                link = app.graph.links[rInput.link];
+            } else {
+                break;
+            }
+        } else {
+            return origin;
+        }
+    }
+    return null;
+}
+
+// 检查当前采样器是否已连接上游【分段规划总线】
+function isSegmentPlanConnected(node) {
+    return getUpstreamPlannerNode(node) != null;
+}
+
 // 获取上游规划器或当前设置的目标分段数
 function resolveTargetSegmentCount(node) {
-    // 1. 优先检查是否连接了上游 PJ_SegmentPlanner
-    if (node.inputs) {
-        const planInput = node.inputs.find(i => i.name === "segment_plan");
-        if (planInput && planInput.link != null && app.graph) {
-            const link = app.graph.links[planInput.link];
-            if (link) {
-                const originNode = app.graph.getNodeById(link.origin_id);
-                if (originNode && originNode.type === "PJ_SegmentPlanner") {
-                    if (originNode.pj_cached_n_chunks) {
-                        return Math.min(20, Math.max(1, originNode.pj_cached_n_chunks));
-                    }
-                    const upNumSeg = originNode.widgets?.find(w => w.name === "num_segments")?.value;
-                    if (upNumSeg) {
-                        return Math.min(20, Math.max(1, parseInt(upNumSeg) || 3));
-                    }
-                }
-            }
+    // 1. 优先实时读取上游 PJ_SegmentPlanner 最新控件值
+    const originNode = getUpstreamPlannerNode(node);
+    if (originNode) {
+        const mode = originNode.widgets?.find(w => w.name === "split_mode")?.value;
+        if (mode === "固定分段数" || mode === "fixed_segments") {
+            const upNumSeg = originNode.widgets?.find(w => w.name === "num_segments")?.value;
+            if (upNumSeg) return Math.min(20, Math.max(1, parseInt(upNumSeg) || 3));
+        } else if (mode === "自定义切点" || mode === "custom_cuts" || mode === "custom") {
+            const cuts = originNode.widgets?.find(w => w.name === "custom_cuts")?.value || "";
+            const count = cuts.split(",").filter(s => s.includes("-")).length;
+            if (count > 0) return Math.min(20, count);
+        } else {
+            // 按秒自动切分模式：根据时长与窗口步长实时估算
+            const dur = parseFloat(originNode.widgets?.find(w => w.name === "duration_seconds")?.value || 15);
+            const chunk = parseFloat(originNode.widgets?.find(w => w.name === "chunk_seconds")?.value || 6);
+            const ov = parseFloat(originNode.widgets?.find(w => w.name === "overlap_seconds")?.value || 1.5);
+            const step = Math.max(0.5, chunk - ov);
+            const est = Math.ceil(dur / step);
+            return Math.min(20, Math.max(1, est));
+        }
+
+        // 次级缓存读取
+        if (originNode.pj_cached_n_chunks) {
+            return Math.min(20, Math.max(1, originNode.pj_cached_n_chunks));
+        }
+        if (originNode.properties?.["pj_preview_cache"]?.n_chunks) {
+            return Math.min(20, Math.max(1, originNode.properties["pj_preview_cache"].n_chunks));
         }
     }
 
-    // 2. 读取本节点的 num_segments
+    // 2. 读取本节点的 num_segments (单节点独立模式 / 历史工作流兼容)
     const numSegWidget = node.widgets?.find(w => w.name === "num_segments");
     if (numSegWidget) {
         const val = parseInt(numSegWidget.value);
@@ -207,7 +249,7 @@ function resolveTargetSegmentCount(node) {
         }
     }
 
-    return 5; // 默认平滑容纳 5 段
+    return 3;
 }
 
 // 动态刷新采样器控件列表 (输入5变5段，输入15变15段)
@@ -246,49 +288,64 @@ function syncSamplerSegmentCount(node, isFirstPass) {
     toggleWidget(node, customRerun, runMode.includes("自定义"));
     toggleWidget(node, targetTime, runMode.includes("缺陷秒数"));
 
+    // 关键修正：1~maxSeg 的锁定开关始终显示！无论在任何模式下，用户都能直观看到并控制当前所有分段！
     for (let i = 1; i <= 20; i++) {
         const lockW = node.widgets?.find(w => w.name === `seg${i}_lock`);
         const offsetW = node.widgets?.find(w => w.name === `seg${i}_seed_offset`);
 
         const inRange = i <= maxSeg;
 
-        if (runMode.includes("自定义") || runMode.includes("缺陷秒数")) {
-            toggleWidget(node, lockW, false);
-            if (isFirstPass) toggleWidget(node, offsetW, inRange);
-        } else if (runMode.startsWith(isFirstPass ? "仅重抽第" : "仅精修第")) {
-            toggleWidget(node, lockW, false);
-            if (isFirstPass) {
-                const targetSeg = parseInt(runMode.replace(/\D/g, "")) || 1;
-                toggleWidget(node, offsetW, i === targetSeg);
-            }
-        } else if (runMode.includes("全部")) {
-            toggleWidget(node, lockW, false);
-            if (isFirstPass) toggleWidget(node, offsetW, inRange);
-        } else {
-            // 智能缓存模式
-            toggleWidget(node, lockW, inRange);
-            if (isFirstPass) toggleWidget(node, offsetW, inRange);
+        // 锁定开关：在当前分段数内始终展示，超出部分严格隐藏
+        toggleWidget(node, lockW, inRange);
+
+        // 一采独立种子偏移：在当前分段数内展示
+        if (isFirstPass) {
+            toggleWidget(node, offsetW, inRange);
         }
     }
 
     autoResizeNode(node);
 }
 
-// 为采样器注入便捷的“刷新分段适配”按钮 (单例且自动清除任何历史多余重复项)
+// 为采样器注入便捷的“刷新分段适配 / 总线同步”按钮 (单例且自动清除任何历史多余重复项)
 function ensureSyncButton(node, isFirstPass) {
     if (!node.widgets) return;
+
+    const isConnected = isSegmentPlanConnected(node);
+    const maxSeg = resolveTargetSegmentCount(node);
+    const targetBtnName = isConnected
+        ? `🔗 刷新总线同步 (已接管规划器 ${maxSeg} 段)`
+        : `🔄 刷新分段适配 (当前自适应 ${maxSeg} 段)`;
+
+    const handleButtonClick = (widget) => {
+        syncSamplerSegmentCount(node, isFirstPass);
+        const curSeg = resolveTargetSegmentCount(node);
+        if (widget) {
+            widget.name = `✅ 已刷新：当前共 ${curSeg} 段！`;
+            if (node.setDirtyCanvas) node.setDirtyCanvas(true, true);
+            if (app.canvas && app.canvas.setDirty) app.canvas.setDirty(true, true);
+            setTimeout(() => {
+                const refreshedConnected = isSegmentPlanConnected(node);
+                widget.name = refreshedConnected
+                    ? `🔗 刷新总线同步 (已接管规划器 ${curSeg} 段)`
+                    : `🔄 刷新分段适配 (当前自适应 ${curSeg} 段)`;
+                if (node.setDirtyCanvas) node.setDirtyCanvas(true, true);
+                if (app.canvas && app.canvas.setDirty) app.canvas.setDirty(true, true);
+            }, 1200);
+        }
+        console.log(`[PJ分段采样] 🔄 用户点击刷新适配，当前已生效分段数: ${curSeg}`);
+    };
 
     let keptOne = false;
     const cleanWidgets = [];
     for (const w of node.widgets) {
-        if (w.name && w.name.includes("刷新分段适配")) {
+        if (w.type === "button" || (w.name && (w.name.includes("刷新") || w.name.includes("总线同步") || w.name.includes("已刷新")))) {
             if (!keptOne) {
                 // 保留且仅保留第一个，重置其名称与回调
                 keptOne = true;
-                w.name = "🔄 刷新分段适配 (按当前分段数自适应)";
-                w.callback = () => {
-                    syncSamplerSegmentCount(node, isFirstPass);
-                };
+                w.name = targetBtnName;
+                w.type = "button";
+                w.callback = () => handleButtonClick(w);
                 cleanWidgets.push(w);
             }
             // 其它多余的历史重复按钮 (#1, #2, ... #11 等) 全部剔除！
@@ -300,9 +357,7 @@ function ensureSyncButton(node, isFirstPass) {
 
     // 如果之前一个都没有，才新增一个
     if (!keptOne) {
-        node.addWidget("button", "🔄 刷新分段适配 (按当前分段数自适应)", null, () => {
-            syncSamplerSegmentCount(node, isFirstPass);
-        });
+        const newBtn = node.addWidget("button", targetBtnName, null, () => handleButtonClick(newBtn));
     }
 }
 
@@ -312,69 +367,36 @@ function ensureSyncButton(node, isFirstPass) {
 function updateFirstPassVisibility(node) {
     if (!node.widgets) return;
     localizeAndSanitizeCommon(node);
-    ensureSyncButton(node, true);
 
-    const modeWidget = node.widgets.find(w => w.name === "split_mode");
-    const chunkSec = node.widgets.find(w => w.name === "chunk_seconds");
-    const overlapSec = node.widgets.find(w => w.name === "overlap_seconds");
-    const numSeg = node.widgets.find(w => w.name === "num_segments");
-    const customCuts = node.widgets.find(w => w.name === "custom_cuts");
-
-    // 切分模式关联切换
-    if (modeWidget) {
-        const mode = modeWidget.value;
-        if (mode === "按秒自动切分" || mode === "auto_by_seconds") {
-            toggleWidget(node, chunkSec, true);
-            toggleWidget(node, overlapSec, true);
-            toggleWidget(node, numSeg, false);
-            toggleWidget(node, customCuts, false);
-        } else if (mode === "固定分段数" || mode === "fixed_segments") {
-            toggleWidget(node, chunkSec, false);
-            toggleWidget(node, overlapSec, true);
-            toggleWidget(node, numSeg, true);
-            toggleWidget(node, customCuts, false);
-        } else if (mode === "自定义切点" || mode === "custom_cuts") {
-            toggleWidget(node, chunkSec, false);
-            toggleWidget(node, overlapSec, false);
-            toggleWidget(node, numSeg, false);
-            toggleWidget(node, customCuts, true);
-        }
+    // 彻底隐藏任何冗余切分参数（全部由上游规划器总线统一管理）
+    const redundantWidgets = [
+        "split_mode", "chunk_seconds", "overlap_seconds", "num_segments",
+        "custom_cuts", "align_51_frames", "fps"
+    ];
+    for (const name of redundantWidgets) {
+        const w = node.widgets.find(w => w.name === name);
+        if (w) toggleWidget(node, w, false);
     }
 
+    ensureSyncButton(node, true);
     syncSamplerSegmentCount(node, true);
 }
 
 function updateSecondPassVisibility(node) {
     if (!node.widgets) return;
     localizeAndSanitizeCommon(node);
-    ensureSyncButton(node, false);
 
-    const modeWidget = node.widgets.find(w => w.name === "split_mode");
-    const chunkSec = node.widgets.find(w => w.name === "chunk_seconds");
-    const overlapSec = node.widgets.find(w => w.name === "overlap_seconds");
-    const numSeg = node.widgets.find(w => w.name === "num_segments");
-    const customCuts = node.widgets.find(w => w.name === "custom_cuts");
-
-    if (modeWidget) {
-        const mode = modeWidget.value;
-        if (mode === "按秒自动切分" || mode === "auto_by_seconds") {
-            toggleWidget(node, chunkSec, true);
-            toggleWidget(node, overlapSec, true);
-            toggleWidget(node, numSeg, false);
-            toggleWidget(node, customCuts, false);
-        } else if (mode === "固定分段数" || mode === "fixed_segments") {
-            toggleWidget(node, chunkSec, false);
-            toggleWidget(node, overlapSec, true);
-            toggleWidget(node, numSeg, true);
-            toggleWidget(node, customCuts, false);
-        } else if (mode === "自定义切点" || mode === "custom_cuts") {
-            toggleWidget(node, chunkSec, false);
-            toggleWidget(node, overlapSec, false);
-            toggleWidget(node, numSeg, false);
-            toggleWidget(node, customCuts, true);
-        }
+    // 彻底隐藏任何冗余切分参数（全部由上游规划器总线统一管理）
+    const redundantWidgets = [
+        "split_mode", "chunk_seconds", "overlap_seconds", "num_segments",
+        "custom_cuts", "align_51_frames", "fps"
+    ];
+    for (const name of redundantWidgets) {
+        const w = node.widgets.find(w => w.name === name);
+        if (w) toggleWidget(node, w, false);
     }
 
+    ensureSyncButton(node, false);
     syncSamplerSegmentCount(node, false);
 }
 
@@ -428,6 +450,35 @@ function attachSamplerHandlers(node, isFirstPass) {
 // ==========================================
 // 5. PJ_SegmentPlanner 可视时间戳仪表盘与分段播放器
 // ==========================================
+function notifyDownstreamSamplers(plannerNode) {
+    if (!plannerNode.outputs || !app.graph) return;
+    const planOutput = plannerNode.outputs.find(o => o.type === "PJ_SEGMENT_PLAN" || (o.name && o.name.includes("分段规划")));
+    if (!planOutput || !planOutput.links) return;
+
+    function notifyTarget(targetId) {
+        const targetNode = app.graph.getNodeById(targetId);
+        if (!targetNode) return;
+        if (targetNode.type === "Reroute" || targetNode.type === "ReroutePrimitive") {
+            const outLinks = targetNode.outputs?.[0]?.links || [];
+            for (const lid of outLinks) {
+                const l = app.graph.links[lid];
+                if (l && l.target_id != null) notifyTarget(l.target_id);
+            }
+        } else if (targetNode.type === "PJ_FirstPass_SegmentSampler") {
+            updateFirstPassVisibility(targetNode);
+        } else if (targetNode.type === "PJ_SegmentSampler" || targetNode.type === "PJSegmentSampler") {
+            updateSecondPassVisibility(targetNode);
+        }
+    }
+
+    for (const linkId of planOutput.links) {
+        const link = app.graph.links[linkId];
+        if (link && link.target_id != null) {
+            notifyTarget(link.target_id);
+        }
+    }
+}
+
 function setupPlannerNode(node) {
     localizeAndSanitizeCommon(node);
     node.color = "#312e81"; // 现代科技靛蓝 (Indigo)
@@ -465,12 +516,29 @@ function setupPlannerNode(node) {
         autoResizeNode(node);
     }
 
-    if (modeWidget && !modeWidget._pj_attached) {
-        modeWidget._pj_attached = true;
-        const orig = modeWidget.callback;
-        modeWidget.callback = function () {
-            const res = orig?.apply(this, arguments);
-            updatePlannerWidgets();
+    const plannerWatchNames = ["split_mode", "chunk_seconds", "overlap_seconds", "num_segments", "custom_cuts", "duration_seconds", "total_frames", "fps", "align_51_frames"];
+    for (const name of plannerWatchNames) {
+        const w = node.widgets?.find(widget => widget.name === name);
+        if (w && !w._pj_attached) {
+            w._pj_attached = true;
+            const orig = w.callback;
+            w.callback = function () {
+                const res = orig?.apply(this, arguments);
+                updatePlannerWidgets();
+                notifyDownstreamSamplers(node);
+                return res;
+            };
+        }
+    }
+
+    if (!node._pj_conn_attached) {
+        node._pj_conn_attached = true;
+        const origOnConn = node.onConnectionsChange;
+        node.onConnectionsChange = function () {
+            const res = origOnConn?.apply(this, arguments);
+            setTimeout(() => {
+                notifyDownstreamSamplers(node);
+            }, 100);
             return res;
         };
     }

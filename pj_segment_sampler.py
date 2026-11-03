@@ -62,65 +62,14 @@ class PJ_SegmentSampler:
                 "sampler": ("SAMPLER", {"tooltip": "采样算法 (推荐 er_sde 或 euler)"}),
                 "sigmas": ("SIGMAS", {"tooltip": "调度器步长 (二采高清精修，通常 2~3 步)"}),
                 "latent_image": ("LATENT", {"tooltip": "输入待精修的高清潜空间 (来自 3D 潜空间超分放大后的 AV Latent)"}),
-            },
-            "optional": {
                 "segment_plan": (
                     "PJ_SEGMENT_PLAN",
                     {
-                        "tooltip": "连接来自【PJ分段规划器】的时钟总线，自动继承前置切片，实现一采与二采时序绝对对齐",
+                        "tooltip": "连接来自【PJ分段规划器】的时序总线，所有分段时钟与切片由此统领，杜绝重复设置",
                     },
                 ),
-                "split_mode": (
-                    ["按秒自动切分", "固定分段数", "自定义切点"],
-                    {"default": "按秒自动切分", "tooltip": "二采切分规划策略"},
-                ),
-                "chunk_seconds": (
-                    "FLOAT",
-                    {
-                        "default": 8.0,
-                        "min": 2.0,
-                        "max": 30.0,
-                        "step": 0.5,
-                        "tooltip": "自动模式下单段最大时长（秒），推荐 6.0 ~ 8.0 秒",
-                    },
-                ),
-                "overlap_seconds": (
-                    "FLOAT",
-                    {
-                        "default": 2.0,
-                        "min": 0.0,
-                        "max": 10.0,
-                        "step": 0.25,
-                        "tooltip": "相邻分段重叠过渡时长（秒），推荐 1.5 ~ 2.5 秒",
-                    },
-                ),
-                "num_segments": (
-                    "INT",
-                    {
-                        "default": 2,
-                        "min": 2,
-                        "max": 20,
-                        "step": 1,
-                        "tooltip": "固定分段数模式下的分段数量",
-                    },
-                ),
-                "custom_cuts": (
-                    "STRING",
-                    {
-                        "default": "0-8, 6-14, 12-20",
-                        "multiline": False,
-                        "tooltip": "自定义切分秒数范围，逗号分隔，如：0-8, 6-14, 12-20",
-                    },
-                ),
-                "align_51_frames": (
-                    "BOOLEAN",
-                    {
-                        "default": False,
-                        "label_on": "开启51帧吸附",
-                        "label_off": "关闭",
-                        "tooltip": "开启后将窗口长度吸附到51帧/85音频步网格，确保绝对RoPE相位一致，杜绝嘴型漂移；关闭则使用经典连续切分",
-                    },
-                ),
+            },
+            "optional": {
                 "run_mode": (
                     ["智能缓存(仅重跑未锁定分段)", "全部精修(刷新全部缓存)"]
                     + [f"仅精修第{i}段" for i in range(1, 21)]
@@ -189,10 +138,6 @@ class PJ_SegmentSampler:
                         "label_off": "保留显存",
                         "tooltip": "二采完成后自动将 20GB DiT 大模型卸载至 CPU 内存，使下游 VAE 解码拥有充足纯净显存，从根源消除 23G+ 爆显存风险！",
                     },
-                ),
-                "fps": (
-                    "FLOAT",
-                    {"default": 24.0, "min": 1.0, "max": 120.0, "step": 1.0, "tooltip": "视频帧率，MiniMax H3 官方为 24.0"},
                 ),
             },
         }
@@ -371,21 +316,24 @@ class PJ_SegmentSampler:
         total_a = full_audio.shape[-1] if full_audio is not None else 0
 
         # Plan chunks (优先从上游【PJ分段规划器】总线继承，保证绝对时序统一)
+        fps = 24.0
         if segment_plan is not None and isinstance(segment_plan, dict) and "chunks" in segment_plan:
             chunks = segment_plan["chunks"]
-            print(f"[PJ二采分段采样器] 🔗 成功读取上游【PJ分段规划器】总线，直接继承 {len(chunks)} 个切片分段！")
+            if "fps" in segment_plan and segment_plan["fps"]:
+                fps = float(segment_plan["fps"])
+            print(f"[PJ二采分段采样器] 🔗 成功读取上游【PJ分段规划器】总线，直接继承 {len(chunks)} 个切片分段 (FPS: {fps})！")
         else:
+            eff_split = kwargs.get("split_mode", "按秒自动切分")
+            eff_chunk = float(kwargs.get("chunk_seconds", 8.0))
+            eff_ov = float(kwargs.get("overlap_seconds", 2.0))
+            eff_num = int(kwargs.get("num_segments", 2))
+            eff_cuts = kwargs.get("custom_cuts", "")
+            eff_align = bool(kwargs.get("align_51_frames", False))
+            fps = float(kwargs.get("fps", 24.0))
             chunks = self.plan_segments(
-                total_v,
-                total_a,
-                split_mode,
-                chunk_seconds,
-                overlap_seconds,
-                num_segments,
-                custom_cuts,
-                fps,
-                align_51_frames=align_51_frames,
+                total_v, total_a, eff_split, eff_chunk, eff_ov, eff_num, eff_cuts, fps, align_51_frames=eff_align
             )
+            print(f"[PJ二采分段采样器] ⚠️ 未连接【分段规划总线】，使用安全默认分段 (共 {len(chunks)} 段)")
         n_chunks = len(chunks)
 
         print("\n" + "=" * 65)
