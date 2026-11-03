@@ -103,12 +103,10 @@ def _generate_preview_mp4(images, audio, fps):
         proc = subprocess.Popen(
             args,
             stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
-        proc.stdin.write(imgs_np.tobytes())
-        proc.stdin.close()
-        proc.wait(timeout=30)
+        proc.communicate(input=imgs_np.tobytes(), timeout=30)
 
         if audio_temp_path and os.path.exists(audio_temp_path):
             try:

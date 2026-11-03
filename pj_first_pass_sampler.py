@@ -399,20 +399,8 @@ class PJ_FirstPass_SegmentSampler:
         print("=" * 65)
 
         # Segment control configuration (支持到 20 段)
-        locks = [
-            kwargs.get(f"seg{i}_lock", False) if i > 8 else [
-                None, seg1_lock, seg2_lock, seg3_lock, seg4_lock,
-                seg5_lock, seg6_lock, seg7_lock, seg8_lock
-            ][i]
-            for i in range(1, 21)
-        ]
-        offsets = [
-            kwargs.get(f"seg{i}_seed_offset", i - 1) if i > 8 else [
-                None, seg1_seed_offset, seg2_seed_offset, seg3_seed_offset, seg4_seed_offset,
-                seg5_seed_offset, seg6_seed_offset, seg7_seed_offset, seg8_seed_offset
-            ][i]
-            for i in range(1, 21)
-        ]
+        locks = [bool(kwargs.get(f"seg{i}_lock", False)) for i in range(1, 21)]
+        offsets = [int(kwargs.get(f"seg{i}_seed_offset", i - 1)) for i in range(1, 21)]
 
         # Resolve effective base seed
         seed_val = getattr(noise, "seed", None)
@@ -520,9 +508,14 @@ class PJ_FirstPass_SegmentSampler:
                     chunk_guider = guider
 
             chunk_x0_output = {}
-            chunk_callback = latent_preview.prepare_callback(
-                chunk_guider.model_patcher, sigmas.shape[-1] - 1, chunk_x0_output
-            )
+            chunk_callback = None
+            try:
+                if hasattr(chunk_guider, "model_patcher") and chunk_guider.model_patcher is not None:
+                    chunk_callback = latent_preview.prepare_callback(
+                        chunk_guider.model_patcher, sigmas.shape[-1] - 1, chunk_x0_output
+                    )
+            except Exception:
+                chunk_callback = None
 
             # Sample the segment
             chunk_out = chunk_guider.sample(

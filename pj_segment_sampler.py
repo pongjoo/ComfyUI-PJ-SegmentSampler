@@ -344,13 +344,7 @@ class PJ_SegmentSampler:
         print("=" * 65)
 
         # Segment control configuration (支持到 20 段)
-        locks = [
-            kwargs.get(f"seg{i}_lock", False) if i > 8 else [
-                None, seg1_lock, seg2_lock, seg3_lock, seg4_lock,
-                seg5_lock, seg6_lock, seg7_lock, seg8_lock
-            ][i]
-            for i in range(1, 21)
-        ]
+        locks = [bool(kwargs.get(f"seg{i}_lock", False)) for i in range(1, 21)]
 
         # 计算目标缺陷秒数所属的分段编号 (如果处于缺陷秒数精修模式)
         target_defect_seg = None
@@ -443,9 +437,14 @@ class PJ_SegmentSampler:
                     chunk_mask = noise_mask[:, v_start:v_end, :, :].clone()
 
             chunk_x0_output = {}
-            chunk_callback = latent_preview.prepare_callback(
-                guider.model_patcher, sigmas.shape[-1] - 1, chunk_x0_output
-            )
+            chunk_callback = None
+            try:
+                if hasattr(guider, "model_patcher") and guider.model_patcher is not None:
+                    chunk_callback = latent_preview.prepare_callback(
+                        guider.model_patcher, sigmas.shape[-1] - 1, chunk_x0_output
+                    )
+            except Exception:
+                chunk_callback = None
 
             chunk_out = guider.sample(
                 chunk_noise,
