@@ -153,6 +153,13 @@ class PJ_SegmentPlanner:
                         "tooltip": "视频帧率，MiniMax H3 官方为 24.0",
                     },
                 ),
+                "duration_control": (
+                    ["按秒数控制", "按精确帧数控制"],
+                    {
+                        "default": "按秒数控制",
+                        "tooltip": "选择视频总长设定模式：按秒数控制或按精确帧数控制",
+                    },
+                ),
                 "duration_seconds": (
                     "FLOAT",
                     {
@@ -238,6 +245,7 @@ class PJ_SegmentPlanner:
         images=None,
         audio=None,
         fps=24.0,
+        duration_control="按秒数控制",
         duration_seconds=15.0,
         total_frames=0,
         split_mode="按秒自动切分",
@@ -246,15 +254,18 @@ class PJ_SegmentPlanner:
         num_segments=3,
         custom_cuts="0-6, 4.5-10.5, 9-15",
         align_51_frames=False,
+        **kwargs,
     ):
         # 1. 确定实际视频总帧数与时长 (秒)
         if images is not None and hasattr(images, "shape") and len(images.shape) >= 1:
             total_frames = int(images.shape[0])
             effective_seconds = float(total_frames) / float(fps)
-        elif total_frames > 0:
+        elif duration_control in ("按精确帧数控制", "按精确总帧数控制", "exact_frames", "total_frames"):
+            if total_frames <= 0:
+                total_frames = max(1, int(round(max(0.1, float(duration_seconds)) * fps)))
             effective_seconds = float(total_frames) / float(fps)
         else:
-            effective_seconds = max(1.0, float(duration_seconds))
+            effective_seconds = max(0.1, float(duration_seconds))
             total_frames = int(round(effective_seconds * fps))
 
         v_fps = fps / 3.4
@@ -398,6 +409,7 @@ class PJ_SegmentPlanner:
             "n_chunks": n_chunks,
             "effective_seconds": round(effective_seconds, 2),
             "total_frames": total_frames,
+            "duration_control": duration_control,
             "total_v": total_v,
             "total_a": total_a,
             "split_mode": split_mode,
