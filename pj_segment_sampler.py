@@ -15,6 +15,33 @@ import latent_preview
 _SECOND_PASS_CACHE = {}
 
 
+def _safe_generate_noise(noise_obj, latent_image_dict, latent_tensor, seed_val=0):
+    """
+    安全生成噪声：标准 ComfyUI Noise 节点 (如 RandomNoise) 的 generate_noise
+    要求传入包含 'samples' 的 dict (即 latent_image)。
+    本函数进行多重容错，彻底杜绝 'too many indices for tensor of dimension 5' 异常。
+    """
+    if noise_obj is None:
+        return comfy.sample.prepare_noise(latent_tensor, seed_val)
+
+    if hasattr(noise_obj, "generate_noise"):
+        try:
+            if isinstance(latent_image_dict, dict) and "samples" in latent_image_dict:
+                return noise_obj.generate_noise(latent_image_dict)
+            else:
+                return noise_obj.generate_noise({"samples": latent_tensor})
+        except (TypeError, KeyError, IndexError):
+            try:
+                return noise_obj.generate_noise(latent_tensor)
+            except Exception:
+                pass
+
+    eff_seed = getattr(noise_obj, "seed", seed_val)
+    if eff_seed is None or not isinstance(eff_seed, int):
+        eff_seed = seed_val
+    return comfy.sample.prepare_noise(latent_tensor, eff_seed)
+
+
 class PJ_SegmentSampler:
     """
     PJ二采分段精修采样器 (Second-Pass Segment Sampler)
@@ -393,8 +420,8 @@ class PJ_SegmentSampler:
                 target_defect_seg = 1
                 print(f"[PJ二采分段采样器] ⚠️ 目标秒数 {target_time_second:.2f}s 超出范围，默认精修第 1 段")
 
-        # Generate global noise
-        global_noise = noise.generate_noise(latent)
+        # Generate global noise (使用多重安全容错函数，彻底杜绝 5D 索引异常)
+        global_noise = _safe_generate_noise(noise, latent_image, latent, getattr(noise, "seed", 0))
         if is_nested:
             gn_streams = list(global_noise.unbind())
             gn_video = gn_streams[0]
