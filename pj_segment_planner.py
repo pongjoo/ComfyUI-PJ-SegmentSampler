@@ -150,14 +150,7 @@ class PJ_SegmentPlanner:
                         "min": 1.0,
                         "max": 120.0,
                         "step": 1.0,
-                        "tooltip": "视频帧率，MiniMax H3 官方为 24.0",
-                    },
-                ),
-                "duration_control": (
-                    ["按秒数控制", "按精确帧数控制"],
-                    {
-                        "default": "按秒数控制",
-                        "tooltip": "选择视频总长设定模式：按秒数控制或按精确帧数控制",
+                        "tooltip": "视频帧率，用于将连接的总帧数换算为秒数以匹配分段，MiniMax H3 官方为 24.0",
                     },
                 ),
                 "duration_seconds": (
@@ -167,17 +160,7 @@ class PJ_SegmentPlanner:
                         "min": 0.0,
                         "max": 600.0,
                         "step": 0.5,
-                        "tooltip": "视频总时长（秒），若连接了 images 则自动根据帧数和FPS计算",
-                    },
-                ),
-                "total_frames": (
-                    "INT",
-                    {
-                        "default": 0,
-                        "min": 0,
-                        "max": 999999,
-                        "step": 1,
-                        "tooltip": "视频总帧数，若连接了 images 则自动以实际帧数计算",
+                        "tooltip": "默认视频总时长（秒），当外部未连接总帧数输入连接点时生效",
                     },
                 ),
                 "split_mode": (
@@ -232,6 +215,33 @@ class PJ_SegmentPlanner:
                     },
                 ),
             },
+            "optional": {
+                "total_frames": (
+                    "INT",
+                    {
+                        "forceInput": True,
+                        "tooltip": "【帧数输入连接点】直接接入外部总帧数控制，结合面板FPS自动计算总秒数以匹配分段设置",
+                    },
+                ),
+                "latent": (
+                    "LATENT",
+                    {
+                        "tooltip": "【可选】接入采样器处理的潜空间，未连帧数时直接读取其实际长度自动规划",
+                    },
+                ),
+                "images": (
+                    "IMAGE",
+                    {
+                        "tooltip": "【可选】接入参考视频图像，自动根据视频实际帧数与FPS计算",
+                    },
+                ),
+                "audio": (
+                    "AUDIO",
+                    {
+                        "tooltip": "【可选】音频透传",
+                    },
+                ),
+            },
         }
 
     RETURN_TYPES = ("PJ_SEGMENT_PLAN", "INT", "STRING", "IMAGE", "AUDIO")
@@ -242,12 +252,12 @@ class PJ_SegmentPlanner:
 
     def plan(
         self,
+        total_frames=None,
+        latent=None,
         images=None,
         audio=None,
         fps=24.0,
-        duration_control="按秒数控制",
         duration_seconds=15.0,
-        total_frames=0,
         split_mode="按秒自动切分",
         chunk_seconds=6.0,
         overlap_seconds=1.5,
@@ -256,17 +266,38 @@ class PJ_SegmentPlanner:
         align_51_frames=False,
         **kwargs,
     ):
+        # 兼容 kwargs 传参
+        if total_frames is None:
+            total_frames = kwargs.get("total_frames_in", None)
+
         # 1. 确定实际视频总帧数与时长 (秒)
-        if images is not None and hasattr(images, "shape") and len(images.shape) >= 1:
-            total_frames = int(images.shape[0])
-            effective_seconds = float(total_frames) / float(fps)
-        elif duration_control in ("按精确帧数控制", "按精确总帧数控制", "exact_frames", "total_frames"):
-            if total_frames <= 0:
-                total_frames = max(1, int(round(max(0.1, float(duration_seconds)) * fps)))
-            effective_seconds = float(total_frames) / float(fps)
+        # 规则：通过连接的总帧数和面板 FPS 去匹配按多少秒分段的设置
+        if total_frames is not None and int(total_frames) > 0:
+            eff_total_frames = int(total_frames)
+            effective_seconds = float(eff_total_frames) / float(fps)
+            print(f"[PJ分段规划器] 🎯 采用外部接入的【总帧数】: {eff_total_frames} 帧，结合 FPS={fps} 换算总时长为 {effective_seconds:.2f} 秒")
+        elif latent is not None and isinstance(latent, dict) and "samples" in latent:
+            # 自动读取传入的实际 Latent 长度 (等于原来二采前置设置直接嗅探 Latent)
+            samples = latent["samples"]
+            if hasattr(samples, "is_nested") and samples.is_nested:
+                v_stream = list(samples.unbind())[0]
+            else:
+                v_stream = samples
+            total_v = v_stream.shape[2]
+            v_fps = fps / 3.4
+            effective_seconds = float(total_v) / float(v_fps)
+            eff_total_frames = int(round(effective_seconds * fps))
+            print(f"[PJ分段规划器] 🚀 未接帧数输入，直接按采样器实际 Latent 长度规划: {total_v} 潜步 (~{effective_seconds:.2f}秒, {eff_total_frames} 帧)")
+        elif images is not None and hasattr(images, "shape") and len(images.shape) >= 1:
+            eff_total_frames = int(images.shape[0])
+            effective_seconds = float(eff_total_frames) / float(fps)
+            print(f"[PJ分段规划器] 🎬 采用输入图像序列实际帧数: {eff_total_frames} 帧 (~{effective_seconds:.2f}秒)")
         else:
             effective_seconds = max(0.1, float(duration_seconds))
-            total_frames = int(round(effective_seconds * fps))
+            eff_total_frames = int(round(effective_seconds * fps))
+            print(f"[PJ分段规划器] ⚙️ 未连外部输入，采用面板默认时长: {effective_seconds:.2f} 秒 ({eff_total_frames} 帧)")
+
+        total_frames = eff_total_frames
 
         v_fps = fps / 3.4
         a_fps = 40.0
@@ -409,7 +440,6 @@ class PJ_SegmentPlanner:
             "n_chunks": n_chunks,
             "effective_seconds": round(effective_seconds, 2),
             "total_frames": total_frames,
-            "duration_control": duration_control,
             "total_v": total_v,
             "total_a": total_a,
             "split_mode": split_mode,

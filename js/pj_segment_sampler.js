@@ -8,7 +8,6 @@ const HIDDEN_TAG = "pj_hidden";
 // ==========================================
 const WIDGET_LABELS = {
     // 规划模式相关
-    "duration_control": "时长控制模式",
     "split_mode": "切分规划模式",
     "chunk_seconds": "单段最大秒数",
     "overlap_seconds": "重叠过渡秒数",
@@ -17,7 +16,6 @@ const WIDGET_LABELS = {
     "align_51_frames": "51帧网格吸附",
     "fps": "视频帧率",
     "duration_seconds": "视频总时长(秒)",
-    "total_frames": "视频总帧数",
 
     // 一采专有功能
     "sync_ref_video": "同步参考视频",
@@ -41,6 +39,9 @@ for (let i = 1; i <= 20; i++) {
 }
 
 const INPUT_LABELS = {
+    "total_frames": "视频总帧数输入",
+    "total_frames_in": "视频总帧数输入",
+    "latent": "潜空间(可选)",
     "images": "视频图像",
     "audio": "音频原声",
     "noise": "随机噪声",
@@ -225,16 +226,7 @@ function resolveTargetSegmentCount(node) {
         } else {
             // 按秒自动切分模式：根据时长与窗口步长实时估算
             let dur = parseFloat(originNode.widgets?.find(w => w.name === "duration_seconds")?.value || 15);
-            const durCtrl = originNode.widgets?.find(w => w.name === "duration_control")?.value;
-            const tf = parseFloat(originNode.widgets?.find(w => w.name === "total_frames")?.value || 0);
             const fps = parseFloat(originNode.widgets?.find(w => w.name === "fps")?.value || 24);
-            if ((durCtrl === "按精确帧数控制" || durCtrl === "按精确总帧数控制" || durCtrl === "exact_frames" || durCtrl === "total_frames") && tf > 0 && fps > 0) {
-                dur = tf / fps;
-            } else if (durCtrl === "按秒数控制" && dur > 0) {
-                // 按秒数模式直接使用 dur
-            } else if (tf > 0 && fps > 0) {
-                dur = tf / fps;
-            }
             const chunk = parseFloat(originNode.widgets?.find(w => w.name === "chunk_seconds")?.value || 6);
             const ov = parseFloat(originNode.widgets?.find(w => w.name === "overlap_seconds")?.value || 1.5);
             const step = Math.max(0.5, chunk - ov);
@@ -502,11 +494,6 @@ function setupPlannerNode(node) {
         node.title = "PJ分段规划器 (时序总控/可视播放器)";
     }
 
-    const durCtrlWidget = node.widgets?.find(w => w.name === "duration_control");
-    const durSecWidget = node.widgets?.find(w => w.name === "duration_seconds");
-    const totFramesWidget = node.widgets?.find(w => w.name === "total_frames");
-    const fpsWidget = node.widgets?.find(w => w.name === "fps");
-
     const modeWidget = node.widgets?.find(w => w.name === "split_mode");
     const chunkSec = node.widgets?.find(w => w.name === "chunk_seconds");
     const overlapSec = node.widgets?.find(w => w.name === "overlap_seconds");
@@ -514,29 +501,6 @@ function setupPlannerNode(node) {
     const customCuts = node.widgets?.find(w => w.name === "custom_cuts");
 
     function updatePlannerWidgets() {
-        // 1. 时长控制模式切换：按秒数控制 vs 按精确帧数控制
-        if (durCtrlWidget) {
-            const isFrameMode = (
-                durCtrlWidget.value === "按精确帧数控制" ||
-                durCtrlWidget.value === "按精确总帧数控制" ||
-                durCtrlWidget.value === "exact_frames" ||
-                durCtrlWidget.value === "total_frames"
-            );
-            if (isFrameMode) {
-                toggleWidget(node, durSecWidget, false);
-                toggleWidget(node, totFramesWidget, true);
-                if (totFramesWidget && (!totFramesWidget.value || totFramesWidget.value <= 0)) {
-                    const fpsVal = parseFloat(fpsWidget?.value || 24);
-                    const secVal = parseFloat(durSecWidget?.value || 15);
-                    totFramesWidget.value = Math.max(1, Math.round(secVal * fpsVal));
-                }
-            } else {
-                toggleWidget(node, durSecWidget, true);
-                toggleWidget(node, totFramesWidget, false);
-            }
-        }
-
-        // 2. 切分规划模式切换
         if (modeWidget) {
             const mode = modeWidget.value;
             if (mode === "按秒自动切分") {
@@ -559,36 +523,13 @@ function setupPlannerNode(node) {
         autoResizeNode(node);
     }
 
-    if (durCtrlWidget && !durCtrlWidget._pj_switch_attached) {
-        durCtrlWidget._pj_switch_attached = true;
-        const origCb = durCtrlWidget.callback;
-        durCtrlWidget.callback = function (v) {
-            const fpsVal = parseFloat(fpsWidget?.value || 24);
-            if (v === "按精确帧数控制" || v === "按精确总帧数控制") {
-                if (durSecWidget && durSecWidget.value > 0) {
-                    totFramesWidget.value = Math.max(1, Math.round(durSecWidget.value * fpsVal));
-                }
-            } else if (v === "按秒数控制") {
-                if (totFramesWidget && totFramesWidget.value > 0) {
-                    durSecWidget.value = Math.round((totFramesWidget.value / fpsVal) * 100) / 100;
-                }
-            }
-            const res = origCb?.apply(this, arguments);
-            updatePlannerWidgets();
-            notifyDownstreamSamplers(node);
-            return res;
-        };
-    }
-
     const plannerWatchNames = [
-        "duration_control",
         "split_mode",
         "chunk_seconds",
         "overlap_seconds",
         "num_segments",
         "custom_cuts",
         "duration_seconds",
-        "total_frames",
         "fps",
         "align_51_frames"
     ];
@@ -877,12 +818,14 @@ app.registerExtension({
             const origConfigure = nodeType.prototype.configure;
             nodeType.prototype.configure = function (info) {
                 if (info && info.widgets_values && Array.isArray(info.widgets_values)) {
-                    // 兼容旧版 workflow: 旧版 widgets_values 格式为 [fps, duration_seconds, total_frames, ...] (第1项为数值)
-                    // 新版 widgets_values 格式为 [fps, duration_control, duration_seconds, total_frames, ...] (第1项为字符串)
-                    if (typeof info.widgets_values[1] === "number") {
-                        const oldTf = Number(info.widgets_values[2]) || 0;
-                        const controlVal = (oldTf > 0) ? "按精确帧数控制" : "按秒数控制";
-                        info.widgets_values.splice(1, 0, controlVal);
+                    // 兼容旧版 workflow:
+                    // 1. 若第1项为 string (临时 duration_control)，剔除它
+                    if (typeof info.widgets_values[1] === "string") {
+                        info.widgets_values.splice(1, 1);
+                    }
+                    // 2. 若依然超过 8 项且第2项为 number (旧版 total_frames widget 已变为输入连接点)，平滑移除
+                    if (info.widgets_values.length > 8 && typeof info.widgets_values[2] === "number") {
+                        info.widgets_values.splice(2, 1);
                     }
                 }
                 const r = origConfigure ? origConfigure.apply(this, arguments) : undefined;
@@ -896,10 +839,11 @@ app.registerExtension({
             const onConfigure = nodeType.prototype.onConfigure;
             nodeType.prototype.onConfigure = function (info) {
                 if (info && info.widgets_values && Array.isArray(info.widgets_values)) {
-                    if (typeof info.widgets_values[1] === "number") {
-                        const oldTf = Number(info.widgets_values[2]) || 0;
-                        const controlVal = (oldTf > 0) ? "按精确帧数控制" : "按秒数控制";
-                        info.widgets_values.splice(1, 0, controlVal);
+                    if (typeof info.widgets_values[1] === "string") {
+                        info.widgets_values.splice(1, 1);
+                    }
+                    if (info.widgets_values.length > 8 && typeof info.widgets_values[2] === "number") {
+                        info.widgets_values.splice(2, 1);
                     }
                 }
                 const r = onConfigure ? onConfigure.apply(this, arguments) : undefined;
