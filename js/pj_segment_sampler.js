@@ -223,7 +223,12 @@ function resolveTargetSegmentCount(node) {
             if (count > 0) return Math.min(20, count);
         } else {
             // 按秒自动切分模式：根据时长与窗口步长实时估算
-            const dur = parseFloat(originNode.widgets?.find(w => w.name === "duration_seconds")?.value || 15);
+            let dur = parseFloat(originNode.widgets?.find(w => w.name === "duration_seconds")?.value || 15);
+            const tf = parseFloat(originNode.widgets?.find(w => w.name === "total_frames")?.value || 0);
+            const fps = parseFloat(originNode.widgets?.find(w => w.name === "fps")?.value || 24);
+            if (tf > 0 && fps > 0) {
+                dur = tf / fps;
+            }
             const chunk = parseFloat(originNode.widgets?.find(w => w.name === "chunk_seconds")?.value || 6);
             const ov = parseFloat(originNode.widgets?.find(w => w.name === "overlap_seconds")?.value || 1.5);
             const step = Math.max(0.5, chunk - ov);
@@ -307,39 +312,39 @@ function syncSamplerSegmentCount(node, isFirstPass) {
     autoResizeNode(node);
 }
 
-// 为采样器注入便捷的“刷新分段适配 / 总线同步”按钮 (单例且自动清除任何历史多余重复项)
+// 为采样器注入便捷的“读取规划器参数 / 刷新分段适配”按钮 (单例且自动清除任何历史多余重复项)
 function ensureSyncButton(node, isFirstPass) {
     if (!node.widgets) return;
 
     const isConnected = isSegmentPlanConnected(node);
     const maxSeg = resolveTargetSegmentCount(node);
     const targetBtnName = isConnected
-        ? `🔗 刷新总线同步 (已接管规划器 ${maxSeg} 段)`
-        : `🔄 刷新分段适配 (当前自适应 ${maxSeg} 段)`;
+        ? `🔗 读取规划器参数 (当前共 ${maxSeg} 段)`
+        : `🔄 读取规划参数 (当前共 ${maxSeg} 段)`;
 
     const handleButtonClick = (widget) => {
         syncSamplerSegmentCount(node, isFirstPass);
         const curSeg = resolveTargetSegmentCount(node);
         if (widget) {
-            widget.name = `✅ 已刷新：当前共 ${curSeg} 段！`;
+            widget.name = `✅ 已读取规划参数：当前共 ${curSeg} 段！`;
             if (node.setDirtyCanvas) node.setDirtyCanvas(true, true);
             if (app.canvas && app.canvas.setDirty) app.canvas.setDirty(true, true);
             setTimeout(() => {
                 const refreshedConnected = isSegmentPlanConnected(node);
                 widget.name = refreshedConnected
-                    ? `🔗 刷新总线同步 (已接管规划器 ${curSeg} 段)`
-                    : `🔄 刷新分段适配 (当前自适应 ${curSeg} 段)`;
+                    ? `🔗 读取规划器参数 (当前共 ${curSeg} 段)`
+                    : `🔄 读取规划参数 (当前共 ${curSeg} 段)`;
                 if (node.setDirtyCanvas) node.setDirtyCanvas(true, true);
                 if (app.canvas && app.canvas.setDirty) app.canvas.setDirty(true, true);
             }, 1200);
         }
-        console.log(`[PJ分段采样] 🔄 用户点击刷新适配，当前已生效分段数: ${curSeg}`);
+        console.log(`[PJ分段采样] 🔄 用户点击读取规划器参数，当前已生效分段数: ${curSeg}`);
     };
 
     let keptOne = false;
     const cleanWidgets = [];
     for (const w of node.widgets) {
-        if (w.type === "button" || (w.name && (w.name.includes("刷新") || w.name.includes("总线同步") || w.name.includes("已刷新")))) {
+        if (w.type === "button" || (w.name && (w.name.includes("刷新") || w.name.includes("读取") || w.name.includes("总线同步") || w.name.includes("已刷新") || w.name.includes("已读取")))) {
             if (!keptOne) {
                 // 保留且仅保留第一个，重置其名称与回调
                 keptOne = true;
