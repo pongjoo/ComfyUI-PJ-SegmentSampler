@@ -123,8 +123,8 @@ class PJ_FirstPass_SegmentSampler:
                     "BOOLEAN",
                     {
                         "default": False,
-                        "label_on": "开启51帧整数吸附",
-                        "label_off": "关闭(经典连续切分)",
+                        "label_on": "开启51帧吸附",
+                        "label_off": "关闭",
                         "tooltip": "开启后将窗口长度吸附到51帧/85音频步网格，确保绝对RoPE相位一致",
                     },
                 ),
@@ -132,7 +132,7 @@ class PJ_FirstPass_SegmentSampler:
                     "BOOLEAN",
                     {
                         "default": True,
-                        "label_on": "开启参考视频时钟同步(强烈推荐)",
+                        "label_on": "开启(时序同步)",
                         "label_off": "关闭",
                         "tooltip": "【核心功能】自动将参考视频按分段时区精准裁切，保证各段角色动作与原视频对应秒数100%对齐！",
                     },
@@ -166,7 +166,7 @@ class PJ_FirstPass_SegmentSampler:
                 ),
                 "seg1_lock": (
                     "BOOLEAN",
-                    {"default": False, "label_on": "锁定第1段缓存", "label_off": "未锁定", "tooltip": "打勾锁定后跳过计算，0秒读缓存"},
+                    {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "打勾锁定后跳过计算，0秒读缓存"},
                 ),
                 "seg2_seed_offset": (
                     "INT",
@@ -174,7 +174,7 @@ class PJ_FirstPass_SegmentSampler:
                 ),
                 "seg2_lock": (
                     "BOOLEAN",
-                    {"default": False, "label_on": "锁定第2段缓存", "label_off": "未锁定", "tooltip": "打勾锁定后跳过计算，0秒读缓存"},
+                    {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "打勾锁定后跳过计算，0秒读缓存"},
                 ),
                 "seg3_seed_offset": (
                     "INT",
@@ -182,7 +182,7 @@ class PJ_FirstPass_SegmentSampler:
                 ),
                 "seg3_lock": (
                     "BOOLEAN",
-                    {"default": False, "label_on": "锁定第3段缓存", "label_off": "未锁定", "tooltip": "打勾锁定后跳过计算，0秒读缓存"},
+                    {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "打勾锁定后跳过计算，0秒读缓存"},
                 ),
                 "seg4_seed_offset": (
                     "INT",
@@ -190,7 +190,7 @@ class PJ_FirstPass_SegmentSampler:
                 ),
                 "seg4_lock": (
                     "BOOLEAN",
-                    {"default": False, "label_on": "锁定第4段缓存", "label_off": "未锁定", "tooltip": "打勾锁定后跳过计算，0秒读缓存"},
+                    {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "打勾锁定后跳过计算，0秒读缓存"},
                 ),
                 "blend_mode": (
                     ["余弦平滑(推荐)", "线性过渡", "硬切"],
@@ -200,8 +200,8 @@ class PJ_FirstPass_SegmentSampler:
                     "BOOLEAN",
                     {
                         "default": False,
-                        "label_on": "一采后卸载模型释放显存",
-                        "label_off": "保留模型在显存",
+                        "label_on": "开启(释放显存)",
+                        "label_off": "保留显存",
                         "tooltip": "若一采后直接运行3D超分，开启此项可清空GPU显存，给超分腾出充足空间",
                     },
                 ),
@@ -233,7 +233,7 @@ class PJ_FirstPass_SegmentSampler:
         a_fps = 40.0
         chunks = []
 
-        if split_mode == "按秒自动切分":
+        if split_mode in ("按秒自动切分", "auto_by_seconds"):
             if align_51_frames:
                 target_chunk_v = max(17, int(round(chunk_seconds * v_fps)))
                 m_chunk = max(1, round((target_chunk_v - 2) / 15.0))
@@ -282,7 +282,7 @@ class PJ_FirstPass_SegmentSampler:
                         break
                     v_cur += stride_v
 
-        elif split_mode == "固定分段数":
+        elif split_mode in ("固定分段数", "fixed_segments"):
             win_v = max(5, int(math.ceil(total_v / num_segments)))
             rem = (win_v - 2) % 5
             if rem != 0:
@@ -300,7 +300,7 @@ class PJ_FirstPass_SegmentSampler:
                 a_e = min(total_a, int(round(sec_e * a_fps)))
                 chunks.append((v_start, v_end, a_s, a_e))
 
-        elif split_mode == "自定义切点":
+        elif split_mode in ("自定义切点", "custom", "custom_cuts"):
             pairs = [p.strip() for p in custom_cuts.split(",") if "-" in p]
             for p in pairs:
                 try:
@@ -349,6 +349,15 @@ class PJ_FirstPass_SegmentSampler:
         fps=24.0,
     ):
         global _FIRST_PASS_CACHE
+
+        if isinstance(run_mode, bool) or str(run_mode).lower() in ("true", "false"):
+            run_mode = "智能缓存(仅重跑未锁定分段)"
+        if blend_mode in ("cosine", "余弦平滑(推荐)"):
+            norm_blend = "cosine"
+        elif blend_mode in ("linear", "线性过渡"):
+            norm_blend = "linear"
+        else:
+            norm_blend = "hard_cut"
 
         latent = latent_image.get("samples")
         if latent is None:

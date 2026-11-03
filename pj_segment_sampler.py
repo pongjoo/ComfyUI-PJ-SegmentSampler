@@ -83,8 +83,8 @@ class PJ_SegmentSampler:
                     "BOOLEAN",
                     {
                         "default": False,
-                        "label_on": "开启51帧整数吸附",
-                        "label_off": "关闭(经典连续切分)",
+                        "label_on": "开启51帧吸附",
+                        "label_off": "关闭",
                         "tooltip": "开启后将窗口长度吸附到51帧/85音频步网格，确保绝对RoPE相位一致，杜绝嘴型漂移；关闭则使用经典连续切分",
                     },
                 ),
@@ -98,25 +98,25 @@ class PJ_SegmentSampler:
                         "仅精修第4段",
                     ],
                     {
-                        "default": "全部精修(刷新全部缓存)",
+                        "default": "智能缓存(仅重跑未锁定分段)",
                         "tooltip": "二采精修控制台：可选择只对某一段进行二采重采样，其余段直接从缓存复用",
                     },
                 ),
                 "seg1_lock": (
                     "BOOLEAN",
-                    {"default": False, "label_on": "锁定第1段二采缓存", "label_off": "未锁定", "tooltip": "打勾后，跳过第1段二采计算直接读缓存"},
+                    {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "打勾后，跳过第1段二采计算直接读缓存"},
                 ),
                 "seg2_lock": (
                     "BOOLEAN",
-                    {"default": False, "label_on": "锁定第2段二采缓存", "label_off": "未锁定", "tooltip": "打勾后，跳过第2段二采计算直接读缓存"},
+                    {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "打勾后，跳过第2段二采计算直接读缓存"},
                 ),
                 "seg3_lock": (
                     "BOOLEAN",
-                    {"default": False, "label_on": "锁定第3段二采缓存", "label_off": "未锁定", "tooltip": "打勾后，跳过第3段二采计算直接读缓存"},
+                    {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "打勾后，跳过第3段二采计算直接读缓存"},
                 ),
                 "seg4_lock": (
                     "BOOLEAN",
-                    {"default": False, "label_on": "锁定第4段二采缓存", "label_off": "未锁定", "tooltip": "打勾后，跳过第4段二采计算直接读缓存"},
+                    {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "打勾后，跳过第4段二采计算直接读缓存"},
                 ),
                 "blend_mode": (
                     ["余弦平滑(推荐)", "线性过渡", "硬切"],
@@ -126,8 +126,8 @@ class PJ_SegmentSampler:
                     "BOOLEAN",
                     {
                         "default": True,
-                        "label_on": "保留一采原音频(强烈推荐)",
-                        "label_off": "二采音频融合",
+                        "label_on": "开启(原音保真)",
+                        "label_off": "二采融合",
                         "tooltip": "二采核心目的是超分细化视频画面。强烈建议勾选此项，100%保留一采无瑕疵连续音频，杜绝声学相位抵消与爆音！",
                     },
                 ),
@@ -135,8 +135,8 @@ class PJ_SegmentSampler:
                     "BOOLEAN",
                     {
                         "default": True,
-                        "label_on": "二采后卸载模型释放显存(保卫VAE)",
-                        "label_off": "保留模型在显存",
+                        "label_on": "开启(释放显存)",
+                        "label_off": "保留显存",
                         "tooltip": "二采完成后自动将 20GB DiT 大模型卸载至 CPU 内存，使下游 VAE 解码拥有充足纯净显存，从根源消除 23G+ 爆显存风险！",
                     },
                 ),
@@ -282,6 +282,8 @@ class PJ_SegmentSampler:
         global _SECOND_PASS_CACHE
 
         # Compatibility fallbacks
+        if isinstance(run_mode, bool) or str(run_mode).lower() in ("true", "false"):
+            run_mode = "智能缓存(仅重跑未锁定分段)"
         if "preserve_original_audio" in kwargs:
             keep_original_audio = kwargs["preserve_original_audio"]
         if blend_mode in ("cosine", "余弦平滑(推荐)"):
