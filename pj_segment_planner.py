@@ -155,7 +155,7 @@ class PJ_SegmentPlanner:
                         "min": 2.0,
                         "max": 30.0,
                         "step": 0.5,
-                        "tooltip": "自动模式下单段最大时长（秒），推荐 5.0 ~ 7.0 秒",
+                        "tooltip": "目标参考时长；后端选择最接近的H3合法帧数，实际时长可能略长或略短，尾段以输入长度为限",
                     },
                 ),
                 "overlap_seconds": (
@@ -165,7 +165,7 @@ class PJ_SegmentPlanner:
                         "min": 0.0,
                         "max": 10.0,
                         "step": 0.25,
-                        "tooltip": "相邻分段重叠过渡时长（秒），推荐 1.0 ~ 2.0 秒",
+                        "tooltip": "目标参考重叠；后端按实际段长选择最近的合法重叠，不保证精确等于输入秒数",
                     },
                 ),
                 "num_segments": (
@@ -183,16 +183,7 @@ class PJ_SegmentPlanner:
                     {
                         "default": "0-6, 4.5-10.5, 9-15",
                         "multiline": False,
-                        "tooltip": "自定义切分秒数范围，逗号分隔，如：0-6, 4.5-10.5, 9-15",
-                    },
-                ),
-                "align_51_frames": (
-                    "BOOLEAN",
-                    {
-                        "default": False,
-                        "label_on": "开启51帧吸附",
-                        "label_off": "关闭",
-                        "tooltip": "使用51视频帧/15视频潜步/85音频潜步的整数起点步进；不保证嘴型或接缝质量",
+                        "tooltip": "参考秒数范围，如：0-6, 4.5-10.5, 9-15；后端将起止位置就近对齐到H3合法网格",
                     },
                 ),
             },
@@ -278,6 +269,8 @@ class PJ_SegmentPlanner:
             summary_lines.append(f"• 视频总长: {effective_seconds:.2f}秒 ({total_frames} 帧, 潜空间 {total_v} 步)")
 
         summary_lines.append(f"• 规划模式: {split_mode} | 总计切分: {n_chunks} 个分段 | FPS: {fps}")
+        timing_note = "秒数仅供参考；后端就近匹配H3合法帧数，实际结果以下方明细为准。"
+        summary_lines.append(f"• {timing_note}")
         summary_lines.append("--------------------------------------------------")
 
         for i, (vs, ve, as_, ae) in enumerate(chunks):
@@ -285,14 +278,19 @@ class PJ_SegmentPlanner:
             s_frame = int(round(s_sec * fps))
             e_frame = min(total_frames, int(round(e_sec * fps)))
             dur_sec = round(e_sec - s_sec, 2)
+            overlap_frames = max(0, min(e_frame, frames_for_tokens(chunks[i - 1][1])) - s_frame) if i else 0
+            overlap_sec = round(overlap_frames / fps, 3)
             summary_lines.append(
                 f"  段 {i + 1:02d}: [{s_sec:5.2f}s ~ {e_sec:5.2f}s] ({dur_sec}s, 帧 {s_frame}~{e_frame}) (步 {vs}:{ve})"
+                + (f" | 与前段重叠 {overlap_sec:.3f}s / {overlap_frames}帧" if i else "")
             )
             chunks_sec_info.append({
                 "segment": i + 1,
                 "start_sec": round(s_sec, 2),
                 "end_sec": round(e_sec, 2),
                 "duration_sec": dur_sec,
+                "overlap_seconds": overlap_sec,
+                "overlap_frames": overlap_frames,
                 "start_frame": s_frame,
                 "end_frame": e_frame,
                 "vs": vs,
@@ -323,7 +321,8 @@ class PJ_SegmentPlanner:
             "overlap_seconds": overlap_seconds,
             "num_segments": num_segments,
             "custom_cuts": custom_cuts,
-            "align_51_frames": align_51_frames,
+            "align_51_frames": False,
+            "timing_policy": "nearest_h3",
             "fps": fps,
             "summary": summary_text,
             "has_video": video_filename is not None,
@@ -342,6 +341,8 @@ class PJ_SegmentPlanner:
                 "chunks": chunks_sec_info,
                 "summary": summary_text,
                 "mode_desc": mode_desc,
+                "timing_policy": "nearest_h3",
+                "timing_note": timing_note,
             }]
         }
 

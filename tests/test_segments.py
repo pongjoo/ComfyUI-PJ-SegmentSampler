@@ -90,11 +90,66 @@ class SegmentTests(unittest.TestCase):
                     self.assertEqual(chunks[0][0], 0)
                     self.assertEqual(chunks[-1][1], total)
                     for vs, ve, a_s, ae in chunks:
-                        self.assertEqual(vs % (15 if align else 5), 0)
+                        self.assertEqual(vs % 5, 0)
                         self.assertEqual((ve - vs) % 5, 2)
                         self.assertTrue(0 <= a_s < ae <= audio)
                         self.assertEqual(a_s, round(frames_for_tokens(vs) * 40 / 24))
                         self.assertEqual(ae, round(frames_for_tokens(ve) * 40 / 24))
+
+    def test_auto_selects_nearest_legal_duration_then_overlap(self):
+        for seconds in (2, 3, 6, 6.5, 10, 30):
+            for overlap in (0, 0.5, 1, 1.5, 4, 10):
+                chunks = plan_segments(107, 603, "按秒自动切分", seconds, overlap, 3, "")
+                first = chunks[0]
+                lengths = range(7, 108, 5)
+                closest = min(lengths, key=lambda t: (abs(frames_for_tokens(t) - seconds * 24), -t))
+                self.assertEqual(first[1], closest)
+                if len(chunks) > 1:
+                    candidates = range(2, closest, 5)
+                    nearest_overlap = min(candidates, key=lambda t: (abs(frames_for_tokens(t) - overlap * 24), -t))
+                    self.assertEqual(first[1] - chunks[1][0], nearest_overlap)
+                self.assertEqual(chunks[-1][1:], (107, chunks[-1][2], 603))
+                self.assertTrue(all(left[1] >= right[0] for left, right in zip(chunks, chunks[1:])))
+
+    def test_half_second_and_rounding_ties(self):
+        chunks = plan_segments(107, 603, "按秒自动切分", 6, 0.5, 3, "")
+        self.assertEqual([(c[0], c[1]) for c in chunks], [(0, 42), (40, 82), (80, 107)])
+        self.assertEqual(frames_for_tokens(chunks[0][1]) - frames_for_tokens(chunks[1][0]), 5)
+        # 149.5 frames is halfway between 141 and 158; 13.5 between 5 and 22.
+        chunks = plan_segments(107, 603, "按秒自动切分", 149.5 / 24, 13.5 / 24, 3, "")
+        self.assertEqual(chunks[0][1], 47)
+        self.assertEqual(chunks[0][1] - chunks[1][0], 7)
+
+    def test_fixed_count_preserves_distinct_ranges_and_nearest_overlap(self):
+        for total in (2, 7, 37, 107):
+            audio = round(frames_for_tokens(total) * 40 / 24)
+            for count in (1, 3, 20, 50):
+                chunks = plan_segments(total, audio, "固定分段数", 6, 0.5, count, "")
+                self.assertEqual(len(chunks), min(count, (total - 2) // 5 + 1))
+                self.assertEqual(len({c[0] for c in chunks}), len(chunks))
+                self.assertEqual(chunks[-1][1], total)
+                for a, b in zip(chunks, chunks[1:]):
+                    self.assertEqual(frames_for_tokens(a[1]) - frames_for_tokens(b[0]), 5)
+
+    def test_custom_boundaries_round_to_nearest_instead_of_outwards(self):
+        chunks = plan_segments(107, 603, "自定义切点", 6, 0.5, 3, "0.4-1.2, 6.6-8.3")
+        self.assertEqual([(c[0], c[1]) for c in chunks], [(5, 7), (45, 57)])
+
+    def test_legacy_grid_toggle_is_migrated_and_actual_overlap_is_reported(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            new = PJ_SegmentPlanner().plan(chunk_seconds=6, overlap_seconds=0.5)
+            old = PJ_SegmentPlanner().plan(chunk_seconds=6, overlap_seconds=0.5, align_51_frames=True)
+        self.assertEqual(new["result"][0]["chunks"], old["result"][0]["chunks"])
+        self.assertNotIn("align_51_frames", PJ_SegmentPlanner.INPUT_TYPES()["required"])
+        data = new["ui"]["preview_data"][0]
+        self.assertEqual(data["timing_policy"], "nearest_h3")
+        self.assertEqual(data["chunks"][1]["overlap_frames"], 5)
+        self.assertEqual(data["chunks"][1]["overlap_seconds"], 0.208)
+        # Both samplers must resolve saved rules identically to the new planner.
+        for cls in (PJ_FirstPass_SegmentSampler, PJ_SegmentSampler):
+            self.guider.calls.clear()
+            self.run_node(self.node(cls), segment_plan=old["result"][0])
+            self.assertEqual([call[1].unbind()[0].shape[2] for call in self.guider.calls], [42, 42, 27])
 
     def test_connected_planner_uses_real_audio_length(self):
         with contextlib.redirect_stdout(io.StringIO()):

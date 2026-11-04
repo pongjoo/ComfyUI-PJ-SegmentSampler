@@ -21,11 +21,14 @@ def segment_seconds(start, end, fps=FPS):
 
 def plan_segments(total_v, total_a, split_mode, chunk_seconds, overlap_seconds,
                   num_segments, custom_cuts, fps=FPS, align_51_frames=False):
-    step = 15 if align_51_frames else 5
-    frame_step = step * 17 / 5
+    # align_51_frames is accepted only for saved API workflows; all plans use the native grid.
+    step = 5
+    frame_step = 17
+    total_groups = max(0, (total_v - 2) // step)
 
-    def window(frames):
-        return max(1, math.floor((frames - 5) / frame_step)) * step + 2
+    def nearest_groups(frames):
+        # Ties favour the longer duration/overlap instead of Python's even rounding.
+        return max(0, math.floor((frames - 5) / frame_step + 0.5))
 
     def interval(start, end):
         start = max(0, int(start // step) * step)
@@ -36,23 +39,23 @@ def plan_segments(total_v, total_a, split_mode, chunk_seconds, overlap_seconds,
 
     chunks = []
     if split_mode in ("按秒自动切分", "auto_by_seconds"):
-        win = window(chunk_seconds * fps)
-        stride = max(step, int((chunk_seconds - overlap_seconds) * fps // frame_step) * step)
-        stride = min(stride, win - 2)
+        groups = min(total_groups, max(1, nearest_groups(chunk_seconds * fps)))
+        win = min(total_v, groups * step + 2)
+        overlap_groups = min(max(0, groups - 1), nearest_groups(overlap_seconds * fps))
+        stride = max(step, (groups - overlap_groups) * step)
         for start in range(0, total_v, stride):
             chunks.append(interval(start, start + win))
             if chunks[-1][1] == total_v:
                 break
     elif split_mode in ("固定分段数", "fixed_segments"):
-        count = min(max(1, int(num_segments)), max(1, (total_v - 2) // step + 1))
+        count = min(max(1, int(num_segments)), total_groups + 1)
         if count == 1:
             return [(0, total_v, 0, total_a)]
-        overlap = max(2, overlap_seconds * fps * 5 / 17)
-        win = min(total_v, math.ceil(((total_v + (count - 1) * overlap) / count - 2) / step) * step + 2)
-        last_start = max(0, ((total_v - win) // step) * step)
-        for i in range(count):
-            start = (i * last_start // (count - 1) // step) * step
-            chunks.append(interval(start, total_v if i == count - 1 else start + win))
+        starts = [i * (total_groups + 1) // count * step for i in range(count)]
+        overlap = nearest_groups(overlap_seconds * fps) * step + 2
+        for i, start in enumerate(starts):
+            end = starts[i + 1] + overlap if i + 1 < count else total_v
+            chunks.append(interval(start, end))
     elif split_mode in ("自定义切点", "custom", "custom_cuts"):
         duration = frames_for_tokens(total_v) / fps
         for pair in custom_cuts.split(","):
@@ -64,8 +67,8 @@ def plan_segments(total_v, total_a, split_mode, chunk_seconds, overlap_seconds,
                 raise ValueError(f"无效自定义区间 {pair!r}：需要有限的非负起点且结束晚于开始")
             if start_sec >= duration:
                 continue
-            start = int(start_sec * fps // frame_step) * step
-            end = max(0, math.ceil((end_sec * fps - 5) / frame_step)) * step + 2
+            start = min(total_groups, math.floor(start_sec * fps / frame_step + 0.5)) * step
+            end = nearest_groups(end_sec * fps) * step + 2
             chunks.append(interval(start, end))
         if not chunks:
             raise ValueError("自定义切点没有覆盖输入视频")

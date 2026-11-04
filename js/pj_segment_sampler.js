@@ -9,11 +9,10 @@ const HIDDEN_TAG = "pj_hidden";
 const WIDGET_LABELS = {
     // 规划模式相关
     "split_mode": "切分规划模式",
-    "chunk_seconds": "单段最大秒数",
-    "overlap_seconds": "重叠过渡秒数",
+    "chunk_seconds": "目标段长(参考秒数)",
+    "overlap_seconds": "目标重叠(参考秒数)",
     "num_segments": "固定分段数量",
     "custom_cuts": "自定义切点范围",
-    "align_51_frames": "51帧网格吸附",
     "fps": "视频帧率",
     "duration_seconds": "视频总时长(秒)",
 
@@ -174,15 +173,6 @@ function localizeAndSanitizeCommon(node) {
                 w.label_off = "关闭";
                 if (typeof w.value !== "boolean") {
                     w.value = true;
-                }
-            } else if (w.name === "align_51_frames") {
-                w.options = w.options || {};
-                w.options.on = "开启51帧吸附";
-                w.options.off = "关闭";
-                w.label_on = "开启51帧吸附";
-                w.label_off = "关闭";
-                if (typeof w.value !== "boolean") {
-                    w.value = false;
                 }
             } else if (w.name && w.name.endsWith("_lock")) {
                 w.options = w.options || {};
@@ -559,8 +549,7 @@ function setupPlannerNode(node) {
         "chunk_seconds",
         "overlap_seconds",
         "num_segments",
-        "custom_cuts",
-        "align_51_frames"
+        "custom_cuts"
     ];
     for (const name of plannerWatchNames) {
         const w = node.widgets?.find(widget => widget.name === name);
@@ -663,6 +652,12 @@ function renderPlannerDashboard(node, data) {
         <span style="color: #fbbf24;">⚡ ${data.fps} FPS</span>
     `;
     container.appendChild(topBanner);
+    if (data.timing_note) {
+        const note = document.createElement("div");
+        note.style.color = "#94a3b8";
+        note.textContent = data.timing_note;
+        container.appendChild(note);
+    }
 
     // 2. 视频播放器 (如果合成出了视频)
     let videoEl = null;
@@ -776,6 +771,9 @@ function renderPlannerDashboard(node, data) {
             const timeText = document.createElement("span");
             timeText.style.color = "#e2e8f0";
             timeText.innerText = `${chunk.start_sec.toFixed(2)}s ~ ${chunk.end_sec.toFixed(2)}s (${chunk.duration_sec}s, 帧 ${chunk.start_frame}~${chunk.end_frame})`;
+            if (chunk.segment > 1 && chunk.overlap_frames !== undefined) {
+                timeText.innerText += `\n与前段重叠 ${chunk.overlap_seconds.toFixed(3)}s / ${chunk.overlap_frames}帧`;
+            }
 
             leftInfo.appendChild(badge);
             leftInfo.appendChild(timeText);
@@ -851,19 +849,22 @@ function scanAndLocalizeAllNodes() {
 // 6. 工作流旧版参数清洗器 (兼容历史 Workflow)
 // ==========================================
 function sanitizePlannerWidgets(info) {
+    if (info?.properties?.pj_preview_cache?.timing_policy !== "nearest_h3" && info?.properties) {
+        delete info.properties.pj_preview_cache;
+    }
     if (info && info.widgets_values && Array.isArray(info.widgets_values)) {
-        // 兼容旧版 workflow 结构清洗:
-        // 目标 7 个控件: [fps, split_mode, chunk_seconds, overlap_seconds, num_segments, custom_cuts, align_51_frames]
-        const modes = ["按秒自动切分", "固定分段数", "自定义切点"];
+        // Six controls; remove the obsolete grid toggle without shifting saved values.
+        const modes = ["按秒自动切分", "固定分段数", "自定义切点", "auto_by_seconds", "fixed_segments", "custom", "custom_cuts"];
         if (typeof info.widgets_values[0] === "string" && modes.includes(info.widgets_values[0])) {
             const fpsVal = info.widgets_values[6] ?? 24.0;
-            info.widgets_values = [fpsVal, ...info.widgets_values.slice(0, 6)];
+            info.widgets_values = [fpsVal, ...info.widgets_values.slice(0, 5)];
             return;
         }
         if (typeof info.widgets_values[0] === "number") {
             while (info.widgets_values.length > 2 && !modes.includes(info.widgets_values[1])) {
                 info.widgets_values.splice(1, 1);
             }
+            if (modes.includes(info.widgets_values[1])) info.widgets_values = info.widgets_values.slice(0, 6);
         }
     }
 }
