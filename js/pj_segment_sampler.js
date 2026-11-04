@@ -136,6 +136,9 @@ function localizeAndSanitizeCommon(node) {
                 if (w.value === "cosine") w.value = "余弦平滑(推荐)";
                 else if (w.value === "linear") w.value = "线性过渡";
                 else if (w.value === "hard" || w.value === "hard_cut") w.value = "硬切";
+                else if (typeof w.value === "boolean" || !["余弦平滑(推荐)", "线性过渡", "硬切"].includes(w.value)) {
+                    w.value = "余弦平滑(推荐)";
+                }
                 if (w.options) {
                     w.options.values = ["余弦平滑(推荐)", "线性过渡", "硬切"];
                 }
@@ -147,30 +150,46 @@ function localizeAndSanitizeCommon(node) {
                 w.options.off = "保留显存";
                 w.label_on = "开启(释放显存)";
                 w.label_off = "保留显存";
+                if (typeof w.value !== "boolean") {
+                    w.value = true;
+                }
             } else if (w.name === "keep_original_audio") {
                 w.options = w.options || {};
                 w.options.on = "开启(原音保真)";
                 w.options.off = "二采融合";
                 w.label_on = "开启(原音保真)";
                 w.label_off = "二采融合";
+                if (typeof w.value !== "boolean") {
+                    w.value = true;
+                }
             } else if (w.name === "sync_ref_video") {
                 w.options = w.options || {};
                 w.options.on = "开启(时序同步)";
                 w.options.off = "关闭";
                 w.label_on = "开启(时序同步)";
                 w.label_off = "关闭";
+                if (typeof w.value !== "boolean") {
+                    w.value = true;
+                }
             } else if (w.name === "align_51_frames") {
                 w.options = w.options || {};
                 w.options.on = "开启51帧吸附";
                 w.options.off = "关闭";
                 w.label_on = "开启51帧吸附";
                 w.label_off = "关闭";
+                if (typeof w.value !== "boolean") {
+                    w.value = false;
+                }
             } else if (w.name && w.name.endsWith("_lock")) {
                 w.options = w.options || {};
                 w.options.on = "已锁定";
                 w.options.off = "未锁定";
                 w.label_on = "已锁定";
                 w.label_off = "未锁定";
+                // 彻底防御：若历史工作流因索引错位灌入了数字(如3)或字符串，强制清洗为 false (未锁定)
+                if (typeof w.value !== "boolean") {
+                    w.value = false;
+                }
             }
         }
     }
@@ -424,6 +443,16 @@ function attachSamplerHandlers(node, isFirstPass) {
             const orig = w.callback;
             w.callback = function () {
                 const res = orig?.apply(this, arguments);
+                const curVal = String(this.value || "");
+                // 当用户明确选择【全部重新采样】或【全部精修】时，主动将下方所有分段解除锁定（重置为未锁定）
+                if (curVal.includes("全部重新采样") || curVal.includes("全部精修")) {
+                    for (let i = 1; i <= 20; i++) {
+                        const lockW = node.widgets?.find(lw => lw.name === `seg${i}_lock`);
+                        if (lockW) lockW.value = false;
+                    }
+                    if (node.setDirtyCanvas) node.setDirtyCanvas(true, true);
+                    if (app.canvas && app.canvas.setDirty) app.canvas.setDirty(true, true);
+                }
                 if (isFirstPass) updateFirstPassVisibility(node);
                 else updateSecondPassVisibility(node);
                 return res;
@@ -855,6 +884,40 @@ app.registerExtension({
                 }
                 return r;
             };
+            function sanitizeSamplerWidgets(info, isFirstPass) {
+                if (!info || !info.widgets_values || !Array.isArray(info.widgets_values)) return;
+
+                const legacySplitModes = [
+                    "按秒自动切分", "固定分段数", "自定义切点",
+                    "auto_by_seconds", "fixed_segments", "custom", "custom_cuts"
+                ];
+
+                // 检测是否为旧版工作流（以旧切分模式字符串开头）
+                if (typeof info.widgets_values[0] === "string" && legacySplitModes.includes(info.widgets_values[0])) {
+                    // 移除旧版前置的 6 个规划参数: [split_mode, chunk_seconds, overlap_seconds, num_segments, custom_cuts, align_51_frames]
+                    info.widgets_values.splice(0, 6);
+
+                    if (isFirstPass) {
+                        // 一采当前结构: [sync_ref_video(bool), run_mode(str), target_time_second(float), custom_rerun_segments(str), base_seed(int), ...]
+                        // 旧版在 run_mode(str) 后面直接是 base_seed(number)，缺少 target_time_second 与 custom_rerun_segments:
+                        if (info.widgets_values.length > 2 && typeof info.widgets_values[2] === "number" && typeof info.widgets_values[3] !== "string") {
+                            info.widgets_values.splice(2, 0, 0.0, "5");
+                        }
+                    } else {
+                        // 二采当前结构: [run_mode(str), target_time_second(float), custom_rerun_segments(str), seg1_lock(bool)...]
+                        // 旧版在 run_mode(str) 后面直接是 seg1_lock(boolean)，缺少 target_time_second 与 custom_rerun_segments:
+                        if (info.widgets_values.length > 1 && typeof info.widgets_values[1] === "boolean") {
+                            info.widgets_values.splice(1, 0, 0.0, "5");
+                        }
+                    }
+
+                    // 如果旧版末尾附带了旧 fps (例如 24.0)，将其剔除
+                    const lastIdx = info.widgets_values.length - 1;
+                    if (lastIdx > 0 && typeof info.widgets_values[lastIdx] === "number" && (info.widgets_values[lastIdx] === 24.0 || info.widgets_values[lastIdx] === 24)) {
+                        info.widgets_values.pop();
+                    }
+                }
+            }
         } else if (nodeData.name === "PJ_FirstPass_SegmentSampler") {
             const onNodeCreated = nodeType.prototype.onNodeCreated;
             nodeType.prototype.onNodeCreated = function () {
@@ -862,8 +925,16 @@ app.registerExtension({
                 attachSamplerHandlers(this, true);
                 return r;
             };
+            const origConfigure = nodeType.prototype.configure;
+            nodeType.prototype.configure = function (info) {
+                sanitizeSamplerWidgets(info, true);
+                const r = origConfigure ? origConfigure.apply(this, arguments) : undefined;
+                attachSamplerHandlers(this, true);
+                return r;
+            };
             const onConfigure = nodeType.prototype.onConfigure;
-            nodeType.prototype.onConfigure = function () {
+            nodeType.prototype.onConfigure = function (info) {
+                sanitizeSamplerWidgets(info, true);
                 const r = onConfigure ? onConfigure.apply(this, arguments) : undefined;
                 attachSamplerHandlers(this, true);
                 return r;
@@ -875,8 +946,16 @@ app.registerExtension({
                 attachSamplerHandlers(this, false);
                 return r;
             };
+            const origConfigure = nodeType.prototype.configure;
+            nodeType.prototype.configure = function (info) {
+                sanitizeSamplerWidgets(info, false);
+                const r = origConfigure ? origConfigure.apply(this, arguments) : undefined;
+                attachSamplerHandlers(this, false);
+                return r;
+            };
             const onConfigure = nodeType.prototype.onConfigure;
-            nodeType.prototype.onConfigure = function () {
+            nodeType.prototype.onConfigure = function (info) {
+                sanitizeSamplerWidgets(info, false);
                 const r = onConfigure ? onConfigure.apply(this, arguments) : undefined;
                 attachSamplerHandlers(this, false);
                 return r;

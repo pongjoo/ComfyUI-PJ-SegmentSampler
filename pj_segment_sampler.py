@@ -355,8 +355,15 @@ class PJ_SegmentSampler:
             print(f"  - 分段 {i + 1}/{n_chunks}: 视频潜空间 [{vs}:{ve}], 音频 [{as_}:{ae}]")
         print("=" * 65)
 
-        # Segment control configuration (支持到 20 段)
-        locks = [bool(kwargs.get(f"seg{i}_lock", False)) for i in range(1, 21)]
+        # Segment control configuration (支持到 20 段，兼容形参以及 kwargs)
+        explicit_locks = [
+            seg1_lock, seg2_lock, seg3_lock, seg4_lock,
+            seg5_lock, seg6_lock, seg7_lock, seg8_lock
+        ]
+        locks = [
+            bool(kwargs[f"seg{i}_lock"] if f"seg{i}_lock" in kwargs else (explicit_locks[i - 1] if i <= 8 else False))
+            for i in range(1, 21)
+        ]
 
         # 计算目标缺陷秒数所属的分段编号 (如果处于缺陷秒数精修模式)
         target_defect_seg = None
