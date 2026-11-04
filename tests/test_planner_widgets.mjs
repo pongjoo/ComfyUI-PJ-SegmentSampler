@@ -37,3 +37,81 @@ test('old preview is discarded, current backend preview survives', () => {
     const current = { properties: { pj_preview_cache: { timing_policy: 'nearest_h3', n_chunks: 3 } } };
     assert.deepEqual(migrate(current), current);
 });
+
+const uiContext = vm.createContext({ app: { registerExtension() {} }, setTimeout() {} });
+vm.runInContext(source, uiContext);
+vm.runInContext('updateSamplerGuide = () => {};', uiContext);
+function sampler(mode, first = false) {
+    const values = {run_mode: mode, target_time_second: 5, custom_rerun_segments: '2',
+        sync_ref_video: false, blend_mode: '硬切', unload_model_after_sampling: false};
+    for (let i = 1; i <= 20; i++) {
+        values[`seg${i}_lock`] = i === 8;
+        if (first) values[`seg${i}_seed_offset`] = i - 1;
+    }
+    return {properties: {}, widgets: Object.entries(values).map(([name, value]) =>
+        ({name, value, type: 'number', options: {}}))};
+}
+function refresh(node, first = false) {
+    uiContext.node = node;
+    uiContext.first = first;
+    vm.runInContext('syncSamplerSegmentCount(node, first)', uiContext);
+}
+const widget = (node, name) => node.widgets.find(w => w.name === name);
+const visible = (node, name) => widget(node, name).type !== 'pj_hidden';
+
+test('preview count cannot reset a saved target beyond the preview', () => {
+    const node = sampler('仅精修第18段');
+    refresh(node);
+    assert.equal(widget(node, 'run_mode').value, '仅精修第18段');
+    assert.ok(widget(node, 'run_mode').options.values.includes('仅精修第20段'));
+    assert.equal(visible(node, 'seg1_lock'), false);
+    assert.equal(widget(node, 'seg8_lock').value, true);
+});
+
+test('smart locks and advanced settings reflect applicable mode without changing values', () => {
+    const node = sampler('智能缓存(仅重跑未锁定分段)', true);
+    refresh(node, true);
+    assert.equal(visible(node, 'seg1_lock'), true);
+    assert.equal(visible(node, 'seg8_lock'), true);
+    assert.equal(visible(node, 'sync_ref_video'), false);
+    assert.equal(visible(node, 'seg1_seed_offset'), false);
+    node.properties.pj_advanced_open = true;
+    refresh(node, true);
+    assert.equal(visible(node, 'sync_ref_video'), true);
+    assert.equal(visible(node, 'seg1_seed_offset'), true);
+    assert.equal(widget(node, 'sync_ref_video').value, false);
+    widget(node, 'run_mode').value = '整段全量采样(一采不分段)';
+    refresh(node, true);
+    for (const name of ['blend_mode', 'seg1_lock', 'seg2_seed_offset'])
+        assert.equal(visible(node, name), false);
+    assert.equal(visible(node, 'seg1_seed_offset'), true);
+    assert.equal(visible(node, 'sync_ref_video'), true);
+    assert.equal(visible(node, 'unload_model_after_sampling'), true);
+});
+
+test('target fields follow the selected operation and guides do not promise cache hits', () => {
+    const node = sampler('按缺陷秒数精修 (下方输入秒数)');
+    refresh(node);
+    assert.equal(visible(node, 'target_time_second'), true);
+    assert.equal(visible(node, 'custom_rerun_segments'), false);
+    const guide = vm.runInContext('samplerGuideText(node, false)', uiContext);
+    assert.match(guide.action, /无缓存或缓存失效时仍需计算/);
+    assert.match(guide.planning, /未连接/);
+    widget(node, 'run_mode').value = '自定义指定分段(下方输入)';
+    refresh(node);
+    assert.equal(visible(node, 'target_time_second'), false);
+    assert.equal(visible(node, 'custom_rerun_segments'), true);
+});
+
+test('selecting all refinement clears locks while preserving advanced values', () => {
+    const node = sampler('智能缓存(仅重跑未锁定分段)');
+    uiContext.node = node;
+    vm.runInContext('attachSamplerHandlers(node, false)', uiContext);
+    const mode = widget(node, 'run_mode');
+    mode.value = '全部精修(刷新全部缓存)';
+    mode.callback();
+    assert.equal(widget(node, 'seg8_lock').value, false);
+    assert.equal(visible(node, 'seg1_lock'), false);
+    assert.equal(widget(node, 'blend_mode').value, '硬切');
+    assert.equal(widget(node, 'unload_model_after_sampling').value, false);
+});
