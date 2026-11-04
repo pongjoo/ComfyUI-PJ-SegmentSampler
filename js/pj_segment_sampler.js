@@ -620,7 +620,7 @@ function renderPlannerDashboard(node, data) {
         root.appendChild(container);
 
         widget = node.addDOMWidget("pj_planner_dashboard", "dashboard", root, {
-            serialize: false, hideOnZoom: false,
+            serialize: false, hideOnZoom: false, margin: 0,
             getMinHeight: () => widget?.pjHeight || 100,
             getMaxHeight: () => widget?.pjHeight || 100,
             getHeight: () => widget?.pjHeight || 100,

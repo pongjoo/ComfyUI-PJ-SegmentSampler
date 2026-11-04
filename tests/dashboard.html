@@ -26,7 +26,7 @@ class TestNode {
     computeSize() { return [this.size[0], 250+this.widgets.reduce((h,w)=>h+w.computeSize(this.size[0])[1],0)]; }
     setSize(size) {
         this.size=size; box.style.width=size[0]+'px'; box.style.height=size[1]+'px';
-        for(const w of this.widgets) w.element.style.height=w.options.getHeight()+'px';
+        for(const w of this.widgets) w.element.style.height=(w.options.getHeight()-2*(w.options.margin??8))+'px';
         const w=this.widgets[0];
         if(w) document.querySelector('#status').textContent = w.element.clientHeight >= w.pjContent.offsetHeight ?
             `PASS：完整显示 ${w.pjContent.querySelectorAll('[style]').length} 个内容元素；内容 ${w.pjContent.offsetHeight}px，控件 ${w.element.clientHeight}px` : 'FAIL：内容被裁切';
@@ -36,7 +36,7 @@ await window.extension.beforeRegisterNodeDef(TestNode,{name:'PJ_SegmentPlanner'}
 const node = new TestNode();
 function execute(count) {
     const frames = count === 4 ? 362 : (count-1)*102+141;
-    const chunks=Array.from({length:count},(_,i)=>({segment:i+1,start_sec:i*4.25,end_sec:Math.min(frames,i*102+141)/24,duration_sec:(Math.min(frames,i*102+141)-i*102)/24,start_frame:i*102,end_frame:Math.min(frames,i*102+141)}));
+    const chunks=Array.from({length:count},(_,i)=>({segment:i+1,start_sec:i*4.25,end_sec:Math.min(frames,i*102+141)/24,duration_sec:((Math.min(frames,i*102+141)-i*102)/24).toFixed(2),start_frame:i*102,end_frame:Math.min(frames,i*102+141)}));
     node.onExecuted({preview_data:[{has_media:false,has_video:false,effective_seconds:(frames/24).toFixed(2),total_frames:frames,fps:24,n_chunks:count,chunks}]});
 }
 document.querySelector('#four').onclick=()=>execute(4);
