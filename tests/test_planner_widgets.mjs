@@ -115,3 +115,41 @@ test('selecting all refinement clears locks while preserving advanced values', (
     assert.equal(widget(node, 'blend_mode').value, '硬切');
     assert.equal(widget(node, 'unload_model_after_sampling').value, false);
 });
+
+test('second pass tasks map saved backend modes without changing workflow values', () => {
+    const cases = [['全部精修(刷新全部缓存)', '常规分段采样'],
+        ['智能缓存(仅重跑未锁定分段)', '按锁定状态采样'],
+        ['仅精修第18段', '局部重做'], ['自定义指定分段(下方输入)', '局部重做']];
+    for (const [mode, task] of cases) {
+        const node = sampler(mode);
+        refresh(node);
+        assert.equal(vm.runInContext('secondPassOperation(node.widgets[0].value)', uiContext), task);
+        assert.equal(widget(node, 'run_mode').value, mode);
+        assert.equal(visible(node, 'run_mode'), false);
+        assert.equal(visible(node, 'seg1_lock'), task === '按锁定状态采样');
+    }
+    const node = sampler('全部精修(刷新全部缓存)');
+    refresh(node);
+    assert.match(vm.runInContext('samplerGuideText(node, false).action', uiContext), /逐段采样一次/);
+});
+
+test('new second pass nodes default to normal sampling; configure restores saved modes', async () => {
+    let extension;
+    const creationContext = vm.createContext({app: {registerExtension(value) {extension=value;}}, setTimeout() {}});
+    vm.runInContext(source, creationContext);
+    vm.runInContext('updateSamplerGuide = () => {};', creationContext);
+    for (const name of ['PJ_SegmentSampler', 'PJSegmentSampler']) {
+        class Node {
+            constructor() { Object.assign(this, sampler('智能缓存(仅重跑未锁定分段)')); }
+            configure(info) { this.widgets[0].value = info.widgets_values[0]; }
+        }
+        await extension.beforeRegisterNodeDef(Node, {name});
+        const node = new Node();
+        node.onNodeCreated();
+        assert.equal(widget(node, 'run_mode').value, '全部精修(刷新全部缓存)');
+        node.configure({widgets_values: ['仅精修第18段']});
+        assert.equal(widget(node, 'run_mode').value, '仅精修第18段');
+        node.configure({widgets_values: ['智能缓存(仅重跑未锁定分段)']});
+        assert.equal(widget(node, 'seg8_lock').value, true);
+    }
+});

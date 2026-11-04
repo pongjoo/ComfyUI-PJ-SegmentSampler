@@ -294,6 +294,7 @@ function syncSamplerSegmentCount(node, isFirstPass) {
 
     // 2. 控制 1~20 控件的动态显隐
     const runMode = String(runModeWidget?.value || "");
+    if (!isFirstPass) toggleWidget(node, runModeWidget, false);
     const customRerun = node.widgets?.find(w => w.name === "custom_rerun_segments");
     const targetTime = node.widgets?.find(w => w.name === "target_time_second");
 
@@ -325,6 +326,12 @@ function syncSamplerSegmentCount(node, isFirstPass) {
     autoResizeNode(node);
 }
 
+function secondPassOperation(mode) {
+    if (mode === "全部精修(刷新全部缓存)") return "常规分段采样";
+    if (mode === "智能缓存(仅重跑未锁定分段)") return "按锁定状态采样";
+    return "局部重做";
+}
+
 function samplerGuideText(node, isFirstPass) {
     const value = name => node.widgets.find(w => w.name === name)?.value;
     const mode = String(value("run_mode") || "");
@@ -336,6 +343,7 @@ function samplerGuideText(node, isFirstPass) {
     let action;
     if (full) action = "整段一次生成，使用第1段种子偏移；不使用分段锁定或重叠过渡。";
     else if (mode.includes("智能缓存")) action = "未锁定段重新计算；锁定段仅在缓存有效时复用。";
+    else if (!isFirstPass && mode.includes("全部")) action = "按规划逐段采样一次，再融合为完整输出；无需锁定或已有缓存。";
     else if (mode.includes("全部")) action = "重新计算规划覆盖的所有分段，并更新缓存。";
     else action = "重做指定段；其他段复用有效缓存，无缓存或缓存失效时仍需计算。";
     const settings = full ? [] : [String(value("blend_mode") || "")];
@@ -377,6 +385,40 @@ function updateSamplerGuide(node, isFirstPass) {
             observer.disconnect();
             return onRemoved?.apply(this, arguments);
         };
+        if (!isFirstPass) {
+            const runMode = node.widgets.find(w => w.name === "run_mode");
+            for (const kind of ["operation", "target"]) {
+                const label = document.createElement("label");
+                label.style.cssText = "display:flex;align-items:center;gap:8px;";
+                label.textContent = kind === "operation" ? "采样任务" : "重做范围";
+                const select = document.createElement("select");
+                select.setAttribute("aria-label", label.textContent);
+                select.dataset.pjSelect = kind;
+                select.style.cssText = "flex:1;min-width:0;padding:5px;border:1px solid #64748b;border-radius:4px;background:#1e293b;color:#f8fafc;font:inherit;";
+                const values = kind === "operation"
+                    ? ["常规分段采样", "局部重做", "按锁定状态采样"]
+                    : ["按缺陷秒数精修 (下方输入秒数)", "自定义指定分段(下方输入)",
+                        ...Array.from({ length: 20 }, (_, i) => `仅精修第${i + 1}段`)];
+                for (const value of values) {
+                    const option = document.createElement("option");
+                    option.value = value;
+                    option.textContent = value.replace("按缺陷秒数精修 (下方输入秒数)", "按时间定位")
+                        .replace("自定义指定分段(下方输入)", "指定多个段号").replace("仅精修", "");
+                    select.appendChild(option);
+                }
+                select.onchange = () => {
+                    runMode.value = kind === "target" ? select.value : {
+                        "常规分段采样": "全部精修(刷新全部缓存)",
+                        "局部重做": "按缺陷秒数精修 (下方输入秒数)",
+                        "按锁定状态采样": "智能缓存(仅重跑未锁定分段)",
+                    }[select.value];
+                    runMode.callback?.call(runMode, runMode.value);
+                    node.setDirtyCanvas?.(true, true);
+                };
+                label.appendChild(select);
+                content.appendChild(label);
+            }
+        }
         for (const key of ["planning", "output", "action", "settings"]) {
             const line = document.createElement("div");
             line.dataset.pjLine = key;
@@ -393,6 +435,15 @@ function updateSamplerGuide(node, isFirstPass) {
         content.appendChild(button);
     }
     const text = samplerGuideText(node, isFirstPass);
+    if (!isFirstPass) {
+        const mode = node.widgets.find(w => w.name === "run_mode").value;
+        const operation = secondPassOperation(mode);
+        widget.pjContent.querySelector('[data-pj-select="operation"]').value = operation;
+        const target = widget.pjContent.querySelector('[data-pj-select="target"]');
+        target.parentElement.hidden = operation !== "局部重做";
+        target.parentElement.style.display = operation === "局部重做" ? "flex" : "none";
+        if (operation === "局部重做") target.value = mode;
+    }
     text.output = "输出保持完整长度 · 局部重做不会导出独立片段";
     for (const [key, value] of Object.entries(text)) {
         widget.pjContent.querySelector(`[data-pj-line="${key}"]`).textContent = value;
@@ -1006,6 +1057,8 @@ app.registerExtension({
             const onNodeCreated = nodeType.prototype.onNodeCreated;
             nodeType.prototype.onNodeCreated = function () {
                 const r = onNodeCreated ? onNodeCreated.apply(this, arguments) : undefined;
+                const mode = this.widgets?.find(w => w.name === "run_mode");
+                if (mode) mode.value = "全部精修(刷新全部缓存)";
                 attachSamplerHandlers(this, false);
                 return r;
             };
