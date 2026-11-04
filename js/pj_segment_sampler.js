@@ -822,7 +822,63 @@ function scanAndLocalizeAllNodes() {
 }
 
 // ==========================================
-// 6. 注册 ComfyUI 前端扩展
+// 6. 工作流旧版参数清洗器 (兼容历史 Workflow)
+// ==========================================
+function sanitizePlannerWidgets(info) {
+    if (info && info.widgets_values && Array.isArray(info.widgets_values)) {
+        // 兼容旧版 workflow 结构清洗:
+        // 目标 7 个控件: [fps, split_mode, chunk_seconds, overlap_seconds, num_segments, custom_cuts, align_51_frames]
+        const modes = ["按秒自动切分", "固定分段数", "自定义切点"];
+        if (typeof info.widgets_values[0] === "string" && modes.includes(info.widgets_values[0])) {
+            const fpsVal = info.widgets_values[6] ?? 24.0;
+            info.widgets_values = [fpsVal, ...info.widgets_values.slice(0, 6)];
+            return;
+        }
+        if (typeof info.widgets_values[0] === "number") {
+            while (info.widgets_values.length > 2 && !modes.includes(info.widgets_values[1])) {
+                info.widgets_values.splice(1, 1);
+            }
+        }
+    }
+}
+
+function sanitizeSamplerWidgets(info, isFirstPass) {
+    if (!info || !info.widgets_values || !Array.isArray(info.widgets_values)) return;
+
+    const legacySplitModes = [
+        "按秒自动切分", "固定分段数", "自定义切点",
+        "auto_by_seconds", "fixed_segments", "custom", "custom_cuts"
+    ];
+
+    // 检测是否为旧版工作流（以旧切分模式字符串开头）
+    if (typeof info.widgets_values[0] === "string" && legacySplitModes.includes(info.widgets_values[0])) {
+        // 移除旧版前置的 6 个规划参数: [split_mode, chunk_seconds, overlap_seconds, num_segments, custom_cuts, align_51_frames]
+        info.widgets_values.splice(0, 6);
+
+        if (isFirstPass) {
+            // 一采当前结构: [sync_ref_video(bool), run_mode(str), target_time_second(float), custom_rerun_segments(str), base_seed(int), ...]
+            // 旧版在 run_mode(str) 后面直接是 base_seed(number)，缺少 target_time_second 与 custom_rerun_segments:
+            if (info.widgets_values.length > 2 && typeof info.widgets_values[2] === "number" && typeof info.widgets_values[3] !== "string") {
+                info.widgets_values.splice(2, 0, 0.0, "5");
+            }
+        } else {
+            // 二采当前结构: [run_mode(str), target_time_second(float), custom_rerun_segments(str), seg1_lock(bool)...]
+            // 旧版在 run_mode(str) 后面直接是 seg1_lock(boolean)，缺少 target_time_second 与 custom_rerun_segments:
+            if (info.widgets_values.length > 1 && typeof info.widgets_values[1] === "boolean") {
+                info.widgets_values.splice(1, 0, 0.0, "5");
+            }
+        }
+
+        // 如果旧版末尾附带了旧 fps (例如 24.0)，将其剔除
+        const lastIdx = info.widgets_values.length - 1;
+        if (lastIdx > 0 && typeof info.widgets_values[lastIdx] === "number" && (info.widgets_values[lastIdx] === 24.0 || info.widgets_values[lastIdx] === 24)) {
+            info.widgets_values.pop();
+        }
+    }
+}
+
+// ==========================================
+// 7. 注册 ComfyUI 前端扩展
 // ==========================================
 app.registerExtension({
     name: "PJ.SegmentSampler.InteractiveSuite",
@@ -845,24 +901,6 @@ app.registerExtension({
                 return r;
             };
 
-            function sanitizePlannerWidgets(info) {
-                if (info && info.widgets_values && Array.isArray(info.widgets_values)) {
-                    // 兼容旧版 workflow 结构清洗:
-                    // 目标 7 个控件: [fps, split_mode, chunk_seconds, overlap_seconds, num_segments, custom_cuts, align_51_frames]
-                    const modes = ["按秒自动切分", "固定分段数", "自定义切点"];
-                    if (typeof info.widgets_values[0] === "string" && modes.includes(info.widgets_values[0])) {
-                        const fpsVal = info.widgets_values[6] ?? 24.0;
-                        info.widgets_values = [fpsVal, ...info.widgets_values.slice(0, 6)];
-                        return;
-                    }
-                    if (typeof info.widgets_values[0] === "number") {
-                        while (info.widgets_values.length > 2 && !modes.includes(info.widgets_values[1])) {
-                            info.widgets_values.splice(1, 1);
-                        }
-                    }
-                }
-            }
-
             const origConfigure = nodeType.prototype.configure;
             nodeType.prototype.configure = function (info) {
                 sanitizePlannerWidgets(info);
@@ -884,40 +922,6 @@ app.registerExtension({
                 }
                 return r;
             };
-            function sanitizeSamplerWidgets(info, isFirstPass) {
-                if (!info || !info.widgets_values || !Array.isArray(info.widgets_values)) return;
-
-                const legacySplitModes = [
-                    "按秒自动切分", "固定分段数", "自定义切点",
-                    "auto_by_seconds", "fixed_segments", "custom", "custom_cuts"
-                ];
-
-                // 检测是否为旧版工作流（以旧切分模式字符串开头）
-                if (typeof info.widgets_values[0] === "string" && legacySplitModes.includes(info.widgets_values[0])) {
-                    // 移除旧版前置的 6 个规划参数: [split_mode, chunk_seconds, overlap_seconds, num_segments, custom_cuts, align_51_frames]
-                    info.widgets_values.splice(0, 6);
-
-                    if (isFirstPass) {
-                        // 一采当前结构: [sync_ref_video(bool), run_mode(str), target_time_second(float), custom_rerun_segments(str), base_seed(int), ...]
-                        // 旧版在 run_mode(str) 后面直接是 base_seed(number)，缺少 target_time_second 与 custom_rerun_segments:
-                        if (info.widgets_values.length > 2 && typeof info.widgets_values[2] === "number" && typeof info.widgets_values[3] !== "string") {
-                            info.widgets_values.splice(2, 0, 0.0, "5");
-                        }
-                    } else {
-                        // 二采当前结构: [run_mode(str), target_time_second(float), custom_rerun_segments(str), seg1_lock(bool)...]
-                        // 旧版在 run_mode(str) 后面直接是 seg1_lock(boolean)，缺少 target_time_second 与 custom_rerun_segments:
-                        if (info.widgets_values.length > 1 && typeof info.widgets_values[1] === "boolean") {
-                            info.widgets_values.splice(1, 0, 0.0, "5");
-                        }
-                    }
-
-                    // 如果旧版末尾附带了旧 fps (例如 24.0)，将其剔除
-                    const lastIdx = info.widgets_values.length - 1;
-                    if (lastIdx > 0 && typeof info.widgets_values[lastIdx] === "number" && (info.widgets_values[lastIdx] === 24.0 || info.widgets_values[lastIdx] === 24)) {
-                        info.widgets_values.pop();
-                    }
-                }
-            }
         } else if (nodeData.name === "PJ_FirstPass_SegmentSampler") {
             const onNodeCreated = nodeType.prototype.onNodeCreated;
             nodeType.prototype.onNodeCreated = function () {
