@@ -5,6 +5,7 @@ import comfy.model_management
 import comfy.nested_tensor
 import latent_preview
 
+from .segment_boundaries import constrain_boundaries, restore_boundaries
 from .segment_timing import plan_segments, resolve_plan, segment_seconds
 from .segment_sampling import (SegmentCache, sampling_signature, fingerprint, generate_noise,
                                slice_mask, segment_guider, blend_sequence)
@@ -14,7 +15,7 @@ class PJ_FirstPass_SegmentSampler:
     """
     PJ一采分段重抽采样器 (First-Pass Segment Sampler with Independent Re-roll & Cache)
     专为长视频一采（低清骨架生成）设计：
-    1. 按照预设规则精准分段，支持参考视频时钟同步（每段只看对应时间段的原视频）；
+    1. 按照预设规则分段，可按时间裁剪参考视频潜空间条件；
     2. 支持各分段独立设置随机种子与【锁定缓存】；
     3. 哪段效果不好，仅单独重跑该段一采，锁定且输入未变化的分段可从临时磁盘缓存复用；
     4. 相同种子共享绝对位置噪声，独立偏移重抽对应分段。
@@ -135,6 +136,11 @@ class PJ_FirstPass_SegmentSampler:
                         "tooltip": "若一采后直接运行3D超分，开启此项可清空GPU显存，给超分腾出充足空间",
                     },
                 ),
+                "boundary_constraints": ("BOOLEAN", {
+                    "default": False,
+                    "label_on": "开启(实验)", "label_off": "关闭(独立采样)",
+                    "tooltip": "首次生成固定前段重叠内容；局部重做保护有效缓存中的前后边界。开启后不再混合两份重叠内容。切换后重建缓存；真实接缝画质需验证。",
+                }),
             },
         }
 
@@ -173,6 +179,7 @@ class PJ_FirstPass_SegmentSampler:
         blend_mode="余弦平滑(推荐)",
         unload_model_after_sampling=False,
         fps=24.0,
+        boundary_constraints=False,
         **kwargs,
     ):
 
@@ -200,8 +207,11 @@ class PJ_FirstPass_SegmentSampler:
             full_length="不分段" in str(run_mode) or "全量采样" in str(run_mode),
         )
         n_chunks = len(chunks)
+        constrain = boundary_constraints and n_chunks > 1
         self._cache.retain(n_chunks)
         context_signature = sampling_signature(guider, sampler, sigmas)
+        if constrain:
+            context_signature = fingerprint((context_signature, "boundaries-v1", chunks, latent_image))
 
         print("\n" + "=" * 65)
         print(f"[PJ一采分段采样器] 输入总时长: {total_v} 视频步 (~{segment_seconds(0, total_v, fps)[1]:.2f}s), 音频: {total_a} 步")
@@ -233,10 +243,44 @@ class PJ_FirstPass_SegmentSampler:
                 target_defect_seg = 1
                 print(f"[PJ一采分段采样器] ⚠️ 目标秒数 {target_time_second:.2f}s 超出范围，默认重抽第 1 段")
 
+        signatures = []
+        retained = []
+        for idx, bounds in enumerate(chunks):
+            vs, ve, a_s, ae = bounds
+            inputs = [full_video[:, :, vs:ve]]
+            if full_audio is not None:
+                inputs.append(full_audio[..., a_s:ae])
+            signature = fingerprint((context_signature, bounds, inputs,
+                                     slice_mask(latent_image.get("noise_mask"), bounds),
+                                     latent_image.get("batch_index"), sync_ref_video, type(noise),
+                                     {k: v for k, v in vars(noise).items() if k != "seed"} if noise is not None else None))
+            signatures.append(signature)
+            should_resample = True
+            if "缺陷秒数" in str(run_mode):
+                should_resample = idx + 1 == target_defect_seg
+            elif run_mode.startswith("仅重抽第"):
+                should_resample = idx + 1 == int(run_mode.replace("仅重抽第", "").replace("段", "").strip())
+            elif "自定义" in run_mode:
+                targets = [int(s.strip()) for s in str(custom_rerun_segments).split(",") if s.strip()]
+                should_resample = idx + 1 in targets
+            elif run_mode == "智能缓存(仅重跑未锁定分段)":
+                should_resample = not (locks[idx] if idx < len(locks) else False)
+            cached = self._cache.load(idx, signature) if not should_resample else None
+            retained.append(cached[0] if cached is not None else None)
+
+        # Invalidate before work: an interrupted boundary rebuild must not expose a mixed generation.
+        rebuilding = constrain and any(value is None for value in retained)
+        if rebuilding:
+            self._cache.entries.clear()
         sampled_chunks = []
         disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
-
+        if constrain:
+            print("[PJ一采] 接缝约束：固定已有重叠内容；缓存缺失的分段将重新生成")
         for idx, (v_start, v_end, a_start, a_end) in enumerate(chunks):
+            if retained[idx] is not None:
+                sampled_chunks.append(retained[idx])
+                print(f"[PJ分段采样] 第 {idx + 1}/{n_chunks} 段复用缓存")
+                continue
             chunk_v = full_video[:, :, v_start:v_end].clone()
             if is_nested and full_audio is not None:
                 chunk_a = full_audio[..., a_start:a_end].clone()
@@ -245,38 +289,12 @@ class PJ_FirstPass_SegmentSampler:
                 chunk_latent_samples = chunk_v
             bounds = (v_start, v_end, a_start, a_end)
             chunk_mask = slice_mask(latent_image.get("noise_mask"), bounds)
-            cache_signature = fingerprint((context_signature, bounds, chunk_latent_samples,
-                                           chunk_mask, latent_image.get("batch_index"),
-                                           sync_ref_video, type(noise),
-                                           {k: v for k, v in vars(noise).items() if k != "seed"} if noise is not None else None))
-            cache_valid = self._cache.entries.get(idx) == cache_signature
-            seg_lock = locks[idx] if idx < len(locks) else False
+            if constrain:
+                sources = [(chunks[i], value) for i, value in enumerate(retained) if value is not None]
+                sources += [(chunks[i], value) for i, value in enumerate(sampled_chunks) if retained[i] is None]
+                chunk_latent_samples, chunk_mask = constrain_boundaries(chunk_latent_samples, chunk_mask, bounds, sources)
             seg_offset = offsets[idx] if idx < len(offsets) else idx
             seg_seed = (seed_val + seg_offset) & 0xFFFFFFFFFFFFFFFF
-
-            # Determine whether to re-sample this segment
-            should_resample = True
-            if run_mode == "全部重新采样(刷新全部缓存)":
-                should_resample = True
-            elif "缺陷秒数" in str(run_mode):
-                should_resample = (idx + 1) == target_defect_seg
-            elif run_mode.startswith("仅重抽第"):
-                target_seg_num = int(run_mode.replace("仅重抽第", "").replace("段", "").strip())
-                should_resample = (idx + 1) == target_seg_num
-            elif "自定义" in run_mode:
-                targets = [int(s.strip()) for s in str(custom_rerun_segments).split(",") if s.strip()]
-                should_resample = (idx + 1) in targets
-            elif run_mode == "智能缓存(仅重跑未锁定分段)":
-                if seg_lock and cache_valid:
-                    should_resample = False
-                else:
-                    should_resample = True
-
-            cached = self._cache.load(idx, cache_signature) if not should_resample else None
-            if cached is not None:
-                sampled_chunks.append(cached[0])
-                print(f"[PJ分段采样] 第 {idx + 1}/{n_chunks} 段复用缓存")
-                continue
 
             # Need to sample this segment
             print(f"\n[PJ一采分段采样器] 🎲 >>> 开始采样第 {idx + 1}/{n_chunks} 段 (视频 [{v_start}:{v_end}], 独立种子: {seg_seed}) ...")
@@ -312,9 +330,13 @@ class PJ_FirstPass_SegmentSampler:
 
             # Save to CPU and update cache
             chunk_out_cpu = chunk_out.to("cpu")
+            if constrain:
+                restore_boundaries(chunk_out_cpu, bounds, sources)
+                del sources
             sampled_chunks.append(chunk_out_cpu)
-            self._cache.save(idx, cache_signature, chunk_out_cpu)
-            print(f"[PJ一采分段采样器] <<< 第 {idx + 1}/{n_chunks} 段采样完成，已存入分段缓存池。")
+            if not constrain:
+                self._cache.save(idx, signatures[idx], chunk_out_cpu)
+            print(f"[PJ一采分段采样器] <<< 第 {idx + 1}/{n_chunks} 段采样完成。")
 
             # Clean temporary memory
             del chunk_v, chunk_latent_samples, chunk_out, chunk_x0_output, chunk_guider
@@ -324,7 +346,9 @@ class PJ_FirstPass_SegmentSampler:
                 del chunk_noise
             comfy.model_management.soft_empty_cache()
 
-        # Step 3: Seamless Overlap Blending
+        if constrain:
+            blend_mode = "保留边界"
+        # Assemble on the original timeline.
         print(f"\n[PJ一采分段采样器] 正在执行全序列重叠区融合 (融合算法: {blend_mode}) ...")
         video_intervals = [(c[0], c[1]) for c in chunks]
         audio_intervals = [(c[2], c[3]) for c in chunks]
@@ -354,6 +378,10 @@ class PJ_FirstPass_SegmentSampler:
             result_samples = comfy.nested_tensor.NestedTensor((blended_video, blended_audio))
         else:
             result_samples = blended_video
+
+        if rebuilding:
+            for idx, samples in enumerate(sampled_chunks):
+                self._cache.save(idx, signatures[idx], samples)
 
         if unload_model_after_sampling:
             comfy.model_management.unload_all_models()

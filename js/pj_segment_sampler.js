@@ -18,6 +18,7 @@ const WIDGET_LABELS = {
 
     // 一采专有功能
     "sync_ref_video": "按分段裁剪参考条件",
+    "boundary_constraints": "接缝约束(实验)",
     "base_seed": "基础随机种子",
 
     // 运行重抽与缓存锁
@@ -318,9 +319,11 @@ function syncSamplerSegmentCount(node, isFirstPass) {
     }
 
     const full = isFirstPass && runMode.includes("不分段");
+    const boundary = isFirstPass && !!node.widgets.find(w => w.name === "boundary_constraints")?.value;
+    toggleWidget(node, node.widgets.find(w => w.name === "boundary_constraints"), isFirstPass && !full);
     for (const name of ["sync_ref_video", "blend_mode", "unload_model_after_sampling"]) {
         toggleWidget(node, node.widgets.find(w => w.name === name),
-            !!node.properties?.pj_advanced_open && (name !== "blend_mode" || !full));
+            !!node.properties?.pj_advanced_open && (name !== "blend_mode" || (!full && !boundary)));
     }
     updateSamplerGuide(node, isFirstPass);
     autoResizeNode(node);
@@ -346,7 +349,9 @@ function samplerGuideText(node, isFirstPass) {
     else if (!isFirstPass && mode.includes("全部")) action = "按规划逐段采样一次，再融合为完整输出；无需锁定或已有缓存。";
     else if (mode.includes("全部")) action = "重新计算规划覆盖的所有分段，并更新缓存。";
     else action = "重做指定段；其他段复用有效缓存，无缓存或缓存失效时仍需计算。";
-    const settings = full ? [] : [String(value("blend_mode") || "")];
+    const boundary = isFirstPass && !full && !!value("boundary_constraints");
+    if (boundary) action += " 接缝约束固定已生成或缓存的重叠区；修改重叠内容需将相邻段一起重做。首次开启需重建缓存。";
+    const settings = full ? [] : [boundary ? "接缝约束：开（实验，画质待验证）" : String(value("blend_mode") || "")];
     if (isFirstPass) settings.push(`参考条件裁剪：${value("sync_ref_video") ? "开" : "关"}`);
     settings.push(`完成后卸载：${value("unload_model_after_sampling") ? "开" : "关"}`);
     return { planning, action, settings: settings.join(" · ") };
@@ -504,7 +509,7 @@ function attachSamplerHandlers(node, isFirstPass) {
         if (!node.title || node.title.startsWith("PJ_Segment") || node.title.startsWith("PJSegment")) node.title = "PJ二采分段精修采样器 (分段精修/局部重做)";
     }
 
-    const watchNames = ["run_mode", "target_time_second", "custom_rerun_segments", "sync_ref_video", "blend_mode", "unload_model_after_sampling"];
+    const watchNames = ["run_mode", "target_time_second", "custom_rerun_segments", "sync_ref_video", "boundary_constraints", "blend_mode", "unload_model_after_sampling"];
     for (const name of watchNames) {
         const w = node.widgets.find(widget => widget.name === name);
         if (w && !w._pj_attached) {

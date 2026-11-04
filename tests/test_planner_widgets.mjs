@@ -43,7 +43,7 @@ vm.runInContext(source, uiContext);
 vm.runInContext('updateSamplerGuide = () => {};', uiContext);
 function sampler(mode, first = false) {
     const values = {run_mode: mode, target_time_second: 5, custom_rerun_segments: '2',
-        sync_ref_video: false, blend_mode: '硬切', unload_model_after_sampling: false};
+        sync_ref_video: false, boundary_constraints: false, blend_mode: '硬切', unload_model_after_sampling: false};
     for (let i = 1; i <= 20; i++) {
         values[`seg${i}_lock`] = i === 8;
         if (first) values[`seg${i}_seed_offset`] = i - 1;
@@ -152,4 +152,23 @@ test('new second pass nodes default to normal sampling; configure restores saved
         node.configure({widgets_values: ['智能缓存(仅重跑未锁定分段)']});
         assert.equal(widget(node, 'seg8_lock').value, true);
     }
+});
+
+
+test('boundary constraints stay visible, replace blending, and do not reset saved controls', () => {
+    const node = sampler('仅重抽第2段', true);
+    node.properties.pj_advanced_open = true;
+    refresh(node, true);
+    assert.equal(visible(node, 'boundary_constraints'), true);
+    assert.equal(visible(node, 'blend_mode'), true);
+    widget(node, 'boundary_constraints').value = true;
+    refresh(node, true);
+    assert.equal(visible(node, 'blend_mode'), false);
+    assert.equal(widget(node, 'blend_mode').value, '硬切');
+    assert.match(vm.runInContext('samplerGuideText(node, true).action', uiContext), /首次开启需重建缓存/);
+    widget(node, 'run_mode').value = '整段全量采样(一采不分段)';
+    refresh(node, true);
+    assert.equal(visible(node, 'boundary_constraints'), false);
+    assert.equal(widget(node, 'boundary_constraints').value, true);
+    assert.doesNotMatch(vm.runInContext('samplerGuideText(node, true).settings', uiContext), /接缝约束/);
 });

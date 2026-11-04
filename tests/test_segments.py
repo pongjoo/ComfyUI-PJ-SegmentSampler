@@ -14,6 +14,7 @@ comfy.cli_args.args.cpu = True
 
 import torch
 import comfy.samplers
+import comfy.model_base
 from comfy.nested_tensor import NestedTensor
 from comfy_extras.nodes_custom_sampler import Noise_RandomNoise, Noise_EmptyNoise
 
@@ -21,6 +22,7 @@ spec = importlib.util.spec_from_file_location("pj_segments_test", ROOT / "__init
 package = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = package
 spec.loader.exec_module(package)
+from pj_segments_test.segment_boundaries import constrain_boundaries
 from pj_segments_test.segment_timing import frames_for_tokens, tokens_for_frames, plan_segments
 from pj_segments_test.segment_sampling import blend_sequence, segment_guider, generate_noise, slice_mask, fingerprint
 from pj_segments_test.pj_segment_planner import PJ_SegmentPlanner
@@ -45,6 +47,46 @@ class RecordingGuider(comfy.samplers.CFGGuider):
         if kwargs["callback"]:
             kwargs["callback"](0, noise, noise, 1)
         return noise.cpu()
+
+
+class NativeMaskGuider(RecordingGuider):
+    """Real H3 mask/inpaint adapter with a noise-returning DiT substitute; no weights."""
+    def sample(self, noise, latent, sampler, sigmas, **kwargs):
+        super().sample(noise, latent, sampler, sigmas, **kwargs)
+        mask = kwargs["denoise_mask"]
+        if mask is None:
+            return noise.cpu()
+        nested = latent.is_nested
+        streams = list(latent.unbind()) if nested else [latent]
+        noises = list(noise.unbind()) if nested else [noise]
+        masks = list(mask.unbind()) if mask.is_nested else [mask]
+        masks = [comfy.sampler_helpers.prepare_mask(m, t.shape, t.device) for m, t in zip(masks, streams)]
+        packed, shapes = comfy.utils.pack_latents(streams)
+        packed_noise, _ = comfy.utils.pack_latents(noises)
+        packed_mask, _ = comfy.utils.pack_latents(masks)
+        model = comfy.model_base.MiniMaxH3.__new__(comfy.model_base.MiniMaxH3)
+        torch.nn.Module.__init__(model)
+        model.diffusion_model = SimpleNamespace(patch_size=(1, 2, 2))
+        model.latent_shapes = shapes
+        model.audio_scale = lambda: 1.0
+        if nested:
+            conditions = model._denoise_mask_values(packed_mask, shapes)
+            assert "denoise_mask" in conditions or "audio_denoise_mask" in conditions
+        class FlowSampling(comfy.model_sampling.ModelSamplingDiscreteFlow, comfy.model_sampling.CONST):
+            pass
+        flow = FlowSampling()
+        class Inner:
+            inner_model = model
+            model_patcher = SimpleNamespace(get_model_object=lambda name: flow)
+            def __call__(self, x, sigma, **options):
+                return packed_noise
+        wrapper = comfy.samplers.KSamplerX0Inpaint(Inner(), sigmas)
+        wrapper.noise = packed_noise
+        wrapper.latent_image = packed
+        result = sampler.sampler_function(wrapper, packed_noise, sigmas,
+                                          extra_args={"denoise_mask": packed_mask, "seed": kwargs["seed"]}, disable=True)
+        parts = comfy.utils.unpack_latents(result, shapes)
+        return NestedTensor(parts) if nested else parts[0]
 
 
 class SegmentTests(unittest.TestCase):
@@ -306,6 +348,145 @@ class SegmentTests(unittest.TestCase):
         self.assertEqual(guide["latent"].shape[2], 22)
         clone = segment_guider(self.guider, (60, 102, 340, 575), True)
         self.assertEqual(clone.original_conds["positive"][0]["minimax_refs"], [])
+
+    def test_boundary_first_generation_uses_native_video_and_audio_masks(self):
+        self.guider = NativeMaskGuider()
+        self.plan["overlap_seconds"] = 0.5
+        node = self.node(PJ_FirstPass_SegmentSampler)
+        output = self.run_node(node, boundary_constraints=True)[0]["samples"]
+        self.assertEqual(len(self.guider.calls), 3)
+        first, second, third = self.guider.calls
+        self.assertIsNone(first[3]["denoise_mask"])
+        vm, am = second[3]["denoise_mask"].unbind()
+        self.assertTrue(torch.all(vm[:, :, :2] == 0))
+        self.assertTrue(torch.all(vm[:, :, 2:] == 1))
+        self.assertTrue(torch.all(am[..., :8] == 0))
+        self.assertTrue(torch.all(am[..., 8:] == 1))
+        self.assertTrue(torch.equal(second[1].unbind()[0][:, :, :2], first[0].unbind()[0][:, :, 40:42]))
+        self.assertTrue(torch.equal(third[1].unbind()[0][:, :, :2], output.unbind()[0][:, :, 80:82]))
+        self.assertEqual([t.shape for t in output.unbind()], [t.shape for t in self.latent["samples"].unbind()])
+
+    def test_local_redo_preserves_both_neighbours_without_cascade(self):
+        self.guider = NativeMaskGuider()
+        self.plan["overlap_seconds"] = 0.5
+        node = self.node(PJ_FirstPass_SegmentSampler)
+        before = self.run_node(node, boundary_constraints=True)[0]["samples"]
+        self.guider.calls.clear()
+        after = self.run_node(node, boundary_constraints=True, run_mode="仅重抽第2段", seg2_seed_offset=999)[0]["samples"]
+        self.assertEqual(len(self.guider.calls), 1)
+        for axis, start, end, a, b in zip((2, 3), (42, 235), (80, 453), before.unbind(), after.unbind()):
+            self.assertTrue(torch.equal(a.narrow(axis, 0, start), b.narrow(axis, 0, start)))
+            self.assertTrue(torch.equal(a.narrow(axis, end, a.shape[axis] - end), b.narrow(axis, end, b.shape[axis] - end)))
+            self.assertFalse(torch.equal(a.narrow(axis, start, end - start), b.narrow(axis, start, end - start)))
+        self.guider.calls.clear()
+        repeated = self.run_node(node, boundary_constraints=True, **{f"seg{i}_lock": True for i in range(1, 21)})[0]["samples"]
+        self.assertEqual(len(self.guider.calls), 0)
+        for a, b in zip(after.unbind(), repeated.unbind()):
+            self.assertTrue(torch.equal(a, b))
+
+    def test_boundary_multi_segment_redo_and_triple_overlaps(self):
+        self.guider = NativeMaskGuider()
+        self.plan["overlap_seconds"] = 4
+        node = self.node(PJ_FirstPass_SegmentSampler)
+        before = self.run_node(node, boundary_constraints=True)[0]["samples"]
+        self.guider.calls.clear()
+        after = self.run_node(node, boundary_constraints=True, run_mode="自定义指定分段(下方输入)",
+                              custom_rerun_segments="1,2", seg1_seed_offset=555, seg2_seed_offset=556)[0]["samples"]
+        self.assertEqual(len(self.guider.calls), 2)
+        intervals = plan_segments(107, 603, "按秒自动切分", 6, 4, 3, "")
+        for axis, start, a, b in zip((2, 3), (intervals[2][0], intervals[2][2]), before.unbind(), after.unbind()):
+            self.assertTrue(torch.equal(a.narrow(axis, start, a.shape[axis] - start), b.narrow(axis, start, b.shape[axis] - start)))
+
+    def test_er_sde_boundary_sampling_keeps_retained_overlap_exact(self):
+        self.guider = NativeMaskGuider()
+        self.sampler = comfy.samplers.ksampler("er_sde")
+        self.plan["overlap_seconds"] = 0.5
+        node = self.node(PJ_FirstPass_SegmentSampler)
+        sigmas = torch.tensor([1., 0.7, 0.3, 0.])
+        before = self.run_node(node, boundary_constraints=True, sigmas=sigmas)[0]["samples"]
+        self.guider.calls.clear()
+        after = self.run_node(node, boundary_constraints=True, sigmas=sigmas,
+                              run_mode="仅重抽第2段", seg2_seed_offset=456)[0]["samples"]
+        self.assertEqual(len(self.guider.calls), 1)
+        self.assertTrue(torch.equal(before.unbind()[0][:, :, :42], after.unbind()[0][:, :, :42]))
+        self.assertTrue(torch.equal(before.unbind()[0][:, :, 80:], after.unbind()[0][:, :, 80:]))
+        self.assertFalse(torch.equal(before.unbind()[0][:, :, 42:80], after.unbind()[0][:, :, 42:80]))
+
+    def test_boundary_mode_changes_and_plan_changes_invalidate_cache(self):
+        self.guider = NativeMaskGuider()
+        node = self.node(PJ_FirstPass_SegmentSampler)
+        locks = {f"seg{i}_lock": True for i in range(1, 21)}
+        self.run_node(node)
+        self.guider.calls.clear()
+        self.run_node(node, boundary_constraints=True, **locks)
+        self.assertEqual(len(self.guider.calls), 4)
+        self.guider.calls.clear()
+        self.plan["overlap_seconds"] = 0.5
+        self.run_node(node, boundary_constraints=True, **locks)
+        self.assertEqual(len(self.guider.calls), 3)
+        self.guider.calls.clear()
+        self.run_node(node, boundary_constraints=False, **locks)
+        self.assertEqual(len(self.guider.calls), 3)
+
+    def test_interrupted_boundary_rebuild_invalidates_all_cache_entries(self):
+        self.guider = NativeMaskGuider()
+        node = self.node(PJ_FirstPass_SegmentSampler)
+        self.run_node(node, boundary_constraints=True)
+        with patch.object(self.guider, "sample", side_effect=RuntimeError("cancelled")):
+            with self.assertRaisesRegex(RuntimeError, "cancelled"):
+                self.run_node(node, boundary_constraints=True, run_mode="仅重抽第2段")
+        self.assertFalse(node._cache.entries)
+        self.guider.calls.clear()
+        self.run_node(node, boundary_constraints=True, run_mode="仅重抽第2段")
+        self.assertEqual(len(self.guider.calls), 4)
+
+    def test_boundaries_preserve_input_masks_dtype_and_source_tensors(self):
+        video = torch.zeros(1, 24, 42, 2, 2, dtype=torch.bfloat16)
+        audio = torch.zeros(1, 32, 2, 235, dtype=torch.bfloat16)
+        source = NestedTensor((torch.full_like(video, 3, dtype=torch.float32), torch.full_like(audio, 4, dtype=torch.float32)))
+        mask = NestedTensor((torch.full((1, 1, 1, 2, 2), 0.25), torch.full((1, 1, 1, 1), 0.5)))
+        result, masks = constrain_boundaries(NestedTensor((video, audio)), mask, (40, 82, 227, 462), [((0, 42, 0, 235), source)])
+        self.assertEqual(result.unbind()[0].dtype, torch.float32)
+        self.assertTrue(torch.all(result.unbind()[0][:, :, :2] == 3))
+        self.assertTrue(torch.all(masks.unbind()[0][:, :, 2:] == 0.25))
+        self.assertTrue(torch.all(masks.unbind()[1][..., 8:] == 0.5))
+        self.assertEqual(video.count_nonzero(), 0)
+        self.assertTrue(torch.all(mask.unbind()[0] == 0.25))
+
+    def test_single_stream_and_nonoverlapping_boundaries(self):
+        original = torch.zeros(1, 4, 7, 2, 2)
+        source = torch.ones_like(original)
+        unchanged, mask = constrain_boundaries(original, None, (10, 17, 0, 0), [((0, 7, 0, 0), source)])
+        self.assertIs(unchanged, original)
+        self.assertIsNone(mask)
+        result, mask = constrain_boundaries(original, None, (5, 12, 0, 0), [((0, 7, 0, 0), source)])
+        self.assertTrue(torch.all(result[:, :, :2] == 1))
+        self.assertTrue(torch.all(mask[:, :, :2] == 0))
+        self.assertTrue(torch.all(mask[:, :, 2:] == 1))
+
+    def test_contained_and_duplicate_blends_do_not_erase_low_precision_tail(self):
+        for dtype in (torch.float32, torch.float16, torch.bfloat16):
+            original = torch.zeros(1, 1, 107, 1, 1, dtype=dtype)
+            for intervals in ([(0, 107), (5, 12)], [(0, 107), (0, 107)], [(0, 42), (30, 72), (60, 107)]):
+                chunks = [torch.ones(1, 1, e - s, 1, 1, dtype=dtype) for s, e in intervals]
+                result = blend_sequence(chunks, intervals, original, "cosine")
+                self.assertTrue(torch.equal(result, torch.ones_like(original)))
+                self.assertEqual(result.dtype, dtype)
+
+    def test_dense_overlap_weights_remain_finite(self):
+        original = torch.zeros(1, 1, 1, 1, 1)
+        result = blend_sequence([torch.ones_like(original)] * 180, [(0, 1)] * 180, original, "cosine")
+        self.assertTrue(torch.equal(result, torch.ones_like(original)))
+
+    def test_blend_keeps_sample_precision_and_direct_copies_nonoverlap(self):
+        original = torch.full((1, 1, 20, 1, 1), 7, dtype=torch.bfloat16)
+        chunks = [torch.full((1, 1, 7, 1, 1), value) for value in (1.234567, 3.456789)]
+        for mode in ("cosine", "linear", "硬切", "保留边界"):
+            result = blend_sequence(chunks, [(0, 7), (5, 12)], original, mode)
+            self.assertEqual(result.dtype, torch.float32)
+            self.assertTrue(torch.equal(result[:, :, :5], chunks[0][:, :, :5]))
+            self.assertTrue(torch.equal(result[:, :, 7:12], chunks[1][:, :, 2:]))
+            self.assertTrue(torch.all(result[:, :, 12:] == 7))
 
 
 if __name__ == "__main__":

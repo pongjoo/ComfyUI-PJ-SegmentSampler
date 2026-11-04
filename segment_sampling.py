@@ -183,38 +183,64 @@ def segment_guider(guider, bounds, sync_refs):
 
 
 def blend_sequence(chunks, intervals, original, blend_mode, is_audio=False):
-    """Assemble into the original extent; uncovered custom ranges keep their input."""
-    axis = 3 if is_audio else 2
+    """Keep the original extent; only overlapping blocks need weighted arithmetic."""
+    axis = original.ndim - 1 if is_audio else 2
     original = original.cpu()
     if len(chunks) == 1 and intervals[0] == (0, original.shape[axis]):
         return chunks[0]
-    hard = blend_mode in ("硬切", "hard_cut", "hard")
-    if hard:
-        result = original.clone()
-        for chunk, (start, end) in zip(chunks, intervals):
+    dtype = original.dtype
+    for chunk in chunks:
+        dtype = torch.promote_types(dtype, chunk.dtype)
+    result = original.to(dtype=dtype, copy=True)
+    if blend_mode in ("硬切", "hard_cut", "hard", "保留边界"):
+        items = list(zip(chunks, intervals))
+        if blend_mode == "保留边界":
+            items.reverse()
+        for chunk, (start, end) in items:
             result.narrow(axis, start, end - start).copy_(chunk)
         return result
-    accum = torch.zeros_like(original)
-    weight_shape = [1] * original.ndim
-    weight_shape[axis] = original.shape[axis]
-    weights = torch.zeros(weight_shape, dtype=original.dtype)
-    for i, (chunk, (start, end)) in enumerate(zip(chunks, intervals)):
-        length = end - start
-        w = torch.ones(length, dtype=original.dtype)
-        for left, overlap in ((True, max((e for _, e in intervals[:i]), default=start) - start),
-                              (False, end - min((s for s, _ in intervals[i + 1:]), default=end))):
-            overlap = min(length, max(0, overlap))
-            if overlap:
-                fade = torch.linspace(0, 1, overlap + 2, dtype=original.dtype)[1:-1]
-                if blend_mode in ("余弦平滑(推荐)", "cosine"):
-                    fade = 0.5 * (1 - torch.cos(math.pi * fade))
-                if left:
-                    w[:overlap] *= fade
-                else:
-                    w[-overlap:] *= fade.flip(0)
-        shape = [1] * original.ndim
-        shape[axis] = length
-        w = w.reshape(shape)
-        accum.narrow(axis, start, length).add_(chunk * w)
-        weights.narrow(axis, start, length).add_(w)
-    return torch.where(weights > 0, accum / weights.clamp_min(torch.finfo(weights.dtype).tiny), original)
+
+    compute_dtype = torch.float64 if dtype == torch.float64 else torch.float32
+    # Log weights keep dense multi-way overlaps from underflowing to zero.
+    weights = []
+    for i, (start, end) in enumerate(intervals):
+        w = torch.zeros(end - start, dtype=compute_dtype)
+        for j, (other_start, other_end) in enumerate(intervals):
+            left, right = max(start, other_start), min(end, other_end)
+            if i == j or left >= right:
+                continue
+            fade = torch.arange(1, right - left + 1, dtype=compute_dtype) / (right - left + 1)
+            if blend_mode in ("余弦平滑(推荐)", "cosine"):
+                fade = torch.sin(fade * (math.pi / 2)).square()
+            if j > i:
+                fade = fade.flip(0)
+            w[left - start:right - start] += fade.log()
+        weights.append(w)
+
+    edges = sorted({point for interval in intervals for point in interval})
+    for left, right in zip(edges, edges[1:]):
+        active = [i for i, (start, end) in enumerate(intervals) if start <= left and end >= right]
+        if not active:
+            continue
+        if len(active) == 1:
+            i = active[0]
+            result.narrow(axis, left, right - left).copy_(chunks[i].narrow(axis, left - intervals[i][0], right - left))
+            continue
+        # Bound temporary FP32 storage even for long, high-resolution overlaps.
+        for offset in range(left, right, 8):
+            length = min(8, right - offset)
+            shape = list(result.shape)
+            shape[axis] = length
+            accum = torch.zeros(shape, dtype=compute_dtype)
+            weight_shape = [1] * result.ndim
+            weight_shape[axis] = length
+            total = torch.zeros(weight_shape, dtype=compute_dtype)
+            block_weights = torch.stack([weights[i][offset - intervals[i][0]:offset - intervals[i][0] + length] for i in active])
+            block_weights = (block_weights - block_weights.amax(dim=0)).exp()
+            for row, i in enumerate(active):
+                start = offset - intervals[i][0]
+                w = block_weights[row].reshape(weight_shape)
+                accum.addcmul_(chunks[i].narrow(axis, start, length).to(dtype=compute_dtype), w)
+                total.add_(w)
+            result.narrow(axis, offset, length).copy_(accum / total)
+    return result
