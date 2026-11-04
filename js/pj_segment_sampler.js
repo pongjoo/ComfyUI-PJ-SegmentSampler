@@ -71,6 +71,19 @@ const OUTPUT_LABELS = {
 // ==========================================
 function toggleWidget(node, widget, show) {
     if (!widget) return;
+    const slotIndex = node.inputs?.findIndex(input => input.widget?.name === widget.name) ?? -1;
+    const input = node.inputs?.[slotIndex];
+    const connected = slotIndex >= 0 && (node.isInputConnected?.(slotIndex) ?? input.link != null);
+    show = show || connected;
+    // Widget sockets are drawn separately by current LiteGraph, even for hidden rows.
+    if (input && typeof input.draw === "function" && !input._pjVisibilityDraw) {
+        const draw = input.draw;
+        input.draw = function () {
+            const current = node.widgets?.find(w => w.name === this.widget?.name);
+            if (current?.type !== HIDDEN_TAG) return draw.apply(this, arguments);
+        };
+        Object.defineProperty(input, "_pjVisibilityDraw", { value: true });
+    }
     if (!widget._origProps) {
         widget._origProps = {
             origType: widget.type,
@@ -84,6 +97,7 @@ function toggleWidget(node, widget, show) {
         widget.type = HIDDEN_TAG;
         widget.computeSize = () => [0, -4];
     }
+    widget.hidden = !show;
 }
 
 function autoResizeNode(node) {

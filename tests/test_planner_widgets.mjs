@@ -59,6 +59,66 @@ function refresh(node, first = false) {
 const widget = (node, name) => node.widgets.find(w => w.name === name);
 const visible = (node, name) => widget(node, name).type !== 'pj_hidden';
 
+test('hidden widget sockets do not draw and expanding restores the original renderer', () => {
+    const node = sampler('全部精修(刷新全部缓存)');
+    let draws = 0;
+    const input = {name: 'blend_mode', widget: {name: 'blend_mode'}, link: null, alwaysVisible: true,
+        draw(context, options) {assert.equal(this, input); assert.equal(context, 'canvas'); draws++; return options;}};
+    node.inputs.push(input);
+    const inputs = [...node.inputs];
+    const values = node.widgets.map(w => w.value);
+    refresh(node);
+    input.draw('canvas', 'hidden');
+    assert.equal(draws, 0);
+    assert.equal(widget(node, 'blend_mode').hidden, true);
+    const wrapped = input.draw;
+    refresh(node);
+    assert.equal(input.draw, wrapped);
+    node.properties.pj_advanced_open = true;
+    refresh(node);
+    assert.equal(input.draw('canvas', 'visible'), 'visible');
+    assert.equal(draws, 1);
+    assert.equal(widget(node, 'blend_mode').hidden, false);
+    assert.deepEqual(node.inputs, inputs);
+    assert.deepEqual(node.widgets.map(w => w.value), values);
+});
+
+test('connected widget inputs keep their rows when folding or disconnecting the planner', () => {
+    const node = sampler('智能缓存(仅重跑未锁定分段)', true);
+    node.inputs[0].link = null;
+    const input = {name: 'seg8_seed_offset', widget: {name: 'seg8_seed_offset'}, link: 0, draw() {return 'drawn';}};
+    node.inputs.push(input);
+    refresh(node, true);
+    assert.equal(visible(node, 'seg8_seed_offset'), true);
+    assert.equal(widget(node, 'seg8_seed_offset').hidden, false);
+    assert.equal(input.draw(), 'drawn');
+    assert.equal(input.link, 0);
+    input.link = null;
+    refresh(node, true);
+    assert.equal(visible(node, 'seg8_seed_offset'), false);
+    assert.equal(input.draw(), undefined);
+    node.isInputConnected = index => index === 1;
+    refresh(node, true);
+    assert.equal(visible(node, 'seg8_seed_offset'), true);
+    assert.equal(input.draw(), 'drawn');
+});
+
+test('socket renderer follows replaced widgets after workflow configuration', () => {
+    const node = sampler('全部精修(刷新全部缓存)');
+    const input = {name: 'blend_mode', widget: {name: 'blend_mode'}, link: null, draw() {return 'drawn';}};
+    node.inputs.push(input);
+    refresh(node);
+    const index = node.widgets.findIndex(w => w.name === 'blend_mode');
+    node.widgets[index] = {name: 'blend_mode', type: 'combo', value: '硬切'};
+    node.properties.pj_advanced_open = true;
+    refresh(node);
+    assert.equal(input.draw(), 'drawn');
+    node.properties.pj_advanced_open = false;
+    refresh(node);
+    assert.equal(input.draw(), undefined);
+    assert.equal(node.inputs[1], input);
+});
+
 test('preview count cannot reset a saved target beyond the preview', () => {
     const node = sampler('仅精修第18段');
     refresh(node);
