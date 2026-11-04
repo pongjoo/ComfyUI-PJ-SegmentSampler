@@ -5,8 +5,6 @@ PJ_SegmentPlanner (PJ分段规划器 / 时序总控与可视分段播放器)
 """
 
 import os
-import sys
-import math
 import json
 import uuid
 import tempfile
@@ -15,6 +13,8 @@ import numpy as np
 import torch
 
 import folder_paths
+
+from .segment_timing import FPS, frames_for_tokens, tokens_for_frames, plan_segments, segment_seconds
 
 try:
     import soundfile as sf
@@ -141,7 +141,7 @@ class PJ_SegmentPlanner:
                         "min": 1.0,
                         "max": 120.0,
                         "step": 1.0,
-                        "tooltip": "视频帧率，用于换算秒数与潜空间步数，MiniMax H3 官方为 24.0",
+                        "tooltip": "输入图像序列的播放帧率；H3 分段和潜空间始终使用24fps模型时钟",
                     },
                 ),
                 "split_mode": (
@@ -192,7 +192,7 @@ class PJ_SegmentPlanner:
                         "default": False,
                         "label_on": "开启51帧吸附",
                         "label_off": "关闭",
-                        "tooltip": "开启后将窗口长度吸附到51帧/85音频步网格，确保绝对RoPE相位一致",
+                        "tooltip": "使用51视频帧/15视频潜步/85音频潜步的整数起点步进；不保证嘴型或接缝质量",
                     },
                 ),
             },
@@ -200,7 +200,7 @@ class PJ_SegmentPlanner:
                 "latent": (
                     "LATENT",
                     {
-                        "tooltip": "【可选】接入采样器处理的潜空间。接入后直接读取其实际长度并呈现100%精准分段预览",
+                        "tooltip": "【可选】读取音视频潜空间实际长度；H3 使用固定24fps模型时钟",
                     },
                 ),
                 "images": (
@@ -238,135 +238,30 @@ class PJ_SegmentPlanner:
         audio=None,
         **kwargs,
     ):
-        # 1. 确定视频总帧数与时长 (秒)
-        has_media = False
-        mode_desc = ""
-
-        if latent is not None and isinstance(latent, dict) and "samples" in latent:
-            # 自动读取传入的实际 Latent 长度
+        source_fps = fps
+        fps = FPS
+        has_media = latent is not None or images is not None
+        total_a = None
+        if latent is not None:
             samples = latent["samples"]
-            if hasattr(samples, "is_nested") and samples.is_nested:
-                v_stream = list(samples.unbind())[0]
-            else:
-                v_stream = samples
-            total_v = v_stream.shape[2]
-            v_fps = fps / 3.4
-            effective_seconds = float(total_v) / float(v_fps)
-            eff_total_frames = int(round(effective_seconds * fps))
-            has_media = True
-            mode_desc = f"直连潜空间 ({total_v} 潜步, ~{effective_seconds:.2f}s)"
-            print(f"[PJ分段规划器] 🚀 读取接入的实际 Latent 长度: {total_v} 潜步 (~{effective_seconds:.2f}秒, {eff_total_frames} 帧)")
-        elif images is not None and hasattr(images, "shape") and len(images.shape) >= 1:
-            eff_total_frames = int(images.shape[0])
-            effective_seconds = float(eff_total_frames) / float(fps)
-            v_fps = fps / 3.4
-            total_v = int(round(effective_seconds * v_fps))
-            has_media = True
-            mode_desc = f"直连视频图像 ({eff_total_frames} 帧, ~{effective_seconds:.2f}s)"
-            print(f"[PJ分段规划器] 🎬 采用输入图像序列实际帧数: {eff_total_frames} 帧 (~{effective_seconds:.2f}秒)")
+            streams = list(samples.unbind()) if samples.is_nested else [samples]
+            video = streams[0]
+            total_v = video.shape[2]
+            if samples.is_nested and video.ndim == 5 and video.shape[1] == 24:
+                fps = FPS
+            if len(streams) > 1:
+                total_a = streams[1].shape[-1]
+            mode_desc = "直连潜空间"
         else:
-            # 未连潜空间或视频：规则待命模式
-            # 采用 15 秒（或旧工作流传入的 duration_seconds）作为参考时长生成预览规则
-            effective_seconds = max(0.1, float(kwargs.get("duration_seconds", 15.0)))
-            eff_total_frames = int(round(effective_seconds * fps))
-            v_fps = fps / 3.4
-            total_v = int(round(effective_seconds * v_fps))
-            has_media = False
-            mode_desc = "规则待命模式 (未直连潜空间，下游采样器将按其各自输入的潜空间长度动态适配)"
-            print(f"[PJ分段规划器] ⚙️ 未直连潜空间输入，按参考基准 {effective_seconds:.2f} 秒 ({eff_total_frames} 帧) 预览分段规则")
-
-        total_frames = eff_total_frames
-        a_fps = 40.0
-        total_a = int(round(effective_seconds * a_fps))
-
-        chunks = []
-
-        # 2. 精准切片时序规划
-        if split_mode in ("按秒自动切分", "auto_by_seconds"):
-            if align_51_frames:
-                target_chunk_v = max(17, int(round(chunk_seconds * v_fps)))
-                m_chunk = max(1, round((target_chunk_v - 2) / 15.0))
-                win_v = m_chunk * 15 + 2
-                target_ov_v = max(2, int(round(overlap_seconds * v_fps)))
-                m_ov = max(1, round((target_ov_v - 2) / 15.0))
-                stride_m = max(1, m_chunk - m_ov)
-                stride_v = stride_m * 15
-                v_cur = 0
-                while v_cur < total_v:
-                    v_start = v_cur
-                    v_end = min(total_v, v_start + win_v)
-                    if v_end < total_v:
-                        rem = (v_end - 2) % 15
-                        if rem != 0:
-                            v_end = min(total_v, v_end + (15 - rem))
-                    a_start = int(round(v_start * (85.0 / 15.0)))
-                    a_end = min(total_a, int(round(v_end * (85.0 / 15.0))))
-                    chunks.append((v_start, v_end, a_start, a_end))
-                    if v_end >= total_v:
-                        break
-                    v_cur += stride_v
-            else:
-                win_v = max(5, int(round(chunk_seconds * v_fps)))
-                rem = (win_v - 2) % 5
-                if rem != 0:
-                    win_v = win_v + (5 - rem)
-                stride_v = max(5, int(round((chunk_seconds - overlap_seconds) * v_fps)))
-                stride_v = (stride_v // 5) * 5
-                if stride_v <= 0:
-                    stride_v = 5
-                v_cur = 0
-                while v_cur < total_v:
-                    v_start = (v_cur // 5) * 5
-                    v_end = min(total_v, v_start + win_v)
-                    if v_end < total_v:
-                        rem_end = (v_end - 2) % 5
-                        if rem_end != 0:
-                            v_end = min(total_v, v_end + (5 - rem_end))
-                    sec_start = v_start / v_fps
-                    sec_end = v_end / v_fps
-                    a_start = int(round(sec_start * a_fps))
-                    a_end = min(total_a, int(round(sec_end * a_fps)))
-                    chunks.append((v_start, v_end, a_start, a_end))
-                    if v_end >= total_v:
-                        break
-                    v_cur += stride_v
-
-        elif split_mode in ("固定分段数", "fixed_segments"):
-            actual_n = max(1, int(num_segments))
-            win_v = max(5, int(math.ceil(total_v / actual_n)))
-            rem = (win_v - 2) % 5
-            if rem != 0:
-                win_v += 5 - rem
-            ov_v = max(2, int(round(overlap_seconds * v_fps)))
-            for i in range(actual_n):
-                v_start = max(0, i * (win_v - ov_v))
-                v_start = (v_start // 5) * 5
-                v_end = min(total_v, v_start + win_v)
-                if i == actual_n - 1:
-                    v_end = total_v
-                sec_s = v_start / v_fps
-                sec_e = v_end / v_fps
-                a_s = int(round(sec_s * a_fps))
-                a_e = min(total_a, int(round(sec_e * a_fps)))
-                chunks.append((v_start, v_end, a_s, a_e))
-
-        elif split_mode in ("自定义切点", "custom", "custom_cuts"):
-            pairs = [p.strip() for p in custom_cuts.split(",") if "-" in p]
-            for p in pairs:
-                try:
-                    s_str, e_str = p.split("-")
-                    s_sec, e_sec = float(s_str.strip()), float(e_str.strip())
-                    v_start = max(0, int(round(s_sec * v_fps)))
-                    v_start = (v_start // 5) * 5
-                    v_end = min(total_v, int(round(e_sec * v_fps)))
-                    a_start = max(0, int(round(s_sec * a_fps)))
-                    a_end = min(total_a, int(round(e_sec * a_fps)))
-                    chunks.append((v_start, v_end, a_start, a_end))
-                except Exception as e:
-                    print(f"[PJ分段规划器] 解析自定义切点失败: '{p}', 错误: {e}")
-
-        if not chunks:
-            chunks = [(0, total_v, 0, total_a)]
+            source_frames = images.shape[0] * FPS / source_fps if images is not None else round(15 * FPS)
+            total_v = tokens_for_frames(source_frames)
+            mode_desc = "直连视频图像（H3 帧网格预览）" if images is not None else "规则待命模式"
+        total_frames = frames_for_tokens(total_v)
+        effective_seconds = total_frames / fps
+        if total_a is None:
+            total_a = round(effective_seconds * 40)
+        chunks = plan_segments(total_v, total_a, split_mode, chunk_seconds, overlap_seconds,
+                               num_segments, custom_cuts, fps, align_51_frames)
 
         n_chunks = len(chunks)
 
@@ -386,8 +281,7 @@ class PJ_SegmentPlanner:
         summary_lines.append("--------------------------------------------------")
 
         for i, (vs, ve, as_, ae) in enumerate(chunks):
-            s_sec = vs / v_fps
-            e_sec = ve / v_fps
+            s_sec, e_sec = segment_seconds(vs, ve, fps)
             s_frame = int(round(s_sec * fps))
             e_frame = min(total_frames, int(round(e_sec * fps)))
             dur_sec = round(e_sec - s_sec, 2)
@@ -413,7 +307,7 @@ class PJ_SegmentPlanner:
         print("=" * 65 + "\n")
 
         # 4. 合成前端交互播放视频 (如果传入了 images)
-        video_filename = _generate_preview_mp4(images, audio, fps) if images is not None else None
+        video_filename = _generate_preview_mp4(images, audio, source_fps) if images is not None else None
 
         plan_dict = {
             "has_media": has_media,

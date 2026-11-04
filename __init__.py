@@ -1,11 +1,6 @@
-try:
-    from .pj_segment_sampler import PJ_SegmentSampler, PJSegmentSampler
-    from .pj_first_pass_sampler import PJ_FirstPass_SegmentSampler
-    from .pj_segment_planner import PJ_SegmentPlanner
-except ImportError:
-    from pj_segment_sampler import PJ_SegmentSampler, PJSegmentSampler
-    from pj_first_pass_sampler import PJ_FirstPass_SegmentSampler
-    from pj_segment_planner import PJ_SegmentPlanner
+from .pj_segment_sampler import PJ_SegmentSampler, PJSegmentSampler
+from .pj_first_pass_sampler import PJ_FirstPass_SegmentSampler
+from .pj_segment_planner import PJ_SegmentPlanner
 
 NODE_CLASS_MAPPINGS = {
     "PJ_SegmentPlanner": PJ_SegmentPlanner,
@@ -17,7 +12,7 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "PJ_SegmentPlanner": "PJ分段规划器 (时序总控/可视播放器)",
     "PJ_FirstPass_SegmentSampler": "PJ一采分段重抽采样器 (单段重抽/缓存)",
-    "PJ_SegmentSampler": "PJ二采分段精修采样器 (高清无损/防爆显存)",
+    "PJ_SegmentSampler": "PJ二采分段精修采样器 (分段精修/释放显存)",
     "PJSegmentSampler": "PJ二采分段精修采样器 (别名)",
 }
 

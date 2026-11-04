@@ -1,56 +1,24 @@
-import os
-import sys
-import math
-import logging
-import gc
 import torch
 
-import comfy.sample
 import comfy.utils
 import comfy.model_management
 import comfy.nested_tensor
 import latent_preview
 
-# Global in-memory cache for Second Pass segment latents
-_SECOND_PASS_CACHE = {}
-
-
-def _safe_generate_noise(noise_obj, latent_image_dict, latent_tensor, seed_val=0):
-    """
-    安全生成噪声：标准 ComfyUI Noise 节点 (如 RandomNoise) 的 generate_noise
-    要求传入包含 'samples' 的 dict (即 latent_image)。
-    本函数进行多重容错，彻底杜绝 'too many indices for tensor of dimension 5' 异常。
-    """
-    if noise_obj is None:
-        return comfy.sample.prepare_noise(latent_tensor, seed_val)
-
-    if hasattr(noise_obj, "generate_noise"):
-        try:
-            if isinstance(latent_image_dict, dict) and "samples" in latent_image_dict:
-                return noise_obj.generate_noise(latent_image_dict)
-            else:
-                return noise_obj.generate_noise({"samples": latent_tensor})
-        except (TypeError, KeyError, IndexError):
-            try:
-                return noise_obj.generate_noise(latent_tensor)
-            except Exception:
-                pass
-
-    eff_seed = getattr(noise_obj, "seed", seed_val)
-    if eff_seed is None or not isinstance(eff_seed, int):
-        eff_seed = seed_val
-    return comfy.sample.prepare_noise(latent_tensor, eff_seed)
+from .segment_timing import plan_segments, resolve_plan, segment_seconds
+from .segment_sampling import (SegmentCache, sampling_signature, fingerprint, generate_noise,
+                               slice_mask, segment_guider, blend_sequence)
 
 
 class PJ_SegmentSampler:
     """
     PJ二采分段精修采样器 (Second-Pass Segment Sampler)
     专为 MiniMax H3 及长视频 2.0MP 高清精修设计：
-    1. 纯潜空间切分，阻断 40GB+ 显存爆炸；
-    2. 支持 MiniMax H3 严苛的 17k+5 周期与 51 帧 RoPE 相位对齐；
+    1. 按时间切分潜空间，降低单段采样工作量；
+    2. 使用 H3 17n+5 帧网格，可选51帧整数步进；
     3. 支持各分段独立缓存与局部重跑；
-    4. 100% 保留一采原版连续高保真音频，零接缝与声学相位损耗；
-    5. 采样结束自动将 20GB DiT 模型卸载至 CPU，彻底解决 VAE 解码爆显存！
+    4. 可保留输入音频潜空间；不保证画面与音频嘴型一致；
+    5. 可在采样结束后请求 ComfyUI 卸载模型！
     """
 
     @classmethod
@@ -119,7 +87,7 @@ class PJ_SegmentSampler:
                 "seg20_lock": ("BOOLEAN", {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "打勾后，跳过第20段二采计算直接读缓存"}),
                 "blend_mode": (
                     ["余弦平滑(推荐)", "线性过渡", "硬切"],
-                    {"default": "余弦平滑(推荐)", "tooltip": "重叠区无缝平滑算法"},
+                    {"default": "余弦平滑(推荐)", "tooltip": "重叠区融合算法"},
                 ),
                 "keep_original_audio": (
                     "BOOLEAN",
@@ -127,7 +95,7 @@ class PJ_SegmentSampler:
                         "default": True,
                         "label_on": "开启(原音保真)",
                         "label_off": "二采融合",
-                        "tooltip": "二采核心目的是超分细化视频画面。强烈建议勾选此项，100%保留一采无瑕疵连续音频，杜绝声学相位抵消与爆音！",
+                        "tooltip": "输出直接保留输入音频潜空间；音频仍参与模型联合采样，但其新结果不写回",
                     },
                 ),
                 "unload_model_after_sampling": (
@@ -136,7 +104,7 @@ class PJ_SegmentSampler:
                         "default": True,
                         "label_on": "开启(释放显存)",
                         "label_off": "保留显存",
-                        "tooltip": "二采完成后自动将 20GB DiT 大模型卸载至 CPU 内存，使下游 VAE 解码拥有充足纯净显存，从根源消除 23G+ 爆显存风险！",
+                        "tooltip": "采样完成后请求ComfyUI卸载模型；VAE解码仍受分辨率、切块和可用显存影响",
                     },
                 ),
             },
@@ -147,108 +115,13 @@ class PJ_SegmentSampler:
     FUNCTION = "execute"
     CATEGORY = "PJ工具箱/分段采样"
 
-    def plan_segments(
-        self,
-        total_v,
-        total_a,
-        split_mode,
-        chunk_seconds,
-        overlap_seconds,
-        num_segments,
-        custom_cuts,
-        fps,
-        align_51_frames=False,
-    ):
-        v_fps = fps / 3.4
-        a_fps = 40.0
-        chunks = []
+    def __init__(self):
+        self._cache = SegmentCache()
 
-        # Mapping for split_mode compatibility
-        if split_mode in ("auto_by_seconds", "按秒自动切分"):
-            if align_51_frames:
-                target_chunk_v = max(17, int(round(chunk_seconds * v_fps)))
-                m_chunk = max(1, round((target_chunk_v - 2) / 15.0))
-                win_v = m_chunk * 15 + 2
-                target_ov_v = max(2, int(round(overlap_seconds * v_fps)))
-                m_ov = max(1, round((target_ov_v - 2) / 15.0))
-                stride_m = max(1, m_chunk - m_ov)
-                stride_v = stride_m * 15
-                v_cur = 0
-                while v_cur < total_v:
-                    v_start = v_cur
-                    v_end = min(total_v, v_start + win_v)
-                    if v_end < total_v:
-                        rem = (v_end - 2) % 15
-                        if rem != 0:
-                            v_end = min(total_v, v_end + (15 - rem))
-                    a_start = int(round(v_start * (85.0 / 15.0)))
-                    a_end = min(total_a, int(round(v_end * (85.0 / 15.0))))
-                    chunks.append((v_start, v_end, a_start, a_end))
-                    if v_end >= total_v:
-                        break
-                    v_cur += stride_v
-            else:
-                win_v = max(5, int(round(chunk_seconds * v_fps)))
-                rem = (win_v - 2) % 5
-                if rem != 0:
-                    win_v = win_v + (5 - rem)
-                stride_v = max(5, int(round((chunk_seconds - overlap_seconds) * v_fps)))
-                stride_v = (stride_v // 5) * 5
-                if stride_v <= 0:
-                    stride_v = 5
-                v_cur = 0
-                while v_cur < total_v:
-                    v_start = (v_cur // 5) * 5
-                    v_end = min(total_v, v_start + win_v)
-                    if v_end < total_v:
-                        rem_end = (v_end - 2) % 5
-                        if rem_end != 0:
-                            v_end = min(total_v, v_end + (5 - rem_end))
-                    sec_start = v_start / v_fps
-                    sec_end = v_end / v_fps
-                    a_start = int(round(sec_start * a_fps))
-                    a_end = min(total_a, int(round(sec_end * a_fps)))
-                    chunks.append((v_start, v_end, a_start, a_end))
-                    if v_end >= total_v:
-                        break
-                    v_cur += stride_v
-
-        elif split_mode in ("fixed_segments", "固定分段数"):
-            win_v = max(5, int(math.ceil(total_v / num_segments)))
-            rem = (win_v - 2) % 5
-            if rem != 0:
-                win_v += 5 - rem
-            ov_v = max(2, int(round(overlap_seconds * v_fps)))
-            for i in range(num_segments):
-                v_start = max(0, i * (win_v - ov_v))
-                v_start = (v_start // 5) * 5
-                v_end = min(total_v, v_start + win_v)
-                if i == num_segments - 1:
-                    v_end = total_v
-                sec_s = v_start / v_fps
-                sec_e = v_end / v_fps
-                a_s = int(round(sec_s * a_fps))
-                a_e = min(total_a, int(round(sec_e * a_fps)))
-                chunks.append((v_start, v_end, a_s, a_e))
-
-        elif split_mode in ("custom_cuts", "自定义切点"):
-            pairs = [p.strip() for p in custom_cuts.split(",") if "-" in p]
-            for p in pairs:
-                try:
-                    s_str, e_str = p.split("-")
-                    s_sec, e_sec = float(s_str.strip()), float(e_str.strip())
-                    v_start = max(0, int(round(s_sec * v_fps)))
-                    v_start = (v_start // 5) * 5
-                    v_end = min(total_v, int(round(e_sec * v_fps)))
-                    a_start = max(0, int(round(s_sec * a_fps)))
-                    a_end = min(total_a, int(round(e_sec * a_fps)))
-                    chunks.append((v_start, v_end, a_start, a_end))
-                except Exception as e:
-                    print(f"[PJ二采分段] 解析自定义切点失败: '{p}', 错误: {e}")
-
-        if not chunks:
-            chunks = [(0, total_v, 0, total_a)]
-        return chunks
+    def plan_segments(self, total_v, total_a, split_mode, chunk_seconds, overlap_seconds,
+                      num_segments, custom_cuts, fps, align_51_frames=False):
+        return plan_segments(total_v, total_a, split_mode, chunk_seconds, overlap_seconds,
+                             num_segments, custom_cuts, fps, align_51_frames)
 
     def execute(
         self,
@@ -281,7 +154,6 @@ class PJ_SegmentSampler:
         fps=24.0,
         **kwargs,
     ):
-        global _SECOND_PASS_CACHE
 
         # Compatibility fallbacks
         if isinstance(run_mode, bool) or str(run_mode).lower() in ("true", "false"):
@@ -299,8 +171,6 @@ class PJ_SegmentSampler:
         if latent is None:
             raise ValueError("latent_image 中未找到 samples 张量")
 
-        noise_mask = latent_image.get("noise_mask", None)
-
         is_nested = hasattr(latent, "is_nested") and latent.is_nested
         if is_nested:
             streams = list(latent.unbind())
@@ -310,46 +180,22 @@ class PJ_SegmentSampler:
             full_video = latent
             full_audio = None
 
-        orig_audio_for_bypass = full_audio.clone() if full_audio is not None else None
+        orig_audio_for_bypass = full_audio.cpu().clone() if full_audio is not None and keep_original_audio else None
 
         total_v = full_video.shape[2]
         total_a = full_audio.shape[-1] if full_audio is not None else 0
 
-        # Plan chunks (优先从上游【PJ分段规划器】总线继承，保证绝对时序统一)
-        fps = 24.0
-        if segment_plan is not None and isinstance(segment_plan, dict):
-            fps = float(segment_plan.get("fps", 24.0))
-            eff_split = segment_plan.get("split_mode", "按秒自动切分")
-            eff_chunk = float(segment_plan.get("chunk_seconds", 8.0))
-            eff_ov = float(segment_plan.get("overlap_seconds", 2.0))
-            eff_num = int(segment_plan.get("num_segments", 2))
-            eff_cuts = segment_plan.get("custom_cuts", "0-6, 4.5-10.5, 9-15")
-            eff_align = bool(segment_plan.get("align_51_frames", False))
-
-            if segment_plan.get("has_media") and segment_plan.get("total_v") == total_v and "chunks" in segment_plan:
-                chunks = segment_plan["chunks"]
-                print(f"[PJ二采分段采样器] 🔗 成功读取上游【PJ分段规划器】总线，直接继承精确切片分段 ({len(chunks)} 段, FPS: {fps})！")
-            else:
-                chunks = self.plan_segments(
-                    total_v, total_a, eff_split, eff_chunk, eff_ov, eff_num, eff_cuts, fps, align_51_frames=eff_align
-                )
-                print(f"[PJ二采分段采样器] 🎯 成功读取上游【PJ分段规划器】规则，根据输入潜空间实际长度 ({total_v} 潜步, ~{total_v / (fps / 3.4):.2f}s) 动态规划出 {len(chunks)} 个分段！")
-        else:
-            eff_split = kwargs.get("split_mode", "按秒自动切分")
-            eff_chunk = float(kwargs.get("chunk_seconds", 8.0))
-            eff_ov = float(kwargs.get("overlap_seconds", 2.0))
-            eff_num = int(kwargs.get("num_segments", 2))
-            eff_cuts = kwargs.get("custom_cuts", "")
-            eff_align = bool(kwargs.get("align_51_frames", False))
-            fps = float(kwargs.get("fps", 24.0))
-            chunks = self.plan_segments(
-                total_v, total_a, eff_split, eff_chunk, eff_ov, eff_num, eff_cuts, fps, align_51_frames=eff_align
-            )
-            print(f"[PJ二采分段采样器] ⚠️ 未连接【分段规划总线】，使用安全默认分段 (共 {len(chunks)} 段)")
+        chunks, fps = resolve_plan(
+            latent, segment_plan, split_mode, chunk_seconds, overlap_seconds,
+            num_segments, custom_cuts, fps, align_51_frames,
+            full_length="不分段" in str(run_mode) or "全量采样" in str(run_mode),
+        )
         n_chunks = len(chunks)
+        self._cache.retain(n_chunks)
+        context_signature = sampling_signature(guider, sampler, sigmas)
 
         print("\n" + "=" * 65)
-        print(f"[PJ二采分段采样器] 输入潜空间总计: {total_v} 视频步 (~{total_v / (fps / 3.4):.2f}s), 音频: {total_a} 步")
+        print(f"[PJ二采分段采样器] 输入潜空间总计: {total_v} 视频步 (~{segment_seconds(0, total_v, fps)[1]:.2f}s), 音频: {total_a} 步")
         print(f"[PJ二采分段采样器] 运行模式: {run_mode} | 计划切分: {n_chunks} 段")
         for i, (vs, ve, as_, ae) in enumerate(chunks):
             print(f"  - 分段 {i + 1}/{n_chunks}: 视频潜空间 [{vs}:{ve}], 音频 [{as_}:{ae}]")
@@ -368,11 +214,9 @@ class PJ_SegmentSampler:
         # 计算目标缺陷秒数所属的分段编号 (如果处于缺陷秒数精修模式)
         target_defect_seg = None
         if "缺陷秒数" in str(run_mode):
-            v_fps = fps / 3.4
             for seg_i, (vs, ve, as_, ae) in enumerate(chunks):
-                s_sec = vs / v_fps
-                e_sec = ve / v_fps
-                if s_sec <= target_time_second <= e_sec:
+                s_sec, e_sec = segment_seconds(vs, ve, fps)
+                if s_sec <= target_time_second < e_sec:
                     target_defect_seg = seg_i + 1
                     break
             if target_defect_seg is not None:
@@ -381,23 +225,24 @@ class PJ_SegmentSampler:
                 target_defect_seg = 1
                 print(f"[PJ二采分段采样器] ⚠️ 目标秒数 {target_time_second:.2f}s 超出范围，默认精修第 1 段")
 
-        # Generate global noise (使用多重安全容错函数，彻底杜绝 5D 索引异常)
-        global_noise = _safe_generate_noise(noise, latent_image, latent, getattr(noise, "seed", 0))
-        if is_nested:
-            gn_streams = list(global_noise.unbind())
-            gn_video = gn_streams[0]
-            gn_audio = gn_streams[1] if len(gn_streams) > 1 else None
-        else:
-            gn_video = global_noise
-            gn_audio = None
-
         sampled_chunks = []
         x0_chunks = []
         has_any_x0 = False
         disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
 
         for idx, (v_start, v_end, a_start, a_end) in enumerate(chunks):
-            cache_key = f"second_pass_seg_{idx}"
+            chunk_v = full_video[:, :, v_start:v_end].clone()
+            if is_nested and full_audio is not None:
+                chunk_a = full_audio[..., a_start:a_end].clone()
+                chunk_latent_samples = comfy.nested_tensor.NestedTensor((chunk_v, chunk_a))
+            else:
+                chunk_latent_samples = chunk_v
+            bounds = (v_start, v_end, a_start, a_end)
+            chunk_mask = slice_mask(latent_image.get("noise_mask"), bounds)
+            cache_signature = fingerprint((context_signature, bounds, chunk_latent_samples,
+                                           chunk_mask, latent_image.get("batch_index"), type(noise),
+                                           {k: v for k, v in vars(noise).items() if k != "seed"} if noise is not None else None))
+            cache_valid = self._cache.entries.get(idx) == cache_signature
             seg_lock = locks[idx] if idx < len(locks) else False
 
             should_resample = True
@@ -409,63 +254,44 @@ class PJ_SegmentSampler:
                 target_seg_num = int(run_mode.replace("仅精修第", "").replace("段", "").strip())
                 should_resample = (idx + 1) == target_seg_num
             elif "自定义" in run_mode:
-                try:
-                    targets = [int(s.strip()) for s in str(custom_rerun_segments).split(",") if s.strip().isdigit()]
-                    should_resample = (idx + 1) in targets
-                except Exception:
-                    should_resample = True
+                targets = [int(s.strip()) for s in str(custom_rerun_segments).split(",") if s.strip()]
+                should_resample = (idx + 1) in targets
             elif run_mode == "智能缓存(仅重跑未锁定分段)":
-                if seg_lock and cache_key in _SECOND_PASS_CACHE:
+                if seg_lock and cache_valid:
                     should_resample = False
                 else:
                     should_resample = True
 
             # Cache hit check
-            if not should_resample and cache_key in _SECOND_PASS_CACHE:
-                print(f"\n[PJ二采分段采样器] ⚡ 第 {idx + 1}/{n_chunks} 段二采已锁定，直接从缓存加载 (耗时 0.00s)！")
-                cached_chunk = _SECOND_PASS_CACHE[cache_key]
-                sampled_chunks.append(cached_chunk)
+            cached = self._cache.load(idx, cache_signature) if not should_resample else None
+            if cached is not None:
+                sampled_chunks.append(cached[0])
+                x0_chunks.append(cached[1])
+                has_any_x0 |= cached[1] is not None
+                print(f"[PJ分段采样] 第 {idx + 1}/{n_chunks} 段复用缓存")
                 continue
 
             print(f"\n[PJ二采分段采样器] >>> 开始精修第 {idx + 1}/{n_chunks} 段 (视频 [{v_start}:{v_end}]) ...")
 
-            chunk_v = full_video[:, :, v_start:v_end, :, :].clone()
-            if is_nested and full_audio is not None and a_end > a_start:
-                chunk_a = full_audio[:, :, :, a_start:a_end].clone()
-                chunk_latent_samples = comfy.nested_tensor.NestedTensor((chunk_v, chunk_a))
+            # Generate from the full shape so equal seeds share noise at equal absolute positions.
+            segment_noise = generate_noise(noise, latent_image, getattr(noise, "seed", 0))
+            if is_nested:
+                noise_streams = segment_noise.unbind()
+                chunk_noise = comfy.nested_tensor.NestedTensor((
+                    noise_streams[0][:, :, v_start:v_end].clone(),
+                    noise_streams[1][..., a_start:a_end].clone(),
+                ))
+                del noise_streams
             else:
-                chunk_latent_samples = chunk_v
-
-            chunk_nv = gn_video[:, :, v_start:v_end, :, :].clone()
-            if is_nested and gn_audio is not None and a_end > a_start:
-                chunk_na = gn_audio[:, :, :, a_start:a_end].clone()
-                chunk_noise = comfy.nested_tensor.NestedTensor((chunk_nv, chunk_na))
-            else:
-                chunk_noise = chunk_nv
-
-            chunk_mask = None
-            if noise_mask is not None:
-                if hasattr(noise_mask, "is_nested") and noise_mask.is_nested:
-                    nm_streams = list(noise_mask.unbind())
-                    chunk_mv = nm_streams[0][:, :, v_start:v_end, :, :].clone()
-                    chunk_ma = nm_streams[1][:, :, :, a_start:a_end].clone() if len(nm_streams) > 1 else None
-                    chunk_mask = comfy.nested_tensor.NestedTensor((chunk_mv, chunk_ma)) if chunk_ma is not None else chunk_mv
-                elif noise_mask.ndim >= 5:
-                    chunk_mask = noise_mask[:, :, v_start:v_end, :, :].clone()
-                elif noise_mask.ndim == 4:
-                    chunk_mask = noise_mask[:, v_start:v_end, :, :].clone()
+                chunk_noise = segment_noise[:, :, v_start:v_end].clone()
+            del segment_noise
+            chunk_guider = segment_guider(guider, bounds, True)
 
             chunk_x0_output = {}
-            chunk_callback = None
-            try:
-                if hasattr(guider, "model_patcher") and guider.model_patcher is not None:
-                    chunk_callback = latent_preview.prepare_callback(
-                        guider.model_patcher, sigmas.shape[-1] - 1, chunk_x0_output
-                    )
-            except Exception:
-                chunk_callback = None
-
-            chunk_out = guider.sample(
+            chunk_callback = latent_preview.prepare_callback(
+                chunk_guider.model_patcher, sigmas.shape[-1] - 1, chunk_x0_output
+            )
+            chunk_out = chunk_guider.sample(
                 chunk_noise,
                 chunk_latent_samples,
                 sampler,
@@ -477,7 +303,6 @@ class PJ_SegmentSampler:
             )
             chunk_out_cpu = chunk_out.to("cpu")
             sampled_chunks.append(chunk_out_cpu)
-            _SECOND_PASS_CACHE[cache_key] = chunk_out_cpu
 
             if "x0" in chunk_x0_output:
                 has_any_x0 = True
@@ -487,11 +312,13 @@ class PJ_SegmentSampler:
                     x0_c = comfy.nested_tensor.NestedTensor(
                         comfy.utils.unpack_latents(x0_c, latent_shapes)
                     )
-                x0_chunks.append(x0_c.to("cpu"))
+                x0_chunks.append(chunk_guider.model_patcher.model.process_latent_out(x0_c.cpu()))
+                del x0_c
             else:
                 x0_chunks.append(None)
+            self._cache.save(idx, cache_signature, chunk_out_cpu, x0_chunks[-1])
 
-            del chunk_v, chunk_latent_samples
+            del chunk_v, chunk_latent_samples, chunk_out, chunk_x0_output, chunk_guider
             if "chunk_a" in locals() and chunk_a is not None:
                 del chunk_a
             if "chunk_noise" in locals() and chunk_noise is not None:
@@ -500,11 +327,9 @@ class PJ_SegmentSampler:
             print(f"[PJ二采分段采样器] <<< 第 {idx + 1}/{n_chunks} 段精修完成，已存入缓存。")
 
         # Blending
-        print(f"\n[PJ二采分段采样器] 正在执行视频重叠区无缝融合 (融合算法: {blend_mode}) ...")
+        print(f"\n[PJ二采分段采样器] 正在执行视频重叠区融合 (融合算法: {blend_mode}) ...")
         video_intervals = [(c[0], c[1]) for c in chunks]
         audio_intervals = [(c[2], c[3]) for c in chunks]
-
-        target_ov_latents = max(1, int(round(overlap_seconds * (fps / 3.4)))) if overlap_seconds > 0 else None
 
         chunk_videos = []
         chunk_audios = []
@@ -517,17 +342,16 @@ class PJ_SegmentSampler:
             else:
                 chunk_videos.append(c)
 
-        blended_video = self._blend_sequence(
-            chunk_videos, video_intervals, total_v, norm_blend, target_ov_latents
+        blended_video = blend_sequence(
+            chunk_videos, video_intervals, full_video, norm_blend
         )
 
         if keep_original_audio and orig_audio_for_bypass is not None:
-            print("[PJ二采分段采样器] 音频策略: 100% 保留一采原版连续完整音频 (零接缝、零相位抵消、零音质损耗)！")
+            print("[PJ二采分段采样器] 输出保留输入音频潜空间")
             blended_audio = orig_audio_for_bypass
         elif chunk_audios and total_a > 0:
-            target_ov_audio = max(1, int(round(overlap_seconds * 40.0))) if overlap_seconds > 0 else None
-            blended_audio = self._blend_sequence(
-                chunk_audios, audio_intervals, total_a, norm_blend, target_ov_audio, is_audio=True
+            blended_audio = blend_sequence(
+                chunk_audios, audio_intervals, full_audio, norm_blend, is_audio=True
             )
         else:
             blended_audio = None
@@ -541,108 +365,39 @@ class PJ_SegmentSampler:
         result_denoised = None
         if has_any_x0:
             valid_x0_videos = []
+            valid_x0_audios = []
             for i, x0_c in enumerate(x0_chunks):
                 if x0_c is not None:
                     if hasattr(x0_c, "is_nested") and x0_c.is_nested:
-                        valid_x0_videos.append(list(x0_c.unbind())[0])
+                        x0_streams = list(x0_c.unbind())
+                        valid_x0_videos.append(x0_streams[0])
+                        valid_x0_audios.append(x0_streams[1])
                     else:
                         valid_x0_videos.append(x0_c)
                 else:
                     valid_x0_videos.append(chunk_videos[i])
-            blended_x0_video = self._blend_sequence(
-                valid_x0_videos, video_intervals, total_v, norm_blend, target_ov_latents
+                    if chunk_audios:
+                        valid_x0_audios.append(chunk_audios[i])
+            blended_x0_video = blend_sequence(
+                valid_x0_videos, video_intervals, full_video, norm_blend
             )
             if blended_audio is not None:
-                result_denoised = comfy.nested_tensor.NestedTensor((blended_x0_video, blended_audio))
+                denoised_audio = blended_audio if keep_original_audio else blend_sequence(
+                    valid_x0_audios, audio_intervals, full_audio, norm_blend, is_audio=True
+                )
+                result_denoised = comfy.nested_tensor.NestedTensor((blended_x0_video, denoised_audio))
             else:
                 result_denoised = blended_x0_video
 
-        # Auto Unload Model
         if unload_model_after_sampling:
-            print("[PJ二采分段采样器] 采样完成：正在将主模型卸载到 CPU，彻底释放显存给后续 VAE 解码...")
-            try:
-                if hasattr(guider, "model_patcher"):
-                    guider.model_patcher.detach(unpatch_all=False)
-                comfy.model_management.unload_all_models()
-                comfy.model_management.soft_empty_cache(True)
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                print("[PJ二采分段采样器] ✅ 主模型已成功卸载，GPU 显存已完全释放！后续 VAE 解码将拥有充足纯净显存！")
-            except Exception as e:
-                print(f"[PJ二采分段采样器] 卸载模型提示: {e}")
+            comfy.model_management.unload_all_models()
+            comfy.model_management.soft_empty_cache()
+            print("[PJ分段采样] 已请求卸载模型；解码峰值仍取决于分辨率及 VAE 配置")
 
         print("[PJ二采分段采样器] 全部多段二采精修完成！准备输出结果。\n" + "=" * 65)
 
-        out_denoised = {"samples": result_denoised} if result_denoised is not None else {"samples": result_samples}
-        return ({"samples": result_samples}, out_denoised)
-
-    def _blend_sequence(self, chunks, intervals, total_len, blend_mode, target_ov_latents=None, is_audio=False):
-        n = len(chunks)
-        if n == 1:
-            return chunks[0]
-
-        device = torch.device("cpu")
-        sample_chunk = chunks[0]
-        dtype = sample_chunk.dtype
-
-        if is_audio:
-            accum = torch.zeros(
-                (sample_chunk.shape[0], sample_chunk.shape[1], sample_chunk.shape[2], total_len),
-                device=device,
-                dtype=dtype,
-            )
-            weight = torch.zeros((1, 1, 1, total_len), device=device, dtype=dtype)
-        else:
-            accum = torch.zeros(
-                (sample_chunk.shape[0], sample_chunk.shape[1], total_len, sample_chunk.shape[3], sample_chunk.shape[4]),
-                device=device,
-                dtype=dtype,
-            )
-            weight = torch.zeros((1, 1, total_len, 1, 1), device=device, dtype=dtype)
-
-        for i, (chunk, (start, end)) in enumerate(zip(chunks, intervals)):
-            length = end - start
-            if is_audio:
-                w = torch.ones((1, 1, 1, length), device=device, dtype=dtype)
-            else:
-                w = torch.ones((1, 1, length, 1, 1), device=device, dtype=dtype)
-
-            if i > 0 and blend_mode != "hard_cut":
-                prev_start, prev_end = intervals[i - 1]
-                ov = prev_end - start
-                if ov > 0:
-                    fade_len = min(ov, target_ov_latents) if target_ov_latents else ov
-                    t = torch.linspace(0.0, 1.0, fade_len, device=device, dtype=dtype)
-                    fade = 0.5 * (1.0 - torch.cos(math.pi * t)) if blend_mode == "cosine" else t
-                    if is_audio:
-                        w[:, :, :, :fade_len] = fade.view(1, 1, 1, -1)
-                    else:
-                        w[:, :, :fade_len, :, :] = fade.view(1, 1, -1, 1, 1)
-
-            if i < n - 1 and blend_mode != "hard_cut":
-                next_start, next_end = intervals[i + 1]
-                ov = end - next_start
-                if ov > 0:
-                    fade_len = min(ov, target_ov_latents) if target_ov_latents else ov
-                    t = torch.linspace(1.0, 0.0, fade_len, device=device, dtype=dtype)
-                    fade = 0.5 * (1.0 - torch.cos(math.pi * t)) if blend_mode == "cosine" else t
-                    if is_audio:
-                        w[:, :, :, -fade_len:] = fade.view(1, 1, 1, -1)
-                    else:
-                        w[:, :, -fade_len:, :, :] = fade.view(1, 1, -1, 1, 1)
-
-            if is_audio:
-                accum[:, :, :, start:end] += chunk * w
-                weight[:, :, :, start:end] += w
-            else:
-                accum[:, :, start:end, :, :] += chunk * w
-                weight[:, :, start:end, :, :] += w
-
-        weight = torch.clamp(weight, min=1e-6)
-        blended = accum / weight
-        return blended
+        out_denoised = dict(latent_image, samples=result_denoised if result_denoised is not None else result_samples)
+        return (dict(latent_image, samples=result_samples), out_denoised)
 
 
-# Alias class name
 PJSegmentSampler = PJ_SegmentSampler
