@@ -6,7 +6,8 @@ import comfy.nested_tensor
 import latent_preview
 
 from .segment_boundaries import constrain_boundaries, restore_preserved
-from .segment_timing import plan_segments, resolve_plan, segment_seconds
+from .segment_timing import plan_segments, plan_relay_segments, resolve_plan, segment_seconds
+from .segment_relay import sample_relay
 from .segment_sampling import (SegmentCache, sampling_signature, fingerprint, generate_noise,
                                slice_mask, segment_guider, blend_sequence)
 
@@ -29,7 +30,7 @@ class PJ_FirstPass_SegmentSampler:
                 "guider": ("GUIDER", {"tooltip": "引导器 (连接 BasicGuider，内含模型与提示词/参考条件)"}),
                 "sampler": ("SAMPLER", {"tooltip": "采样算法 (推荐 er_sde 或 euler)"}),
                 "sigmas": ("SIGMAS", {"tooltip": "调度器步长 (通常为一采全降噪，如 6 步)"}),
-                "latent_image": ("LATENT", {"tooltip": "一采空潜空间 (来自 EmptyMiniMaxH3LatentAV)"}),
+                "latent_image": ("LATENT", {"tooltip": "目标潜空间，可接H3空音视频潜空间或PJ编辑区域准备的输出"}),
             },
             "optional": {
                 "segment_plan": (
@@ -141,6 +142,15 @@ class PJ_FirstPass_SegmentSampler:
                     "label_on": "开启(实验)", "label_off": "关闭(独立采样)",
                     "tooltip": "首次生成固定前段重叠内容；局部重做保护有效缓存中的前后边界。开启后不再混合两份重叠内容。切换后重建缓存；真实接缝画质需验证。",
                 }),
+                "generation_mode": (["分段编辑", "整段采样", "22帧接力"], {
+                    "default": "分段编辑",
+                    "tooltip": "接力按规划器目标段长生成，固定22帧重叠；不使用普通切点和重叠设置。未连接规划器时整段采样。",
+                }),
+                "relay_action": (["全部生成", "从指定段重做"], {"default": "全部生成"}),
+                "relay_start_segment": ("INT", {
+                    "default": 1, "min": 1, "max": 100000, "step": 1,
+                    "tooltip": "重做该段及之后所有段；前段缓存失效或缺失时从更早处开始。修改对应种子偏移可得到不同结果。",
+                }),
             },
         }
 
@@ -180,8 +190,14 @@ class PJ_FirstPass_SegmentSampler:
         unload_model_after_sampling=False,
         fps=24.0,
         boundary_constraints=False,
+        generation_mode="分段编辑",
+        relay_action="全部生成",
+        relay_start_segment=1,
         **kwargs,
     ):
+
+        if generation_mode == "整段采样" or segment_plan is None:
+            run_mode = "整段全量采样(一采不分段)"
 
         if isinstance(run_mode, bool) or str(run_mode).lower() in ("true", "false"):
             run_mode = "智能缓存(仅重跑未锁定分段)"
@@ -201,10 +217,27 @@ class PJ_FirstPass_SegmentSampler:
         total_v = full_video.shape[2]
         total_a = full_audio.shape[-1] if full_audio is not None else 0
 
+        if generation_mode == "22帧接力" and segment_plan is not None:
+            if (not is_nested or len(streams) != 2 or full_video.ndim != 5 or full_video.shape[1] != 24
+                    or total_v < 2 or total_v % 5 != 2 or full_audio.ndim != 4 or full_audio.shape[1:3] != (32, 2)):
+                raise ValueError("22帧接力需要H3原生音视频潜空间，视频长度为5n+2潜步")
+            chunks = plan_relay_segments(total_v, total_a, segment_plan.get("chunk_seconds", chunk_seconds))
+            seed = getattr(noise, "seed", base_seed)
+            if not isinstance(seed, int):
+                seed = base_seed
+            offsets = [int(kwargs.get(f"seg{i}_seed_offset", i - 1)) for i in range(1, 21)]
+            start_segment = max(1, int(relay_start_segment)) if relay_action == "从指定段重做" else 1
+            result = sample_relay(noise, guider, sampler, sigmas, latent_image, chunks, self._cache,
+                                  seed, offsets, start_segment, sync_ref_video)
+            if unload_model_after_sampling:
+                comfy.model_management.unload_all_models()
+                comfy.model_management.soft_empty_cache()
+            return result
+
         chunks, fps = resolve_plan(
             latent, segment_plan, split_mode, chunk_seconds, overlap_seconds,
             num_segments, custom_cuts, fps, align_51_frames,
-            full_length=segment_plan is None or "不分段" in str(run_mode) or "全量采样" in str(run_mode),
+            full_length=segment_plan is None or generation_mode == "整段采样" or "不分段" in str(run_mode) or "全量采样" in str(run_mode),
         )
         n_chunks = len(chunks)
         constrain = boundary_constraints and n_chunks > 1

@@ -14,7 +14,7 @@ import torch
 
 import folder_paths
 
-from .segment_timing import FPS, frames_for_tokens, tokens_for_frames, plan_segments, segment_seconds
+from .segment_timing import FPS, frames_for_tokens, tokens_for_frames, plan_segments, plan_relay_segments, segment_seconds
 
 try:
     import soundfile as sf
@@ -255,6 +255,7 @@ class PJ_SegmentPlanner:
                                num_segments, custom_cuts, fps, align_51_frames)
 
         n_chunks = len(chunks)
+        relay_n_chunks = len(plan_relay_segments(total_v, total_a, chunk_seconds))
 
         # 3. 组织人类可读的明细文本与结构化分段信息
         chunks_sec_info = []
@@ -312,6 +313,7 @@ class PJ_SegmentPlanner:
             "chunks": chunks,
             "chunks_sec_info": chunks_sec_info,
             "n_chunks": n_chunks,
+            "relay_n_chunks": relay_n_chunks,
             "effective_seconds": round(effective_seconds, 2),
             "total_frames": total_frames,
             "total_v": total_v,
@@ -338,6 +340,7 @@ class PJ_SegmentPlanner:
                 "total_frames": total_frames,
                 "effective_seconds": round(effective_seconds, 2),
                 "n_chunks": n_chunks,
+                "relay_n_chunks": relay_n_chunks,
                 "chunks": chunks_sec_info,
                 "summary": summary_text,
                 "mode_desc": mode_desc,

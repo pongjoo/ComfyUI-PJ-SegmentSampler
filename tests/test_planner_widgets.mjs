@@ -244,3 +244,71 @@ test('both selectors follow upstream planner counts through reroutes', () => {
         }
     } finally {delete uiContext.app.graph;}
 });
+
+
+function relayWidgets(node, generation = '22帧接力') {
+    for (const [name, value] of Object.entries({generation_mode: generation,
+            relay_action: '全部生成', relay_start_segment: 1}))
+        node.widgets.push({name, value, type: 'number', options: {}});
+    return node;
+}
+
+test('relay exposes generation and restart controls without locks or blending', () => {
+    const node = relayWidgets(sampler('智能缓存(仅重跑未锁定分段)', true));
+    node.properties.pj_advanced_open = true;
+    refresh(node, true);
+    for (const name of ['generation_mode', 'relay_action', 'seg1_seed_offset'])
+        assert.equal(visible(node, name), true);
+    for (const name of ['run_mode', 'relay_start_segment', 'seg1_lock', 'seg8_lock', 'blend_mode', 'boundary_constraints'])
+        assert.equal(visible(node, name), false, name);
+    widget(node, 'relay_action').value = '从指定段重做';
+    refresh(node, true);
+    assert.equal(visible(node, 'relay_start_segment'), true);
+    node.inputs[0].link = null;
+    refresh(node, true);
+    for (const name of ['generation_mode', 'relay_action', 'relay_start_segment', 'run_mode'])
+        assert.equal(visible(node, name), false);
+    node.inputs[0].link = 1;
+    widget(node, 'generation_mode').value = '分段编辑';
+    refresh(node, true);
+    assert.equal(visible(node, 'run_mode'), true);
+    assert.equal(visible(node, 'seg8_lock'), true);
+    assert.equal(widget(node, 'seg8_lock').value, true);
+});
+
+test('legacy full-length selection migrates and can switch to relay or editing', () => {
+    const node = relayWidgets(sampler('整段全量采样(一采不分段)', true), '分段编辑');
+    refresh(node, true);
+    assert.equal(widget(node, 'generation_mode').value, '整段采样');
+    assert.equal(visible(node, 'run_mode'), false);
+    uiContext.node = node;
+    vm.runInContext('attachSamplerHandlers(node, true)', uiContext);
+    for (const value of ['22帧接力', '分段编辑']) {
+        const generation = widget(node, 'generation_mode');
+        generation.value = value;
+        generation.callback();
+        assert.equal(generation.value, value);
+        assert.equal(visible(node, 'run_mode'), value === '分段编辑');
+    }
+});
+
+test('relay count uses relay preview, not normal planning count', () => {
+    const planner = {type: 'PJ_SegmentPlanner', properties: {pj_preview_cache: {n_chunks: 4, relay_n_chunks: 3, total_frames: 362}},
+        widgets: [{name: 'chunk_seconds', value: 6}]};
+    uiContext.app.graph = {links: {1: {origin_id: 10}}, getNodeById() {return planner;}};
+    try {
+        const node = relayWidgets(sampler('智能缓存(仅重跑未锁定分段)', true));
+        refresh(node, true);
+        assert.equal(widget(node, 'relay_start_segment').options.max, 3);
+        delete planner.properties.pj_preview_cache.relay_n_chunks;
+        refresh(node, true);
+        assert.equal(widget(node, 'relay_start_segment').options.max, 3);
+        planner.properties.pj_preview_cache = {n_chunks: 7, relay_n_chunks: 6, total_frames: 719};
+        refresh(node, true);
+        assert.equal(widget(node, 'relay_start_segment').options.max, 6);
+        widget(node, 'relay_start_segment').value = 9;
+        refresh(node, true);
+        assert.equal(widget(node, 'relay_start_segment').value, 9);
+        assert.equal(widget(node, 'relay_start_segment').options.max, 9);
+    } finally {delete uiContext.app.graph;}
+});

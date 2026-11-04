@@ -23,7 +23,7 @@ package = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = package
 spec.loader.exec_module(package)
 from pj_segments_test.segment_boundaries import constrain_boundaries
-from pj_segments_test.segment_timing import frames_for_tokens, tokens_for_frames, plan_segments
+from pj_segments_test.segment_timing import frames_for_tokens, tokens_for_frames, plan_segments, plan_relay_segments
 from pj_segments_test.segment_sampling import blend_sequence, segment_guider, generate_noise, slice_mask, fingerprint
 from pj_segments_test.pj_h3_edit_prepare import PJ_H3EditPrepare
 from pj_segments_test.pj_segment_planner import PJ_SegmentPlanner
@@ -31,8 +31,8 @@ from pj_segments_test.pj_first_pass_sampler import PJ_FirstPass_SegmentSampler
 from pj_segments_test.pj_segment_sampler import PJ_SegmentSampler
 
 
-def callback(_model, _steps, output):
-    return lambda step, x0, x, total: output.update(x0=x0)
+def callback(_model, _steps, output=None):
+    return lambda step, x0, x, total: output.update(x0=x0) if output is not None else None
 
 
 class RecordingGuider(comfy.samplers.CFGGuider):
@@ -120,6 +120,139 @@ class SegmentTests(unittest.TestCase):
         args.update(kwargs)
         with contextlib.redirect_stdout(io.StringIO()):
             return node.execute(**args)
+
+    def test_relay_windows_keep_22_frames_and_exact_full_timeline(self):
+        for total_v in (2, 7, 12, 107, 212, 507):
+            total_a = round(frames_for_tokens(total_v) * 40 / 24)
+            for seconds in (0.5, 2, 6, 8, 15):
+                chunks = plan_relay_segments(total_v, total_a, seconds)
+                self.assertEqual(chunks[0][0], 0)
+                self.assertEqual(chunks[-1][1], total_v)
+                self.assertEqual(chunks[-1][3], total_a)
+                for before, after in zip(chunks, chunks[1:]):
+                    self.assertEqual(before[1] - after[0], 7)
+                    self.assertEqual(frames_for_tokens(before[1]) - frames_for_tokens(after[0]), 22)
+                    self.assertIn(before[3] - after[2], (36, 37))
+                self.assertTrue(all(start % 5 == 0 and (end - start) % 5 == 2
+                                    for start, end, _, _ in chunks))
+        self.assertEqual(plan_relay_segments(107, 603, 8), [(0, 57, 0, 320), (50, 107, 283, 603)])
+
+    def test_relay_uses_window_noise_and_deduplicates_av(self):
+        node = self.node(PJ_FirstPass_SegmentSampler)
+        with patch("pj_segments_test.segment_relay.generate_noise", wraps=generate_noise) as noise_calls:
+            output, first = self.run_node(node, generation_mode="22帧接力")
+        chunks = plan_relay_segments(107, 603, 6)
+        self.assertEqual(len(self.guider.calls), 3)
+        self.assertEqual([c.args[1]["samples"].unbind()[0].shape[2] for c in noise_calls.call_args_list], [42, 42, 37])
+        for i, ((noise, samples, _, options), bounds) in enumerate(zip(self.guider.calls, chunks)):
+            streams = samples.unbind()
+            expected = self._relay_expected_chunk(node, i)
+            if i:
+                prev = self._relay_expected_chunk(node, i - 1).unbind()
+                self.assertTrue(torch.equal(streams[0][:, :, :7], prev[0][:, :, -7:]))
+                overlap_a = chunks[i - 1][3] - bounds[2]
+                self.assertTrue(torch.equal(streams[1][..., :overlap_a], prev[1][..., -overlap_a:]))
+                self.assertTrue(torch.all(options["denoise_mask"].unbind()[0][:, :, :7] == 0))
+            for j, axis in enumerate((2, 3)):
+                start = 0 if i == 0 else chunks[i - 1][j * 2 + 1]
+                end = bounds[j * 2 + 1]
+                actual = output["samples"].unbind()[j].narrow(axis, start, end - start)
+                self.assertTrue(torch.equal(actual, expected.unbind()[j].narrow(axis, start - bounds[j * 2], end - start)))
+        self.assertEqual(output["samples"].unbind()[0].shape[2], 107)
+        self.assertEqual(output["samples"].unbind()[1].shape[-1], 603)
+        self.assertEqual(first["samples"].unbind()[0].shape[2], 42)
+
+    def _relay_expected_chunk(self, node, index):
+        return node._cache.load(index, node._cache.entries[index])[0]
+
+    def test_relay_long_target_keeps_full_length_and_sample_precision(self):
+        self.latent = {"samples": NestedTensor((torch.zeros(1, 24, 212, 2, 2, dtype=torch.bfloat16),
+                                               torch.zeros(1, 32, 2, 1198, dtype=torch.bfloat16)))}
+        native_sample = self.guider.sample
+        def float_sample(*args, **kwargs):
+            return native_sample(*args, **kwargs).to(dtype=torch.float32)
+        with patch.object(self.guider, "sample", side_effect=float_sample):
+            result = self.run_node(self.node(PJ_FirstPass_SegmentSampler), generation_mode="22帧接力")[0]["samples"]
+        self.assertEqual(len(self.guider.calls), 6)
+        for actual, source in zip(result.unbind(), self.latent["samples"].unbind()):
+            self.assertEqual(actual.shape, source.shape)
+            self.assertEqual(actual.dtype, torch.float32)
+            self.assertTrue(torch.isfinite(actual).all())
+        self.assertTrue(all(call[0].unbind()[0].shape[2] <= 42 for call in self.guider.calls))
+
+    def test_relay_rejects_non_h3_layout_before_sampling(self):
+        self.latent = {"samples": torch.zeros(1, 4, 107, 2, 2)}
+        with self.assertRaisesRegex(ValueError, "H3原生音视频潜空间"):
+            self.run_node(self.node(PJ_FirstPass_SegmentSampler), generation_mode="22帧接力")
+        self.assertEqual(len(self.guider.calls), 0)
+
+    def test_relay_redo_invalidates_suffix_and_ignores_locks(self):
+        node = self.node(PJ_FirstPass_SegmentSampler)
+        before = self.run_node(node, generation_mode="22帧接力")[0]["samples"]
+        self.guider.calls.clear()
+        after = self.run_node(node, generation_mode="22帧接力", relay_action="从指定段重做",
+                              relay_start_segment=2, seg2_seed_offset=999,
+                              **{f"seg{i}_lock": True for i in range(1, 21)})[0]["samples"]
+        self.assertEqual(len(self.guider.calls), 2)
+        self.assertTrue(torch.equal(before.unbind()[0][:, :, :42], after.unbind()[0][:, :, :42]))
+        self.assertFalse(torch.equal(before.unbind()[0][:, :, 42:77], after.unbind()[0][:, :, 42:77]))
+        self.assertTrue(torch.equal(self.guider.calls[1][1].unbind()[0][:, :, :7],
+                                    self._relay_expected_chunk(node, 1).unbind()[0][:, :, -7:]))
+        self.guider.calls.clear()
+        repeated = self.run_node(node, generation_mode="22帧接力", relay_action="从指定段重做",
+                                 relay_start_segment=4, seg2_seed_offset=999)[0]["samples"]
+        self.assertEqual(len(self.guider.calls), 0)
+        self.assertTrue(torch.equal(after.unbind()[0], repeated.unbind()[0]))
+
+    def test_relay_changed_seed_missing_cache_and_interruption_rebuild_dependents(self):
+        node = self.node(PJ_FirstPass_SegmentSampler)
+        self.run_node(node, generation_mode="22帧接力")
+        self.guider.calls.clear()
+        self.run_node(node, generation_mode="22帧接力", relay_action="从指定段重做",
+                      relay_start_segment=3, seg2_seed_offset=777)
+        self.assertEqual(len(self.guider.calls), 2)
+        with patch.object(self.guider, "sample", side_effect=RuntimeError("cancelled")):
+            with self.assertRaisesRegex(RuntimeError, "cancelled"):
+                self.run_node(node, generation_mode="22帧接力", relay_action="从指定段重做", relay_start_segment=2)
+        self.assertEqual(list(node._cache.entries), [0])
+        self.guider.calls.clear()
+        self.run_node(node, generation_mode="22帧接力", relay_action="从指定段重做", relay_start_segment=3)
+        self.assertEqual(len(self.guider.calls), 2)
+        (Path(node._cache.directory.name) / "0.pt").unlink()
+        self.guider.calls.clear()
+        self.run_node(node, generation_mode="22帧接力", relay_action="从指定段重做", relay_start_segment=3)
+        self.assertEqual(len(self.guider.calls), 3)
+
+    def test_relay_native_mask_keeps_source_outside_edit_region(self):
+        self.guider = NativeMaskGuider()
+        self.sampler = comfy.samplers.ksampler("er_sde")
+        _, audio = self.latent["samples"].unbind()
+        video = torch.full((1, 24, 107, 4, 4), 0.25)
+        self.latent["samples"] = NestedTensor((video, audio))
+        mask = torch.ones_like(video)
+        mask[..., :2] = 0
+        self.latent["noise_mask"] = NestedTensor((mask, torch.ones_like(audio)))
+        node = self.node(PJ_FirstPass_SegmentSampler)
+        out = self.run_node(node, generation_mode="22帧接力", sigmas=torch.tensor([1., 0.5, 0.]))[0]["samples"]
+        self.assertTrue(torch.equal(out.unbind()[0][..., 0], video[..., 0]))
+        self.assertFalse(torch.equal(out.unbind()[0][..., 2:], video[..., 2:]))
+        for i in (1, 2):
+            self.assertTrue(torch.all(self.guider.calls[i][1].unbind()[0][..., 0] == 0.25))
+
+    def test_relay_switching_modes_and_unconnected_planner(self):
+        node = self.node(PJ_FirstPass_SegmentSampler)
+        self.run_node(node, generation_mode="22帧接力")
+        self.guider.calls.clear()
+        self.run_node(node, generation_mode="分段编辑", **{f"seg{i}_lock": True for i in range(1, 21)})
+        self.assertEqual(len(self.guider.calls), 4)
+        self.guider.calls.clear()
+        self.run_node(node, generation_mode="22帧接力", relay_action="从指定段重做", relay_start_segment=3)
+        self.assertEqual(len(self.guider.calls), 3)
+        for mode in ("22帧接力", "整段采样"):
+            self.guider.calls.clear()
+            self.run_node(node, generation_mode=mode, segment_plan=None, run_mode="仅重抽第2段")
+            self.assertEqual(len(self.guider.calls), 1)
+            self.assertEqual(self.guider.calls[0][1].unbind()[0].shape[2], 107)
 
     def test_frame_contract_and_all_planning_modes(self):
         for frames, vt, at in ((124, 37, 207), (141, 42, 235), (362, 107, 603)):

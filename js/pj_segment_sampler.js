@@ -20,6 +20,9 @@ const WIDGET_LABELS = {
     "sync_ref_video": "按分段裁剪参考条件",
     "boundary_constraints": "接缝约束(实验)",
     "base_seed": "基础随机种子",
+    "generation_mode": "生成方式",
+    "relay_action": "本次处理",
+    "relay_start_segment": "从第几段重做",
 
     // 运行重抽与缓存锁
     "run_mode": "本次处理范围",
@@ -237,6 +240,15 @@ function resolveTargetSegmentCount(node) {
     // 1. 优先实时读取上游 PJ_SegmentPlanner 最新控件值
     const originNode = getUpstreamPlannerNode(node);
     if (originNode) {
+        if (node.widgets?.find(w => w.name === "generation_mode")?.value === "22帧接力") {
+            const preview = originNode.properties?.pj_preview_cache;
+            if (preview?.relay_n_chunks) return preview.relay_n_chunks;
+            const frames = preview?.total_frames || 362;
+            const total = Math.max(2, Math.ceil((frames - 5) / 17) * 5 + 2);
+            const seconds = Number(originNode.widgets?.find(w => w.name === "chunk_seconds")?.value ?? 6);
+            const window = Math.max(2, Math.floor((seconds * 24 - 5) / 17 + 0.5)) * 5 + 2;
+            return 1 + Math.max(0, Math.ceil((total - window) / (window - 7)));
+        }
         // 次级缓存读取：上游规划器已执行或有预览缓存时直接获取
         if (originNode.pj_cached_n_chunks) {
             return Math.min(20, Math.max(1, originNode.pj_cached_n_chunks));
@@ -274,6 +286,11 @@ function syncSamplerSegmentCount(node, isFirstPass) {
 
     // 仅保留当前规划的段号及工作流中已选的合法段号。
     const runModeWidget = node.widgets?.find(w => w.name === "run_mode");
+    const generation = isFirstPass && node.widgets?.find(w => w.name === "generation_mode");
+    if (generation) {
+        if (!["分段编辑", "整段采样", "22帧接力"].includes(generation.value)) generation.value = "分段编辑";
+        if (generation.value === "分段编辑" && String(runModeWidget?.value).includes("不分段")) generation.value = "整段采样";
+    }
     if (runModeWidget) {
         const prefix = isFirstPass ? "仅重抽第" : "仅精修第";
         const defectAction = isFirstPass ? "按缺陷秒数重抽 (下方输入秒数)" : "按缺陷秒数精修 (下方输入秒数)";
@@ -281,9 +298,9 @@ function syncSamplerSegmentCount(node, isFirstPass) {
 
         const newOptions = [
             "智能缓存(仅重跑未锁定分段)",
-            ...(isFirstPass ? ["整段全量采样(一采不分段)"] : []),
+            ...(isFirstPass && !generation ? ["整段全量采样(一采不分段)"] : []),
             allAction,
-            ...Array.from({ length: maxSeg }, (_, i) => `${prefix}${i + 1}段`),
+            ...Array.from({ length: Math.min(20, maxSeg) }, (_, i) => `${prefix}${i + 1}段`),
             defectAction,
             "自定义指定分段(下方输入)"
         ];
@@ -306,13 +323,25 @@ function syncSamplerSegmentCount(node, isFirstPass) {
 
     // 2. 控制 1~20 控件的动态显隐
     const runMode = String(runModeWidget?.value || "");
-    const full = !planned || (isFirstPass && runMode.includes("不分段"));
-    toggleWidget(node, runModeWidget, planned);
+    const relay = planned && generation?.value === "22帧接力";
+    const full = !planned || generation?.value === "整段采样" || (isFirstPass && !generation && runMode.includes("不分段"));
+    toggleWidget(node, generation, planned);
+    toggleWidget(node, runModeWidget, planned && !relay && !full);
+    const relayAction = node.widgets.find(w => w.name === "relay_action");
+    const relayStart = node.widgets.find(w => w.name === "relay_start_segment");
+    if (relayAction && !["全部生成", "从指定段重做"].includes(relayAction.value)) relayAction.value = "全部生成";
+    if (relayStart) {
+        if (!Number.isInteger(relayStart.value) || relayStart.value < 1) relayStart.value = 1;
+        relayStart.options = relayStart.options || {};
+        relayStart.options.max = Math.max(maxSeg, relayStart.value);
+    }
+    toggleWidget(node, relayAction, relay);
+    toggleWidget(node, relayStart, relay && relayAction?.value === "从指定段重做");
     const customRerun = node.widgets?.find(w => w.name === "custom_rerun_segments");
     const targetTime = node.widgets?.find(w => w.name === "target_time_second");
 
-    toggleWidget(node, customRerun, planned && runMode.includes("自定义"));
-    toggleWidget(node, targetTime, planned && runMode.includes("缺陷秒数"));
+    toggleWidget(node, customRerun, planned && !relay && !full && runMode.includes("自定义"));
+    toggleWidget(node, targetTime, planned && !relay && !full && runMode.includes("缺陷秒数"));
 
     // 锁定仅影响智能缓存；种子偏移放入高级设置。
     for (let i = 1; i <= 20; i++) {
@@ -322,7 +351,7 @@ function syncSamplerSegmentCount(node, isFirstPass) {
         const inRange = full ? false : (i <= maxSeg || lockW?.value === true || (isFirstPass && offsetW?.value !== i - 1));
 
         // 预览外已有的设置也需要可见，避免载入工作流后无法修改。
-        toggleWidget(node, lockW, inRange && runMode.includes("智能缓存"));
+        toggleWidget(node, lockW, inRange && !relay && runMode.includes("智能缓存"));
 
         // 一采独立种子偏移：在当前分段数内展示
         if (isFirstPass) {
@@ -331,10 +360,10 @@ function syncSamplerSegmentCount(node, isFirstPass) {
     }
 
     const boundary = isFirstPass && !!node.widgets.find(w => w.name === "boundary_constraints")?.value;
-    toggleWidget(node, node.widgets.find(w => w.name === "boundary_constraints"), isFirstPass && !full);
+    toggleWidget(node, node.widgets.find(w => w.name === "boundary_constraints"), isFirstPass && !full && !relay);
     for (const name of ["sync_ref_video", "blend_mode", "unload_model_after_sampling"]) {
         toggleWidget(node, node.widgets.find(w => w.name === name),
-            !!node.properties?.pj_advanced_open && (name !== "blend_mode" || (!full && !boundary)));
+            !!node.properties?.pj_advanced_open && (name !== "blend_mode" || (!full && !boundary && !relay)));
     }
     updateSamplerControls(node, isFirstPass);
     autoResizeNode(node);
@@ -404,7 +433,7 @@ function attachSamplerHandlers(node, isFirstPass) {
         if (!node.title || node.title.startsWith("PJ_Segment") || node.title.startsWith("PJSegment")) node.title = "PJ二采分段精修采样器 (分段精修/局部重做)";
     }
 
-    const watchNames = ["run_mode", "target_time_second", "custom_rerun_segments", "sync_ref_video", "boundary_constraints", "blend_mode", "unload_model_after_sampling"];
+    const watchNames = ["generation_mode", "relay_action", "relay_start_segment", "run_mode", "target_time_second", "custom_rerun_segments", "sync_ref_video", "boundary_constraints", "blend_mode", "unload_model_after_sampling"];
     for (const name of watchNames) {
         const w = node.widgets.find(widget => widget.name === name);
         if (w && !w._pj_attached) {
@@ -412,6 +441,10 @@ function attachSamplerHandlers(node, isFirstPass) {
             const orig = w.callback;
             w.callback = function () {
                 const res = orig?.apply(this, arguments);
+                if (this.name === "generation_mode" && this.value !== "整段采样") {
+                    const mode = node.widgets.find(widget => widget.name === "run_mode");
+                    if (mode && String(mode.value).includes("不分段")) mode.value = "全部重新采样(刷新全部缓存)";
+                }
                 const curVal = String(this.value || "");
                 // 当用户明确选择【全部重新采样】或【全部精修】时，主动将下方所有分段解除锁定（重置为未锁定）
                 if (curVal.includes("全部重新采样") || curVal.includes("全部精修")) {

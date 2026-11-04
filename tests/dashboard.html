@@ -18,6 +18,10 @@ button { margin:0 8px 14px 0; padding:8px; }
 <button id="restore">载入旧工作流：锁定第2段</button>
 <div id="sampler" style="width:440px;background:#0f172a;padding:10px;border-radius:10px;box-sizing:border-box;"><div id="sampler-controls"></div></div>
 <p id="sampler-status"></p>
+<h2>一采生成方式（独立控件检查）</h2>
+<button id="connection">断开 / 接回规划器</button>
+<div id="first" style="width:440px;background:#042f2e;padding:10px;border-radius:10px;"><div id="first-controls"></div></div>
+<p id="first-status"></p>
 <script type="module">
 window.testApp = {registerExtension(extension) { window.extension = extension; }, graph: {_nodes: [], links: {}}, canvas: {setDirty() {}}};
 await import('/extensions/pj/pj_segment_sampler.js');
@@ -50,14 +54,13 @@ function execute(count) {
 document.querySelector('#four').onclick=()=>execute(4);
 document.querySelector('#twenty').onclick=()=>execute(20);
 document.querySelector('#narrow').onclick=()=>node.setSize([420,node.size[1]]);
-const samplerBox = document.querySelector('#sampler');
 class SamplerNode {
     constructor() {
         const values = {run_mode:'智能缓存(仅重跑未锁定分段)', target_time_second:5,
             custom_rerun_segments:'2,3', seg1_lock:false, seg2_lock:false, seg3_lock:false,
             blend_mode:'余弦平滑(推荐)', keep_original_audio:true, unload_model_after_sampling:true};
         this.widgets=Object.entries(values).map(([name,value])=>({name,value,type:'control',options:{}}));
-        this.properties={}; this.size=[440,300];
+        this.properties={}; this.size=[440,300]; this.host='sampler';
         this.inputs=[{name:'segment_plan',link:1}];
     }
     addWidget(type,name,value,callback,options) {
@@ -67,7 +70,7 @@ class SamplerNode {
     computeSize() { return [440, 300]; }
     setSize() { this.setDirtyCanvas(); }
     setDirtyCanvas() {
-        const controls=document.querySelector('#sampler-controls'); controls.replaceChildren();
+        const controls=document.querySelector('#'+this.host+'-controls'); controls.replaceChildren();
         for(const w of this.widgets) {
             if(w.element) { w.element.style.height=w.options.getHeight()+'px'; continue; }
             if(w.type==='pj_hidden') continue;
@@ -83,7 +86,7 @@ class SamplerNode {
             } else line.textContent=`${w.label || w.name}：${w.value}`;
             controls.append(line);
         }
-        document.querySelector('#sampler-status').textContent=
+        document.querySelector('#'+this.host+'-status').textContent=
             `后端模式：${this.widgets[0].value}；原生按钮数：${this.widgets.filter(w=>w.type==='button').length}`;
     }
 }
@@ -91,4 +94,24 @@ await window.extension.beforeRegisterNodeDef(SamplerNode,{name:'PJ_SegmentSample
 const samplerNode=new SamplerNode(); samplerNode.onNodeCreated();
 document.querySelector('#restore').onclick=()=>samplerNode.configure({widgets_values:[
     '智能缓存(仅重跑未锁定分段)',5,'2,3',false,true,false,'硬切',true,false]});
+class FirstSamplerNode extends SamplerNode {
+    constructor() {
+        super(); this.host='first';
+        this.widgets=this.widgets.filter(w=>w.name!=='keep_original_audio');
+        for(const [name,value] of Object.entries({sync_ref_video:true, base_seed:42, seg1_seed_offset:0,
+            seg2_seed_offset:1, seg3_seed_offset:2, boundary_constraints:false,
+            generation_mode:'分段编辑', relay_action:'全部生成', relay_start_segment:1}))
+            this.widgets.push({name,value,type:'control',options: name==='generation_mode' ?
+                {values:['分段编辑','整段采样','22帧接力']} : name==='relay_action' ?
+                {values:['全部生成','从指定段重做']} : {}});
+    }
+    onNodeCreated() {}
+    configure(info) {info.widgets_values.forEach((value,i)=>{this.widgets[i].value=value;});}
+}
+await window.extension.beforeRegisterNodeDef(FirstSamplerNode,{name:'PJ_FirstPass_SegmentSampler'});
+const firstNode=new FirstSamplerNode(); firstNode.onNodeCreated();
+document.querySelector('#connection').onclick=()=>{
+    firstNode.inputs[0].link=firstNode.inputs[0].link==null ? 1 : null;
+    firstNode.onConnectionsChange();
+};
 </script>

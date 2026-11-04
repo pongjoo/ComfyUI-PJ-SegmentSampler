@@ -19,6 +19,21 @@ def segment_seconds(start, end, fps=FPS):
     return frames_for_tokens(start) / fps, frames_for_tokens(end) / fps
 
 
+def plan_relay_segments(total_v, total_a, chunk_seconds):
+    # A window needs at least one new five-token group beyond its seven-token prefix.
+    groups = max(2, math.floor((chunk_seconds * FPS - 5) / 17 + 0.5))
+    window = groups * 5 + 2
+    chunks = []
+    for start in range(0, total_v, window - 7):
+        end = min(total_v, start + window)
+        audio_start = min(total_a, round(frames_for_tokens(start) * AUDIO_FPS / FPS))
+        audio_end = total_a if end == total_v else min(total_a, round(frames_for_tokens(end) * AUDIO_FPS / FPS))
+        chunks.append((start, end, audio_start, audio_end))
+        if end == total_v:
+            break
+    return chunks
+
+
 def plan_segments(total_v, total_a, split_mode, chunk_seconds, overlap_seconds,
                   num_segments, custom_cuts, fps=FPS, align_51_frames=False):
     # align_51_frames is accepted only for saved API workflows; all plans use the native grid.
