@@ -84,6 +84,10 @@ function autoResizeNode(node) {
     [20, 100, 250].forEach(delay => {
         setTimeout(() => {
             if (typeof node.setSize === "function" && typeof node.computeSize === "function") {
+                const dashboard = node.widgets?.find(w => w.name === "pj_planner_dashboard");
+                if (dashboard?.pjContent?.offsetHeight > 0) {
+                    dashboard.pjHeight = Math.ceil(dashboard.pjContent.offsetHeight);
+                }
                 const sz = node.computeSize();
                 const targetW = Math.max(node.size[0] || 0, 420);
                 node.setSize([targetW, sz[1] + 20]);
@@ -596,6 +600,9 @@ function renderPlannerDashboard(node, data) {
 
     let widget = node.widgets?.find(w => w.name === "pj_planner_dashboard");
     if (!widget) {
+        const root = document.createElement("div");
+        root.style.width = "100%";
+        root.style.overflow = "hidden";
         const container = document.createElement("div");
         container.style.display = "flex";
         container.style.flexDirection = "column";
@@ -609,13 +616,34 @@ function renderPlannerDashboard(node, data) {
         container.style.fontSize = "12px";
         container.style.color = "#f8fafc";
         container.style.overflow = "hidden";
+        container.style.flexShrink = "0";
+        root.appendChild(container);
 
-        widget = node.addDOMWidget("pj_planner_dashboard", "dashboard", container, {
-            serialize: false, hideOnZoom: false
+        widget = node.addDOMWidget("pj_planner_dashboard", "dashboard", root, {
+            serialize: false, hideOnZoom: false,
+            getMinHeight: () => widget?.pjHeight || 100,
+            getMaxHeight: () => widget?.pjHeight || 100,
+            getHeight: () => widget?.pjHeight || 100,
         });
+        widget.pjContent = container;
+        widget.pjHeight = 100;
+        widget.computeSize = width => [width, widget.pjHeight];
+        const observer = new ResizeObserver(() => {
+            const height = Math.ceil(container.offsetHeight);
+            if (height > 0 && height !== widget.pjHeight) {
+                widget.pjHeight = height;
+                autoResizeNode(node);
+            }
+        });
+        observer.observe(container);
+        const onRemoved = node.onRemoved;
+        node.onRemoved = function () {
+            observer.disconnect();
+            return onRemoved?.apply(this, arguments);
+        };
     }
 
-    const container = widget.element;
+    const container = widget.pjContent;
     container.innerHTML = "";
 
     // 1. 顶部时序统计横幅
@@ -717,8 +745,6 @@ function renderPlannerDashboard(node, data) {
     segListContainer.style.display = "flex";
     segListContainer.style.flexDirection = "column";
     segListContainer.style.gap = "4px";
-    segListContainer.style.maxHeight = "200px";
-    segListContainer.style.overflowY = "auto";
     segListContainer.style.paddingRight = "4px";
 
     if (data.chunks && Array.isArray(data.chunks)) {

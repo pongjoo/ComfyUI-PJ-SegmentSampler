@@ -1,0 +1,45 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>PJ planner layout regression</title>
+<style>
+body { background:#202124; color:#eee; font:14px sans-serif; margin:24px; }
+button { margin:0 8px 14px 0; padding:8px; }
+#node { width:440px; background:#211c50; padding:10px; box-sizing:border-box; border-radius:10px; }
+#controls { height:230px; }
+#controls p { border-radius:14px; padding:5px 12px; background:#333; }
+#status { margin:16px 0; }
+</style>
+<h2>PJ 规划器自动展开验证（独立 DOM 测试页）</h2>
+<button id="four">执行：4 段</button><button id="twenty">执行：20 段</button><button id="narrow">变窄</button>
+<p id="status">等待执行</p>
+<div id="node"><div id="controls"><b>PJ分段规划器（时序总控/可视播放器）</b>
+<p>视频帧率　24</p><p>切分规划模式　按秒自动切分</p><p>单段最大秒数　6</p><p>重叠过渡秒数　1.5</p><p>51帧网格吸附　关闭</p></div></div>
+<script type="module">
+window.testApp = {registerExtension(extension) { window.extension = extension; }, graph: {_nodes: [], links: {}}, canvas: {setDirty() {}}};
+await import('/extensions/pj/pj_segment_sampler.js');
+const box = document.querySelector('#node');
+class TestNode {
+    constructor() { this.widgets=[]; this.properties={}; this.size=[440,300]; this.graph={setDirty(){}}; }
+    addDOMWidget(name,type,element,options) {
+        const widget={name,type,element,options}; this.widgets.push(widget); box.append(element); return widget;
+    }
+    computeSize() { return [this.size[0], 250+this.widgets.reduce((h,w)=>h+w.computeSize(this.size[0])[1],0)]; }
+    setSize(size) {
+        this.size=size; box.style.width=size[0]+'px'; box.style.height=size[1]+'px';
+        for(const w of this.widgets) w.element.style.height=w.options.getHeight()+'px';
+        const w=this.widgets[0];
+        if(w) document.querySelector('#status').textContent = w.element.clientHeight >= w.pjContent.offsetHeight ?
+            `PASS：完整显示 ${w.pjContent.querySelectorAll('[style]').length} 个内容元素；内容 ${w.pjContent.offsetHeight}px，控件 ${w.element.clientHeight}px` : 'FAIL：内容被裁切';
+    }
+}
+await window.extension.beforeRegisterNodeDef(TestNode,{name:'PJ_SegmentPlanner'});
+const node = new TestNode();
+function execute(count) {
+    const frames = count === 4 ? 362 : (count-1)*102+141;
+    const chunks=Array.from({length:count},(_,i)=>({segment:i+1,start_sec:i*4.25,end_sec:Math.min(frames,i*102+141)/24,duration_sec:(Math.min(frames,i*102+141)-i*102)/24,start_frame:i*102,end_frame:Math.min(frames,i*102+141)}));
+    node.onExecuted({preview_data:[{has_media:false,has_video:false,effective_seconds:(frames/24).toFixed(2),total_frames:frames,fps:24,n_chunks:count,chunks}]});
+}
+document.querySelector('#four').onclick=()=>execute(4);
+document.querySelector('#twenty').onclick=()=>execute(20);
+document.querySelector('#narrow').onclick=()=>node.setSize([420,node.size[1]]);
+</script>
