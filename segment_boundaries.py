@@ -32,12 +32,16 @@ def constrain_boundaries(samples, mask, bounds, sources):
             denoise = torch.ones(shape, device=stream.device, dtype=torch.float32)
         else:
             denoise = comfy.sampler_helpers.prepare_mask(existing.float(), stream.shape, stream.device).clone()
+        editable = denoise > 0 if existing is not None else None
         # Reverse writes give the first source ownership, including triple overlaps.
         for (source_start, source_end), source in reversed(parts):
             left, right = max(start, source_start), min(end, source_end)
             if left < right:
-                target.narrow(axis, left - start, right - left).copy_(
-                    source.narrow(axis, left - source_start, right - left))
+                region = target.narrow(axis, left - start, right - left)
+                carried = source.narrow(axis, left - source_start, right - left).to(device=target.device, dtype=target.dtype)
+                if editable is not None:
+                    carried = torch.where(editable.narrow(axis, left - start, right - left), carried, region)
+                region.copy_(carried)
                 denoise.narrow(axis, left - start, right - left).zero_()
         output.append(target)
         output_masks.append(denoise)
@@ -46,16 +50,18 @@ def constrain_boundaries(samples, mask, bounds, sources):
     return output[0], output_masks[0]
 
 
-def restore_boundaries(samples, bounds, sources):
-    """Remove solver/latent-transform rounding drift from the already-constrained overlaps."""
+def restore_preserved(samples, original, mask):
+    """Restore zero-mask values after solver/assembly rounding, in bounded blocks."""
+    if mask is None:
+        return
     streams = list(samples.unbind()) if samples.is_nested else [samples]
-    for other, value in reversed(sources):
-        parts = list(value.unbind()) if value.is_nested else [value]
-        for i, (stream, source) in enumerate(zip(streams, parts)):
-            start, end = bounds[i * 2:i * 2 + 2]
-            source_start, source_end = other[i * 2:i * 2 + 2]
-            left, right = max(start, source_start), min(end, source_end)
-            if left < right:
-                axis = 2 if i == 0 else stream.ndim - 1
-                stream.narrow(axis, left - start, right - left).copy_(
-                    source.narrow(axis, left - source_start, right - left))
+    originals = list(original.unbind()) if original.is_nested else [original]
+    masks = list(mask.unbind()) if mask.is_nested else [mask]
+    for i, (stream, source, part) in enumerate(zip(streams, originals, masks)):
+        prepared = comfy.sampler_helpers.prepare_mask(part.float(), stream.shape, stream.device)
+        axis = 2 if i == 0 else stream.ndim - 1
+        for start in range(0, stream.shape[axis], 8):
+            length = min(8, stream.shape[axis] - start)
+            region = stream.narrow(axis, start, length)
+            preserved = source.narrow(axis, start, length).to(device=stream.device, dtype=stream.dtype)
+            region.copy_(torch.where(prepared.narrow(axis, start, length) == 0, preserved, region))

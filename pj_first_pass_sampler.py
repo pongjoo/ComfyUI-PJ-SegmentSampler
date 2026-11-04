@@ -5,7 +5,7 @@ import comfy.model_management
 import comfy.nested_tensor
 import latent_preview
 
-from .segment_boundaries import constrain_boundaries, restore_boundaries
+from .segment_boundaries import constrain_boundaries, restore_preserved
 from .segment_timing import plan_segments, resolve_plan, segment_seconds
 from .segment_sampling import (SegmentCache, sampling_signature, fingerprint, generate_noise,
                                slice_mask, segment_guider, blend_sequence)
@@ -211,7 +211,7 @@ class PJ_FirstPass_SegmentSampler:
         self._cache.retain(n_chunks)
         context_signature = sampling_signature(guider, sampler, sigmas)
         if constrain:
-            context_signature = fingerprint((context_signature, "boundaries-v1", chunks, latent_image))
+            context_signature = fingerprint((context_signature, "boundaries-v2", chunks, latent_image))
 
         print("\n" + "=" * 65)
         print(f"[PJ一采分段采样器] 输入总时长: {total_v} 视频步 (~{segment_seconds(0, total_v, fps)[1]:.2f}s), 音频: {total_a} 步")
@@ -293,6 +293,7 @@ class PJ_FirstPass_SegmentSampler:
                 sources = [(chunks[i], value) for i, value in enumerate(retained) if value is not None]
                 sources += [(chunks[i], value) for i, value in enumerate(sampled_chunks) if retained[i] is None]
                 chunk_latent_samples, chunk_mask = constrain_boundaries(chunk_latent_samples, chunk_mask, bounds, sources)
+                del sources
             seg_offset = offsets[idx] if idx < len(offsets) else idx
             seg_seed = (seed_val + seg_offset) & 0xFFFFFFFFFFFFFFFF
 
@@ -330,9 +331,7 @@ class PJ_FirstPass_SegmentSampler:
 
             # Save to CPU and update cache
             chunk_out_cpu = chunk_out.to("cpu")
-            if constrain:
-                restore_boundaries(chunk_out_cpu, bounds, sources)
-                del sources
+            restore_preserved(chunk_out_cpu, chunk_latent_samples, chunk_mask)
             sampled_chunks.append(chunk_out_cpu)
             if not constrain:
                 self._cache.save(idx, signatures[idx], chunk_out_cpu)
@@ -378,6 +377,8 @@ class PJ_FirstPass_SegmentSampler:
             result_samples = comfy.nested_tensor.NestedTensor((blended_video, blended_audio))
         else:
             result_samples = blended_video
+
+        restore_preserved(result_samples, latent, latent_image.get("noise_mask"))
 
         if rebuilding:
             for idx, samples in enumerate(sampled_chunks):

@@ -47,6 +47,9 @@ const INPUT_LABELS = {
     "sampler": "采样算法",
     "sigmas": "调度步长",
     "latent_image": "输入潜空间",
+    "av_latent": "H3目标音视频潜空间",
+    "source_latent": "原视频编码潜空间",
+    "edit_mask": "空间编辑遮罩(白改黑留)",
     "segment_plan": "分段规划总线"
 };
 
@@ -194,8 +197,12 @@ function localizeAndSanitizeCommon(node) {
 
 // 溯源查找上游【分段规划器】节点（智能穿透 Reroute 路由节点）
 function getUpstreamPlannerNode(node) {
+    return getUpstreamInputNode(node, "segment_plan");
+}
+
+function getUpstreamInputNode(node, inputName) {
     if (!node.inputs || !app.graph) return null;
-    const planInput = node.inputs.find(i => i.name === "segment_plan" || i.label === "分段规划总线" || i.type === "PJ_SEGMENT_PLAN");
+    const planInput = node.inputs.find(i => i.name === inputName || (inputName === "segment_plan" && (i.label === "分段规划总线" || i.type === "PJ_SEGMENT_PLAN")));
     if (!planInput || planInput.link == null) return null;
 
     let link = app.graph.links[planInput.link];
@@ -352,7 +359,13 @@ function samplerGuideText(node, isFirstPass) {
     const boundary = isFirstPass && !full && !!value("boundary_constraints");
     if (boundary) action += " 接缝约束固定已生成或缓存的重叠区；修改重叠内容需将相邻段一起重做。首次开启需重建缓存。";
     const settings = full ? [] : [boundary ? "接缝约束：开（实验，画质待验证）" : String(value("blend_mode") || "")];
-    if (isFirstPass) settings.push(`参考条件裁剪：${value("sync_ref_video") ? "开" : "关"}`);
+    if (isFirstPass) {
+        const source = getUpstreamInputNode(node, "latent_image");
+        settings.push(source?.type === "PJ_H3EditPrepare"
+            ? "空间编辑：已连接准备节点，黑色区保留原视频"
+            : "空间编辑：由输入潜空间携带的遮罩决定");
+        settings.push(`参考条件裁剪：${value("sync_ref_video") ? "开" : "关"}`);
+    }
     settings.push(`完成后卸载：${value("unload_model_after_sampling") ? "开" : "关"}`);
     return { planning, action, settings: settings.join(" · ") };
 }
@@ -1037,6 +1050,17 @@ app.registerExtension({
                 }
                 return r;
             };
+        } else if (nodeData.name === "PJ_H3EditPrepare") {
+            for (const event of ["onNodeCreated", "onConfigure"]) {
+                const original = nodeType.prototype[event];
+                nodeType.prototype[event] = function () {
+                    const result = original?.apply(this, arguments);
+                    localizeAndSanitizeCommon(this);
+                    this.color = "#134e4a";
+                    this.bgcolor = "#042f2e";
+                    return result;
+                };
+            }
         } else if (nodeData.name === "PJ_FirstPass_SegmentSampler") {
             const onNodeCreated = nodeType.prototype.onNodeCreated;
             nodeType.prototype.onNodeCreated = function () {

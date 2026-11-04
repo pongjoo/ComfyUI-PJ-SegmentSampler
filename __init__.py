@@ -1,8 +1,10 @@
 from .pj_segment_sampler import PJ_SegmentSampler, PJSegmentSampler
 from .pj_first_pass_sampler import PJ_FirstPass_SegmentSampler
 from .pj_segment_planner import PJ_SegmentPlanner
+from .pj_h3_edit_prepare import PJ_H3EditPrepare
 
 NODE_CLASS_MAPPINGS = {
+    "PJ_H3EditPrepare": PJ_H3EditPrepare,
     "PJ_SegmentPlanner": PJ_SegmentPlanner,
     "PJ_FirstPass_SegmentSampler": PJ_FirstPass_SegmentSampler,
     "PJ_SegmentSampler": PJ_SegmentSampler,
@@ -10,6 +12,7 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "PJ_H3EditPrepare": "PJ H3编辑区域准备 (原视频/空间遮罩)",
     "PJ_SegmentPlanner": "PJ分段规划器 (时序总控/可视播放器)",
     "PJ_FirstPass_SegmentSampler": "PJ一采分段重抽采样器 (单段重抽/缓存)",
     "PJ_SegmentSampler": "PJ二采分段精修采样器 (分段精修/释放显存)",

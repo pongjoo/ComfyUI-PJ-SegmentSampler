@@ -25,6 +25,7 @@ spec.loader.exec_module(package)
 from pj_segments_test.segment_boundaries import constrain_boundaries
 from pj_segments_test.segment_timing import frames_for_tokens, tokens_for_frames, plan_segments
 from pj_segments_test.segment_sampling import blend_sequence, segment_guider, generate_noise, slice_mask, fingerprint
+from pj_segments_test.pj_h3_edit_prepare import PJ_H3EditPrepare
 from pj_segments_test.pj_segment_planner import PJ_SegmentPlanner
 from pj_segments_test.pj_first_pass_sampler import PJ_FirstPass_SegmentSampler
 from pj_segments_test.pj_segment_sampler import PJ_SegmentSampler
@@ -71,7 +72,8 @@ class NativeMaskGuider(RecordingGuider):
         model.audio_scale = lambda: 1.0
         if nested:
             conditions = model._denoise_mask_values(packed_mask, shapes)
-            assert "denoise_mask" in conditions or "audio_denoise_mask" in conditions
+            if packed_mask.min() < 1:
+                assert "denoise_mask" in conditions or "audio_denoise_mask" in conditions
         class FlowSampling(comfy.model_sampling.ModelSamplingDiscreteFlow, comfy.model_sampling.CONST):
             pass
         flow = FlowSampling()
@@ -487,6 +489,100 @@ class SegmentTests(unittest.TestCase):
             self.assertTrue(torch.equal(result[:, :, :5], chunks[0][:, :, :5]))
             self.assertTrue(torch.equal(result[:, :, 7:12], chunks[1][:, :, 2:]))
             self.assertTrue(torch.all(result[:, :, 12:] == 7))
+
+    def test_edit_prepare_source_audio_and_native_temporal_union(self):
+        video = torch.zeros(1, 24, 7, 4, 4)
+        audio = torch.randn(1, 32, 2, 37)
+        template = {"samples": NestedTensor((video, audio)), "batch_index": [0]}
+        source = torch.randn_like(video)
+        mask = torch.zeros(24, 64, 64)
+        mask[4, 2, 33] = 1
+        mask[23] = 1  # Extra frames outside the 22-frame target must not leak in.
+        result = PJ_H3EditPrepare().prepare(template, {"samples": source}, mask)[0]
+        actual, actual_audio = result["samples"].unbind()
+        vm, am = result["noise_mask"].unbind()
+        self.assertTrue(torch.equal(actual, source))
+        self.assertTrue(torch.equal(actual_audio, audio))
+        self.assertEqual(vm.shape, (1, 1, 7, 4, 4))
+        expected = torch.zeros_like(vm)
+        expected[:, :, 1, :2, 2:] = 1
+        self.assertTrue(torch.equal(vm, expected))
+        self.assertTrue(torch.all(am == 1))
+        self.assertTrue(torch.all(video == 0))
+        actual.zero_()
+        self.assertFalse(torch.all(source == 0))
+        self.assertEqual(result["batch_index"], [0])
+
+    def test_edit_prepare_static_mask_and_existing_av_masks(self):
+        video = torch.zeros(1, 24, 7, 3, 3)
+        audio = torch.zeros(1, 32, 2, 37)
+        template = {"samples": NestedTensor((video, audio)),
+                    "noise_mask": NestedTensor((torch.full((1, 1, 1, 3, 3), 0.5), torch.zeros(1, 1, 1, 37)))}
+        result = PJ_H3EditPrepare().prepare(template, {"samples": video + 3}, torch.ones(1, 48, 48))[0]
+        vm, am = result["noise_mask"].unbind()
+        self.assertTrue(torch.all(vm == 0.5))
+        self.assertTrue(torch.all(am == 0))
+        self.assertEqual(vm.shape, video.shape)
+
+    def test_edit_prepare_reports_alignment_errors(self):
+        video = torch.zeros(1, 24, 7, 4, 4)
+        template = {"samples": NestedTensor((video, torch.zeros(1, 32, 2, 37)))}
+        node = PJ_H3EditPrepare()
+        for mask in (torch.ones(21, 64, 64), torch.ones(22, 32, 64), torch.full((1, 64, 64), float('nan'))):
+            with self.assertRaises(ValueError):
+                node.prepare(template, {"samples": video}, mask)
+        with self.assertRaisesRegex(ValueError, "形状不一致"):
+            node.prepare(template, {"samples": video[:, :, :2]}, torch.ones(22, 64, 64))
+        with self.assertRaisesRegex(ValueError, "音视频潜空间"):
+            node.prepare({"samples": video}, {"samples": video}, torch.ones(22, 64, 64))
+
+    def test_spatial_protection_takes_priority_over_cached_boundaries(self):
+        original = torch.full((1, 24, 7, 2, 2), 3.)
+        cached = torch.full_like(original, 99.)
+        mask = torch.zeros(1, 1, 7, 2, 2)
+        mask[..., 1] = 1
+        result, denoise = constrain_boundaries(original, mask, (5, 12, 0, 0), [((0, 7, 0, 0), cached)])
+        self.assertTrue(torch.all(result[..., 0] == 3))
+        self.assertTrue(torch.all(result[:, :, :2, :, 1] == 99))
+        self.assertTrue(torch.all(denoise[:, :, :2] == 0))
+        self.assertTrue(torch.all(denoise[:, :, 2:, :, 1] == 1))
+        self.assertTrue(torch.all(original == 3))
+
+    def test_source_backed_edit_and_local_rerun_keep_background_exact(self):
+        self.guider = NativeMaskGuider()
+        self.plan["overlap_seconds"] = 0.5
+        video = torch.zeros(1, 24, 107, 4, 4)
+        audio = torch.zeros(1, 32, 2, 603)
+        source = torch.randn_like(video)
+        mask = torch.zeros(362, 64, 64)
+        mask[:, :, 32:] = 1
+        self.latent = PJ_H3EditPrepare().prepare({"samples": NestedTensor((video, audio))}, {"samples": source}, mask)[0]
+        for boundary in (False, True):
+            node = self.node(PJ_FirstPass_SegmentSampler)
+            before = self.run_node(node, boundary_constraints=boundary)[0]["samples"].unbind()[0]
+            self.assertTrue(torch.equal(before[..., :2], source[..., :2]))
+            self.guider.calls.clear()
+            after = self.run_node(node, boundary_constraints=boundary, run_mode="仅重抽第2段", seg2_seed_offset=999)[0]["samples"].unbind()[0]
+            self.assertEqual(len(self.guider.calls), 1)
+            self.assertTrue(torch.equal(after[..., :2], source[..., :2]))
+            self.assertFalse(torch.equal(before[:, :, 42:80, :, 2:], after[:, :, 42:80, :, 2:]))
+            if boundary:
+                self.assertTrue(torch.equal(before[:, :, :42], after[:, :, :42]))
+                self.assertTrue(torch.equal(before[:, :, 80:], after[:, :, 80:]))
+            self.latent["noise_mask"].unbind()[0][:, :, 45] = 0
+            self.guider.calls.clear()
+            self.run_node(node, boundary_constraints=boundary, **{f"seg{i}_lock": True for i in range(1, 21)})
+            self.assertEqual(len(self.guider.calls), 3 if boundary else 1)
+            self.latent["noise_mask"].unbind()[0][:, :, 45, :, 2:] = 1
+
+    def test_all_black_edit_preserves_video_and_leaves_audio_sampling_enabled(self):
+        self.guider = NativeMaskGuider()
+        video, audio = self.latent["samples"].unbind()
+        source = torch.randn_like(video)
+        self.latent = PJ_H3EditPrepare().prepare(self.latent, {"samples": source}, torch.zeros(1, 32, 32))[0]
+        output = self.run_node(self.node(PJ_FirstPass_SegmentSampler), boundary_constraints=True)[0]["samples"]
+        self.assertTrue(torch.equal(output.unbind()[0], source))
+        self.assertFalse(torch.equal(output.unbind()[1], audio))
 
 
 if __name__ == "__main__":

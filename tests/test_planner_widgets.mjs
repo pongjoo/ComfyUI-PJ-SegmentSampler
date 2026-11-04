@@ -172,3 +172,31 @@ test('boundary constraints stay visible, replace blending, and do not reset save
     assert.equal(widget(node, 'boundary_constraints').value, true);
     assert.doesNotMatch(vm.runInContext('samplerGuideText(node, true).settings', uiContext), /接缝约束/);
 });
+
+
+test('first pass describes a connected edit preparer through reroutes without assuming other latents are empty', () => {
+    const node = sampler('仅重抽第2段', true);
+    node.inputs = [{name:'latent_image', link:1}];
+    uiContext.node = node;
+    vm.runInContext(`app.graph = {links:{1:{origin_id:10},2:{origin_id:20}},
+        getNodeById(id) {return id === 10 ? {type:'Reroute', inputs:[{link:2}]} : {type:'PJ_H3EditPrepare'};}};`, uiContext);
+    assert.match(vm.runInContext('samplerGuideText(node, true).settings', uiContext), /已连接准备节点/);
+    node.inputs = [];
+    assert.match(vm.runInContext('samplerGuideText(node, true).settings', uiContext), /由输入潜空间携带的遮罩决定/);
+    vm.runInContext('delete app.graph;', uiContext);
+});
+
+test('edit preparer exposes Chinese input labels without extra sampling widgets', async () => {
+    let extension;
+    const ctx = vm.createContext({app:{registerExtension(value) {extension=value;}}});
+    vm.runInContext(source, ctx);
+    class Node {
+        constructor() {this.inputs = ['av_latent','source_latent','edit_mask'].map(name=>({name}));}
+    }
+    await extension.beforeRegisterNodeDef(Node, {name:'PJ_H3EditPrepare'});
+    const node = new Node();
+    node.onNodeCreated();
+    assert.deepEqual(node.inputs.map(i=>i.label), ['H3目标音视频潜空间','原视频编码潜空间','空间编辑遮罩(白改黑留)']);
+    node.onConfigure();
+    assert.equal(node.inputs.length,3);
+});
