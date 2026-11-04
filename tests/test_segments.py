@@ -145,6 +145,7 @@ class SegmentTests(unittest.TestCase):
         self.assertEqual(data["timing_policy"], "nearest_h3")
         self.assertEqual(data["chunks"][1]["overlap_frames"], 5)
         self.assertEqual(data["chunks"][1]["overlap_seconds"], 0.208)
+        self.assertEqual([c["duration_sec"] for c in data["chunks"][:2]], [5.88, 5.88])
         # Both samplers must resolve saved rules identically to the new planner.
         for cls in (PJ_FirstPass_SegmentSampler, PJ_SegmentSampler):
             self.guider.calls.clear()

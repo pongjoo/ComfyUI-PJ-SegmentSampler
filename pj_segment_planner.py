@@ -277,7 +277,7 @@ class PJ_SegmentPlanner:
             s_sec, e_sec = segment_seconds(vs, ve, fps)
             s_frame = int(round(s_sec * fps))
             e_frame = min(total_frames, int(round(e_sec * fps)))
-            dur_sec = round(e_sec - s_sec, 2)
+            dur_sec = round((e_frame - s_frame) / fps, 2)
             overlap_frames = max(0, min(e_frame, frames_for_tokens(chunks[i - 1][1])) - s_frame) if i else 0
             overlap_sec = round(overlap_frames / fps, 3)
             summary_lines.append(
