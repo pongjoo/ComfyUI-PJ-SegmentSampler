@@ -295,6 +295,18 @@ class SegmentTests(unittest.TestCase):
         self.assertEqual(len(self.guider.calls), 1)
         self.assertEqual(output.unbind()[0].shape[2], 107)
 
+    def test_optional_plan_samples_full_input_in_both_samplers(self):
+        for cls in (PJ_FirstPass_SegmentSampler, PJ_SegmentSampler):
+            with self.subTest(node=cls.__name__):
+                schema = cls.INPUT_TYPES()
+                self.assertNotIn("segment_plan", schema["required"])
+                self.assertIn("segment_plan", schema["optional"])
+                self.guider.calls.clear()
+                output = self.run_node(self.node(cls), segment_plan=None)[0]["samples"]
+                self.assertEqual(len(self.guider.calls), 1)
+                self.assertEqual(output.unbind()[0].shape, self.latent["samples"].unbind()[0].shape)
+                self.assertEqual(output.unbind()[1].shape, self.latent["samples"].unbind()[1].shape)
+
     def test_x0_audio_uses_denoised_stream_when_bypass_disabled(self):
         node = self.node(PJ_SegmentSampler)
         output, denoised = self.run_node(node, keep_original_audio=False)

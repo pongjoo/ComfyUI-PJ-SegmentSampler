@@ -40,7 +40,7 @@ test('old preview is discarded, current backend preview survives', () => {
 
 const uiContext = vm.createContext({ app: { registerExtension() {} }, setTimeout() {} });
 vm.runInContext(source, uiContext);
-vm.runInContext('updateSamplerGuide = () => {};', uiContext);
+vm.runInContext('updateSamplerControls = () => {};', uiContext);
 function sampler(mode, first = false) {
     const values = {run_mode: mode, target_time_second: 5, custom_rerun_segments: '2',
         sync_ref_video: false, boundary_constraints: false, blend_mode: '硬切', unload_model_after_sampling: false};
@@ -48,7 +48,7 @@ function sampler(mode, first = false) {
         values[`seg${i}_lock`] = i === 8;
         if (first) values[`seg${i}_seed_offset`] = i - 1;
     }
-    return {properties: {}, widgets: Object.entries(values).map(([name, value]) =>
+    return {properties: {}, inputs: [{name: "segment_plan", link: 1}], widgets: Object.entries(values).map(([name, value]) =>
         ({name, value, type: 'number', options: {}}))};
 }
 function refresh(node, first = false) {
@@ -63,7 +63,8 @@ test('preview count cannot reset a saved target beyond the preview', () => {
     const node = sampler('仅精修第18段');
     refresh(node);
     assert.equal(widget(node, 'run_mode').value, '仅精修第18段');
-    assert.ok(widget(node, 'run_mode').options.values.includes('仅精修第20段'));
+    assert.ok(widget(node, 'run_mode').options.values.includes('仅精修第18段'));
+    assert.ok(!widget(node, 'run_mode').options.values.includes('仅精修第20段'));
     assert.equal(visible(node, 'seg1_lock'), false);
     assert.equal(widget(node, 'seg8_lock').value, true);
 });
@@ -89,14 +90,11 @@ test('smart locks and advanced settings reflect applicable mode without changing
     assert.equal(visible(node, 'unload_model_after_sampling'), true);
 });
 
-test('target fields follow the selected operation and guides do not promise cache hits', () => {
+test('target fields follow the selected operation', () => {
     const node = sampler('按缺陷秒数精修 (下方输入秒数)');
     refresh(node);
     assert.equal(visible(node, 'target_time_second'), true);
     assert.equal(visible(node, 'custom_rerun_segments'), false);
-    const guide = vm.runInContext('samplerGuideText(node, false)', uiContext);
-    assert.match(guide.action, /无缓存或缓存失效时仍需计算/);
-    assert.match(guide.planning, /未连接/);
     widget(node, 'run_mode').value = '自定义指定分段(下方输入)';
     refresh(node);
     assert.equal(visible(node, 'target_time_second'), false);
@@ -116,28 +114,24 @@ test('selecting all refinement clears locks while preserving advanced values', (
     assert.equal(widget(node, 'unload_model_after_sampling').value, false);
 });
 
-test('second pass tasks map saved backend modes without changing workflow values', () => {
+test('native second pass selector preserves saved modes and lock visibility', () => {
     const cases = [['全部精修(刷新全部缓存)', '常规分段采样'],
         ['智能缓存(仅重跑未锁定分段)', '按锁定状态采样'],
         ['仅精修第18段', '局部重做'], ['自定义指定分段(下方输入)', '局部重做']];
     for (const [mode, task] of cases) {
         const node = sampler(mode);
         refresh(node);
-        assert.equal(vm.runInContext('secondPassOperation(node.widgets[0].value)', uiContext), task);
         assert.equal(widget(node, 'run_mode').value, mode);
-        assert.equal(visible(node, 'run_mode'), false);
+        assert.equal(visible(node, 'run_mode'), true);
         assert.equal(visible(node, 'seg1_lock'), task === '按锁定状态采样');
     }
-    const node = sampler('全部精修(刷新全部缓存)');
-    refresh(node);
-    assert.match(vm.runInContext('samplerGuideText(node, false).action', uiContext), /逐段采样一次/);
 });
 
 test('new second pass nodes default to normal sampling; configure restores saved modes', async () => {
     let extension;
     const creationContext = vm.createContext({app: {registerExtension(value) {extension=value;}}, setTimeout() {}});
     vm.runInContext(source, creationContext);
-    vm.runInContext('updateSamplerGuide = () => {};', creationContext);
+    vm.runInContext('updateSamplerControls = () => {};', creationContext);
     for (const name of ['PJ_SegmentSampler', 'PJSegmentSampler']) {
         class Node {
             constructor() { Object.assign(this, sampler('智能缓存(仅重跑未锁定分段)')); }
@@ -165,25 +159,35 @@ test('boundary constraints stay visible, replace blending, and do not reset save
     refresh(node, true);
     assert.equal(visible(node, 'blend_mode'), false);
     assert.equal(widget(node, 'blend_mode').value, '硬切');
-    assert.match(vm.runInContext('samplerGuideText(node, true).action', uiContext), /首次开启需重建缓存/);
     widget(node, 'run_mode').value = '整段全量采样(一采不分段)';
     refresh(node, true);
     assert.equal(visible(node, 'boundary_constraints'), false);
     assert.equal(widget(node, 'boundary_constraints').value, true);
-    assert.doesNotMatch(vm.runInContext('samplerGuideText(node, true).settings', uiContext), /接缝约束/);
 });
 
 
-test('first pass describes a connected edit preparer through reroutes without assuming other latents are empty', () => {
-    const node = sampler('仅重抽第2段', true);
-    node.inputs = [{name:'latent_image', link:1}];
-    uiContext.node = node;
-    vm.runInContext(`app.graph = {links:{1:{origin_id:10},2:{origin_id:20}},
-        getNodeById(id) {return id === 10 ? {type:'Reroute', inputs:[{link:2}]} : {type:'PJ_H3EditPrepare'};}};`, uiContext);
-    assert.match(vm.runInContext('samplerGuideText(node, true).settings', uiContext), /已连接准备节点/);
-    node.inputs = [];
-    assert.match(vm.runInContext('samplerGuideText(node, true).settings', uiContext), /由输入潜空间携带的遮罩决定/);
-    vm.runInContext('delete app.graph;', uiContext);
+test('samplers use one native advanced button and no explanation panel', () => {
+    for (const first of [true, false]) {
+        const node = sampler('全部精修(刷新全部缓存)', first);
+        node.addWidget = (type, name, value, callback, options) => {
+            const control = {type, name, value, callback, options};
+            node.widgets.push(control);
+            return control;
+        };
+        context.node = node;
+        context.first = first;
+        vm.runInContext('updateSamplerControls(node, first); updateSamplerControls(node, first);', context);
+        const buttons = node.widgets.filter(w => w.type === 'button');
+        assert.equal(buttons.length, 1);
+        assert.equal(buttons[0].label, '展开高级设置');
+        assert.equal(buttons[0].options.serialize, false);
+        // Run the real button callback without browser timers.
+        context.setTimeout = () => {};
+        buttons[0].callback();
+        assert.equal(node.properties.pj_advanced_open, true);
+        assert.equal(buttons[0].label, '收起高级设置');
+        assert.equal(node.widgets.some(w => w.name === 'pj_sampler_guide'), false);
+    }
 });
 
 test('edit preparer exposes Chinese input labels without extra sampling widgets', async () => {
@@ -199,4 +203,44 @@ test('edit preparer exposes Chinese input labels without extra sampling widgets'
     assert.deepEqual(node.inputs.map(i=>i.label), ['H3目标音视频潜空间','原视频编码潜空间','空间编辑遮罩(白改黑留)']);
     node.onConfigure();
     assert.equal(node.inputs.length,3);
+});
+
+
+test('disconnected planners hide all segment controls and preserve saved values', () => {
+    for (const first of [true, false]) {
+        const node = sampler(first ? '仅重抽第8段' : '按缺陷秒数精修 (下方输入秒数)', first);
+        node.properties.pj_advanced_open = true;
+        node.inputs[0].link = null;
+        refresh(node, first);
+        for (const name of ['run_mode', 'target_time_second', 'custom_rerun_segments',
+                            'seg1_lock', 'seg8_lock', 'boundary_constraints', 'blend_mode'])
+            assert.equal(visible(node, name), false, name);
+        assert.equal(widget(node, 'seg8_lock').value, true);
+        if (first) {
+            assert.equal(visible(node, 'seg1_seed_offset'), true);
+            assert.equal(visible(node, 'seg2_seed_offset'), false);
+        }
+        node.inputs[0].link = 1;
+        refresh(node, first);
+        assert.equal(visible(node, 'run_mode'), true);
+        assert.equal(widget(node, 'run_mode').value, first ? '仅重抽第8段' : '按缺陷秒数精修 (下方输入秒数)');
+    }
+});
+
+test('both selectors follow upstream planner counts through reroutes', () => {
+    const planner = {type: 'PJ_SegmentPlanner', properties: {pj_preview_cache: {n_chunks: 3}}};
+    uiContext.app.graph = {links: {1: {origin_id: 10}, 2: {origin_id: 20}},
+        getNodeById(id) {return id === 10 ? {type: 'Reroute', inputs: [{link: 2}]} : planner;}};
+    try {
+        for (const first of [true, false]) {
+            const prefix = first ? '仅重抽第' : '仅精修第';
+            const node = sampler(first ? '全部重新采样(刷新全部缓存)' : '全部精修(刷新全部缓存)', first);
+            for (const count of [3, 6, 2]) {
+                planner.properties.pj_preview_cache.n_chunks = count;
+                refresh(node, first);
+                const choices = widget(node, 'run_mode').options.values.filter(value => value.startsWith(prefix));
+                assert.deepEqual(Array.from(choices), Array.from({length: count}, (_, i) => `${prefix}${i + 1}段`));
+            }
+        }
+    } finally {delete uiContext.app.graph;}
 });

@@ -30,14 +30,14 @@ class PJ_FirstPass_SegmentSampler:
                 "sampler": ("SAMPLER", {"tooltip": "采样算法 (推荐 er_sde 或 euler)"}),
                 "sigmas": ("SIGMAS", {"tooltip": "调度器步长 (通常为一采全降噪，如 6 步)"}),
                 "latent_image": ("LATENT", {"tooltip": "一采空潜空间 (来自 EmptyMiniMaxH3LatentAV)"}),
+            },
+            "optional": {
                 "segment_plan": (
                     "PJ_SEGMENT_PLAN",
                     {
-                        "tooltip": "连接来自【PJ分段规划器】的时序总线，所有分段时钟与切片由此统领，杜绝重复设置",
+                        "tooltip": "可选；连接时按规划分段，未连接时按输入完整长度采样",
                     },
                 ),
-            },
-            "optional": {
                 "sync_ref_video": (
                     "BOOLEAN",
                     {
@@ -204,7 +204,7 @@ class PJ_FirstPass_SegmentSampler:
         chunks, fps = resolve_plan(
             latent, segment_plan, split_mode, chunk_seconds, overlap_seconds,
             num_segments, custom_cuts, fps, align_51_frames,
-            full_length="不分段" in str(run_mode) or "全量采样" in str(run_mode),
+            full_length=segment_plan is None or "不分段" in str(run_mode) or "全量采样" in str(run_mode),
         )
         n_chunks = len(chunks)
         constrain = boundary_constraints and n_chunks > 1

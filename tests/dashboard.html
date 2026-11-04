@@ -14,7 +14,7 @@ button { margin:0 8px 14px 0; padding:8px; }
 <p id="status">等待执行</p>
 <div id="node"><div id="controls"><b>PJ分段规划器（时序总控/可视播放器）</b>
 <p>视频帧率　24</p><p>切分规划模式　按秒自动切分</p><p>目标段长(参考秒数)　6</p><p>目标重叠(参考秒数)　1.5</p></div></div>
-<h2>二采任务选择（独立 DOM 检查，非真实采样）</h2>
+<h2>二采原生控件检查（独立测试页，非真实采样）</h2>
 <button id="restore">载入旧工作流：锁定第2段</button>
 <div id="sampler" style="width:440px;background:#0f172a;padding:10px;border-radius:10px;box-sizing:border-box;"><div id="sampler-controls"></div></div>
 <p id="sampler-status"></p>
@@ -58,9 +58,10 @@ class SamplerNode {
             blend_mode:'余弦平滑(推荐)', keep_original_audio:true, unload_model_after_sampling:true};
         this.widgets=Object.entries(values).map(([name,value])=>({name,value,type:'control',options:{}}));
         this.properties={}; this.size=[440,300];
+        this.inputs=[{name:'segment_plan',link:1}];
     }
-    addDOMWidget(name,type,element,options) {
-        const widget={name,type,element,options}; this.widgets.push(widget); samplerBox.append(element); return widget;
+    addWidget(type,name,value,callback,options) {
+        const widget={type,name,value,callback,options}; this.widgets.push(widget); return widget;
     }
     configure(info) { info.widgets_values.forEach((value,i)=>{this.widgets[i].value=value;}); }
     computeSize() { return [440, 300]; }
@@ -70,13 +71,20 @@ class SamplerNode {
         for(const w of this.widgets) {
             if(w.element) { w.element.style.height=w.options.getHeight()+'px'; continue; }
             if(w.type==='pj_hidden') continue;
-            const line=document.createElement('p'); line.textContent=`${w.label || w.name}：${w.value}`;
+            const line=document.createElement('p');
+            if(w.type==='button') {
+                const button=document.createElement('button'); button.textContent=w.label || w.name;
+                button.onclick=()=>w.callback(); line.append(button);
+            } else if(w.options.values) {
+                line.textContent=(w.label || w.name)+'：';
+                const select=document.createElement('select');
+                for(const value of w.options.values) {const option=new Option(value,value); select.add(option);}
+                select.value=w.value; select.onchange=()=>{w.value=select.value; w.callback?.();}; line.append(select);
+            } else line.textContent=`${w.label || w.name}：${w.value}`;
             controls.append(line);
         }
-        const guide=this.widgets.find(w=>w.element);
-        if(guide) document.querySelector('#sampler-status').textContent=
-            `后端模式：${this.widgets[0].value}；面板数：${samplerBox.querySelectorAll('[data-pj-select="operation"]').length}；`+
-            (guide.element.clientHeight>=guide.pjContent.offsetHeight?'PASS：完整显示':'FAIL：内容裁切');
+        document.querySelector('#sampler-status').textContent=
+            `后端模式：${this.widgets[0].value}；原生按钮数：${this.widgets.filter(w=>w.type==='button').length}`;
     }
 }
 await window.extension.beforeRegisterNodeDef(SamplerNode,{name:'PJ_SegmentSampler'});

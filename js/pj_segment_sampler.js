@@ -226,8 +226,14 @@ function getUpstreamInputNode(node, inputName) {
     return null;
 }
 
-// 获取上游规划器或当前设置的目标分段数
+function hasSegmentPlan(node) {
+    return !!node.inputs?.some(input =>
+        (input.name === "segment_plan" || input.type === "PJ_SEGMENT_PLAN") && input.link != null);
+}
+
+// 获取上游规划器的分段数；没有规划时只处理完整输入。
 function resolveTargetSegmentCount(node) {
+    if (!hasSegmentPlan(node)) return 1;
     // 1. 优先实时读取上游 PJ_SegmentPlanner 最新控件值
     const originNode = getUpstreamPlannerNode(node);
     if (originNode) {
@@ -258,23 +264,15 @@ function resolveTargetSegmentCount(node) {
         }
     }
 
-    // 2. 读取本节点的 num_segments (单节点独立模式 / 历史工作流兼容)
-    const numSegWidget = node.widgets?.find(w => w.name === "num_segments");
-    if (numSegWidget) {
-        const val = parseInt(numSegWidget.value);
-        if (!isNaN(val) && val >= 1) {
-            return Math.min(20, Math.max(1, val));
-        }
-    }
-
     return 3;
 }
 
 // 动态刷新采样器控件列表 (输入5变5段，输入15变15段)
 function syncSamplerSegmentCount(node, isFirstPass) {
+    const planned = hasSegmentPlan(node);
     const maxSeg = resolveTargetSegmentCount(node);
 
-    // 保留全部合法段号，规则预览不能限制真实输入的分段数量。
+    // 仅保留当前规划的段号及工作流中已选的合法段号。
     const runModeWidget = node.widgets?.find(w => w.name === "run_mode");
     if (runModeWidget) {
         const prefix = isFirstPass ? "仅重抽第" : "仅精修第";
@@ -285,10 +283,16 @@ function syncSamplerSegmentCount(node, isFirstPass) {
             "智能缓存(仅重跑未锁定分段)",
             ...(isFirstPass ? ["整段全量采样(一采不分段)"] : []),
             allAction,
-            ...Array.from({ length: 20 }, (_, i) => `${prefix}${i + 1}段`),
+            ...Array.from({ length: maxSeg }, (_, i) => `${prefix}${i + 1}段`),
             defectAction,
             "自定义指定分段(下方输入)"
         ];
+
+        const savedSegment = Array.from({ length: 20 }, (_, i) => `${prefix}${i + 1}段`)
+            .find(value => value === runModeWidget.value);
+        if (savedSegment && !newOptions.includes(savedSegment)) {
+            newOptions.splice(newOptions.indexOf(defectAction), 0, savedSegment);
+        }
 
         runModeWidget.options = runModeWidget.options || {};
         runModeWidget.options.values = newOptions;
@@ -302,174 +306,52 @@ function syncSamplerSegmentCount(node, isFirstPass) {
 
     // 2. 控制 1~20 控件的动态显隐
     const runMode = String(runModeWidget?.value || "");
-    if (!isFirstPass) toggleWidget(node, runModeWidget, false);
+    const full = !planned || (isFirstPass && runMode.includes("不分段"));
+    toggleWidget(node, runModeWidget, planned);
     const customRerun = node.widgets?.find(w => w.name === "custom_rerun_segments");
     const targetTime = node.widgets?.find(w => w.name === "target_time_second");
 
-    toggleWidget(node, customRerun, runMode.includes("自定义"));
-    toggleWidget(node, targetTime, runMode.includes("缺陷秒数"));
+    toggleWidget(node, customRerun, planned && runMode.includes("自定义"));
+    toggleWidget(node, targetTime, planned && runMode.includes("缺陷秒数"));
 
     // 锁定仅影响智能缓存；种子偏移放入高级设置。
     for (let i = 1; i <= 20; i++) {
         const lockW = node.widgets?.find(w => w.name === `seg${i}_lock`);
         const offsetW = node.widgets?.find(w => w.name === `seg${i}_seed_offset`);
 
-        const inRange = (isFirstPass && runMode.includes("不分段")) ? false : (i <= maxSeg || lockW?.value === true || (isFirstPass && offsetW?.value !== i - 1));
+        const inRange = full ? false : (i <= maxSeg || lockW?.value === true || (isFirstPass && offsetW?.value !== i - 1));
 
         // 预览外已有的设置也需要可见，避免载入工作流后无法修改。
         toggleWidget(node, lockW, inRange && runMode.includes("智能缓存"));
 
         // 一采独立种子偏移：在当前分段数内展示
         if (isFirstPass) {
-            toggleWidget(node, offsetW, (runMode.includes("不分段") ? i === 1 : inRange) && !!node.properties?.pj_advanced_open);
+            toggleWidget(node, offsetW, (full ? i === 1 : inRange) && !!node.properties?.pj_advanced_open);
         }
     }
 
-    const full = isFirstPass && runMode.includes("不分段");
     const boundary = isFirstPass && !!node.widgets.find(w => w.name === "boundary_constraints")?.value;
     toggleWidget(node, node.widgets.find(w => w.name === "boundary_constraints"), isFirstPass && !full);
     for (const name of ["sync_ref_video", "blend_mode", "unload_model_after_sampling"]) {
         toggleWidget(node, node.widgets.find(w => w.name === name),
             !!node.properties?.pj_advanced_open && (name !== "blend_mode" || (!full && !boundary)));
     }
-    updateSamplerGuide(node, isFirstPass);
+    updateSamplerControls(node, isFirstPass);
     autoResizeNode(node);
 }
 
-function secondPassOperation(mode) {
-    if (mode === "全部精修(刷新全部缓存)") return "常规分段采样";
-    if (mode === "智能缓存(仅重跑未锁定分段)") return "按锁定状态采样";
-    return "局部重做";
-}
-
-function samplerGuideText(node, isFirstPass) {
-    const value = name => node.widgets.find(w => w.name === name)?.value;
-    const mode = String(value("run_mode") || "");
-    const full = isFirstPass && mode.includes("不分段");
-    const planner = getUpstreamPlannerNode(node);
-    const planning = planner
-        ? `规划预览约 ${resolveTargetSegmentCount(node)} 段 · 实际按输入长度计算`
-        : "未连接规划器 · 请连接分段规划总线";
-    let action;
-    if (full) action = "整段一次生成，使用第1段种子偏移；不使用分段锁定或重叠过渡。";
-    else if (mode.includes("智能缓存")) action = "未锁定段重新计算；锁定段仅在缓存有效时复用。";
-    else if (!isFirstPass && mode.includes("全部")) action = "按规划逐段采样一次，再融合为完整输出；无需锁定或已有缓存。";
-    else if (mode.includes("全部")) action = "重新计算规划覆盖的所有分段，并更新缓存。";
-    else action = "重做指定段；其他段复用有效缓存，无缓存或缓存失效时仍需计算。";
-    const boundary = isFirstPass && !full && !!value("boundary_constraints");
-    if (boundary) action += " 接缝约束固定已生成或缓存的重叠区；修改重叠内容需将相邻段一起重做。首次开启需重建缓存。";
-    const settings = full ? [] : [boundary ? "接缝约束：开（实验，画质待验证）" : String(value("blend_mode") || "")];
-    if (isFirstPass) {
-        const source = getUpstreamInputNode(node, "latent_image");
-        settings.push(source?.type === "PJ_H3EditPrepare"
-            ? "空间编辑：已连接准备节点，黑色区保留原视频"
-            : "空间编辑：由输入潜空间携带的遮罩决定");
-        settings.push(`参考条件裁剪：${value("sync_ref_video") ? "开" : "关"}`);
-    }
-    settings.push(`完成后卸载：${value("unload_model_after_sampling") ? "开" : "关"}`);
-    return { planning, action, settings: settings.join(" · ") };
-}
-
-function updateSamplerGuide(node, isFirstPass) {
-    // Remove only this extension's old refresh buttons, leaving other extensions intact.
+function updateSamplerControls(node, isFirstPass) {
     node.widgets = node.widgets.filter(w => !(w.type === "button" &&
         /读取规划|刷新分段|总线同步|已刷新|一采当前为整段采样/.test(w.name || "")));
-    let widget = node.widgets.find(w => w.name === "pj_sampler_guide");
-    if (!widget) {
-        const root = document.createElement("div");
-        root.style.cssText = "width:100%;overflow:hidden;";
-        const content = document.createElement("div");
-        content.style.cssText = "box-sizing:border-box;width:100%;padding:10px;border:1px solid #334155;border-radius:8px;background:#0f172a;color:#cbd5e1;font:12px/1.5 sans-serif;display:flex;flex-direction:column;gap:6px;";
-        root.appendChild(content);
-        widget = node.addDOMWidget("pj_sampler_guide", "dashboard", root, {
-            serialize: false, hideOnZoom: false, margin: 0,
-            getMinHeight: () => widget?.pjHeight || 170,
-            getMaxHeight: () => widget?.pjHeight || 170,
-            getHeight: () => widget?.pjHeight || 170,
-        });
-        widget.pjContent = content;
-        widget.pjHeight = 170;
-        widget.computeSize = width => [width, widget.pjHeight];
-        const observer = new ResizeObserver(() => {
-            const height = Math.ceil(content.offsetHeight);
-            if (height > 0 && height !== widget.pjHeight) {
-                widget.pjHeight = height;
-                autoResizeNode(node);
-            }
-        });
-        observer.observe(content);
-        const onRemoved = node.onRemoved;
-        node.onRemoved = function () {
-            observer.disconnect();
-            return onRemoved?.apply(this, arguments);
-        };
-        if (!isFirstPass) {
-            const runMode = node.widgets.find(w => w.name === "run_mode");
-            for (const kind of ["operation", "target"]) {
-                const label = document.createElement("label");
-                label.style.cssText = "display:flex;align-items:center;gap:8px;";
-                label.textContent = kind === "operation" ? "采样任务" : "重做范围";
-                const select = document.createElement("select");
-                select.setAttribute("aria-label", label.textContent);
-                select.dataset.pjSelect = kind;
-                select.style.cssText = "flex:1;min-width:0;padding:5px;border:1px solid #64748b;border-radius:4px;background:#1e293b;color:#f8fafc;font:inherit;";
-                const values = kind === "operation"
-                    ? ["常规分段采样", "局部重做", "按锁定状态采样"]
-                    : ["按缺陷秒数精修 (下方输入秒数)", "自定义指定分段(下方输入)",
-                        ...Array.from({ length: 20 }, (_, i) => `仅精修第${i + 1}段`)];
-                for (const value of values) {
-                    const option = document.createElement("option");
-                    option.value = value;
-                    option.textContent = value.replace("按缺陷秒数精修 (下方输入秒数)", "按时间定位")
-                        .replace("自定义指定分段(下方输入)", "指定多个段号").replace("仅精修", "");
-                    select.appendChild(option);
-                }
-                select.onchange = () => {
-                    runMode.value = kind === "target" ? select.value : {
-                        "常规分段采样": "全部精修(刷新全部缓存)",
-                        "局部重做": "按缺陷秒数精修 (下方输入秒数)",
-                        "按锁定状态采样": "智能缓存(仅重跑未锁定分段)",
-                    }[select.value];
-                    runMode.callback?.call(runMode, runMode.value);
-                    node.setDirtyCanvas?.(true, true);
-                };
-                label.appendChild(select);
-                content.appendChild(label);
-            }
-        }
-        for (const key of ["planning", "output", "action", "settings"]) {
-            const line = document.createElement("div");
-            line.dataset.pjLine = key;
-            content.appendChild(line);
-        }
-        const button = document.createElement("button");
-        button.type = "button";
-        button.style.cssText = "text-align:left;padding:6px 8px;border:1px solid #64748b;border-radius:4px;background:#1e293b;color:#f8fafc;cursor:pointer;font:inherit;";
-        button.onclick = () => {
+    let button = node.widgets.find(w => w.name === "pj_advanced_toggle");
+    if (!button) {
+        button = node.addWidget("button", "pj_advanced_toggle", null, () => {
             node.properties.pj_advanced_open = !node.properties.pj_advanced_open;
             syncSamplerSegmentCount(node, isFirstPass);
             node.setDirtyCanvas?.(true, true);
-        };
-        content.appendChild(button);
+        }, { serialize: false });
     }
-    const text = samplerGuideText(node, isFirstPass);
-    if (!isFirstPass) {
-        const mode = node.widgets.find(w => w.name === "run_mode").value;
-        const operation = secondPassOperation(mode);
-        widget.pjContent.querySelector('[data-pj-select="operation"]').value = operation;
-        const target = widget.pjContent.querySelector('[data-pj-select="target"]');
-        target.parentElement.hidden = operation !== "局部重做";
-        target.parentElement.style.display = operation === "局部重做" ? "flex" : "none";
-        if (operation === "局部重做") target.value = mode;
-    }
-    text.output = "输出保持完整长度 · 局部重做不会导出独立片段";
-    for (const [key, value] of Object.entries(text)) {
-        widget.pjContent.querySelector(`[data-pj-line="${key}"]`).textContent = value;
-    }
-    const button = widget.pjContent.querySelector("button");
-    const open = !!node.properties?.pj_advanced_open;
-    button.textContent = `${open ? "收起" : "展开"}高级设置${isFirstPass ? "（种子偏移 / 参考条件 / 过渡 / 显存）" : "（过渡 / 显存）"}`;
-    button.setAttribute("aria-expanded", String(open));
+    button.label = node.properties?.pj_advanced_open ? "收起高级设置" : "展开高级设置";
 }
 
 // ==========================================

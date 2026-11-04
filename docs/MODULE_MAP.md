@@ -8,8 +8,8 @@
 | 采样支撑 | `segment_sampling.py` | 条件接口适配、噪声、遮罩切片、融合及 `SegmentCache`；只服务本插件 |
 | 编辑准备 | `pj_h3_edit_prepare.py` / `PJ_H3EditPrepare.prepare` | 检查原视频/目标/遮罩对齐；像素MASK按H3时空跨度合并，填入原视频并输出原生AV LATENT/noise_mask；无缓存 |
 | 接缝约束 | `segment_boundaries.py` | 按音视频真实交集复制边界、合并原生遮罩、空间零遮罩优先于缓存边界，恢复固定内容以消除舍入漂移；无持久状态 |
-| 一采 | `pj_first_pass_sampler.py` | 分段重抽决策和采样编排；每实例拥有一份临时磁盘缓存 |
-| 二采 | `pj_segment_sampler.py` | 精修编排、完整结果及去噪结果、音频旁路；每实例拥有一份临时磁盘缓存 |
+| 一采 | `pj_first_pass_sampler.py` | 分段重抽决策和采样编排；规划可选，未接时整段采样；每实例拥有一份临时磁盘缓存 |
+| 二采 | `pj_segment_sampler.py` | 精修编排、完整结果及去噪结果、音频旁路；规划可选，未接时整段采样；每实例拥有一份临时磁盘缓存 |
 | 前端 | `js/pj_segment_sampler.js` | 旧工作流控件迁移、操作说明、按模式显隐、高级设置折叠、播放器与仪表盘尺寸；节点移除时断开尺寸观察器 |
 | 回归检查 | `tests/test_segments.py` | 真实ComfyUI条件/噪声接口配合记录式采样替身；CPU小张量检查，不加载模型权重 |
 | 浏览器检查 | `tests/serve_dashboard.py`、`tests/dashboard.html` | 仅回环地址提供真实前端扩展的DOM布局检查页 |
