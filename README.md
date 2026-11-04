@@ -104,6 +104,6 @@ node --test tests/test_planner_widgets.mjs
 & '..\..\..\python_embeded\python.exe' -s tests/serve_dashboard.py
 ```
 
-打开 `http://127.0.0.1:18765`，依次执行4段、20段、变窄、再次4段，检查页面显示PASS且无需拖动节点。页面下方还可检查二采三个任务切换、新建默认值和旧工作流锁定恢复。此页面使用真实前端扩展与轻量DOM控件宿主，不代替完整ComfyUI画布验证。
+打开 `http://127.0.0.1:18765`，依次执行4段、20段、变窄、再次4段，检查页面显示PASS且无需拖动节点。页面下方可检查一采三种生成方式、规划断开／重接，以及二采默认值和旧工作流锁定恢复。此页面使用真实前端扩展与轻量DOM控件宿主，不代替完整ComfyUI画布验证。
 
 模块入口见 [模块地图](docs/MODULE_MAP.md)，已验证范围与待办见 [开发台账](docs/DEV_LOG.md)。许可证：[MIT](LICENSE)。
