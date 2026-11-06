@@ -5,8 +5,11 @@ import comfy.model_management
 import comfy.nested_tensor
 import latent_preview
 
-from .segment_timing import plan_segments, resolve_plan, segment_seconds
+from .segment_timing import plan_segments, resolve_plan, segment_seconds, zero_overlap, delivery_chunks
 from .segment_boundaries import constrain_boundaries, restore_preserved
+from .segment_revision import RevisionStore, changed_intervals
+from .segment_local_repair import repair_segments
+from .pj_h3_context import prepare_segment_guider
 from .segment_sampling import (SegmentCache, sampling_signature, fingerprint, generate_noise,
                                slice_mask, segment_guider, blend_sequence)
 
@@ -26,23 +29,24 @@ class PJ_SegmentSampler:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "noise": ("NOISE", {"tooltip": "随机噪声源 (连接 RandomNoise 节点)"}),
-                "guider": ("GUIDER", {"tooltip": "引导器 (连接 BasicGuider 节点)"}),
-                "sampler": ("SAMPLER", {"tooltip": "采样算法 (推荐 er_sde 或 euler)"}),
-                "sigmas": ("SIGMAS", {"tooltip": "调度器步长 (二采高清精修，通常 2~3 步)"}),
-                "latent_image": ("LATENT", {"tooltip": "输入待精修的高清潜空间 (来自 3D 潜空间超分放大后的 AV Latent)"}),
+                "noise": ("NOISE", {"lazy": True, "tooltip": "随机噪声源 (连接 RandomNoise 节点)"}),
+                "guider": ("GUIDER", {"lazy": True, "tooltip": "引导器 (连接 BasicGuider 节点)"}),
+                "sampler": ("SAMPLER", {"lazy": True, "tooltip": "采样算法 (推荐 er_sde 或 euler)"}),
+                "sigmas": ("SIGMAS", {"lazy": True, "tooltip": "调度器步长 (二采高清精修，通常 2~3 步)"}),
+                "latent_image": ("LATENT", {"lazy": True, "tooltip": "输入待精修的高清潜空间 (来自 3D 潜空间超分放大后的 AV Latent)"}),
             },
             "optional": {
                 "segment_plan": (
                     "PJ_SEGMENT_PLAN",
                     {
+                        "lazy": True,
                         "tooltip": "可选；连接时按规划分段，未连接时按输入完整长度采样",
                     },
                 ),
                 "run_mode": (
                     ["智能缓存(仅重跑未锁定分段)", "全部精修(刷新全部缓存)"]
                     + [f"仅精修第{i}段" for i in range(1, 21)]
-                    + ["按缺陷秒数精修 (下方输入秒数)", "自定义指定分段(下方输入)"],
+                    + ["按缺陷秒数精修 (下方输入秒数)", "自定义指定分段(下方输入)", "全部目标段"],
                     {
                         "default": "智能缓存(仅重跑未锁定分段)",
                         "tooltip": "从选定段开始重采并重建后续段；前面的有效缓存可复用，后续锁定不能阻止接缝更新",
@@ -108,6 +112,11 @@ class PJ_SegmentSampler:
                         "tooltip": "采样完成后请求ComfyUI卸载模型；VAE解码仍受分辨率、切块和可用显存影响",
                     },
                 ),
+                "refine_action": (["常规精修", "仅重做目标段", "更新一采变更", "复用高清结果"], {"default": "常规精修"}),
+                "source_result": ("LATENT", {"lazy": True, "tooltip": "可选：直接连接放大前的一采结果，用于读取累计修改区间；不依赖放大器透传版本信息"}),
+                "refine_request_id": ("INT", {"default": 0, "min": 0, "max": 0xFFFFFFFF, "tooltip": "同一种子再次重做时增加此值；相同请求复用已完成结果"}),
+                "repair_boundary_tokens": ("INT", {"default": 2, "min": 0, "max": 72, "tooltip": "仅目标段重做时，保留两端的视频潜步数；不是视频帧数"}),
+                "h3_context": ("PJ_H3_CONTEXT", {"lazy": True}),
             },
         }
 
@@ -118,6 +127,22 @@ class PJ_SegmentSampler:
 
     def __init__(self):
         self._cache = SegmentCache()
+        self._results = RevisionStore()
+        self._source_stamp = None
+
+    def check_lazy_status(self, refine_action="常规精修", **inputs):
+        if refine_action == "复用高清结果":
+            return []
+        if "source_result" in inputs and inputs["source_result"] is None:
+            return ["source_result"]
+        source = inputs.get("source_result")
+        revision = source.get("pj_revision") if source is not None else None
+        stamp = {"lineage": revision["lineage"], "version": revision["version"]} if revision else None
+        if (refine_action == "更新一采变更" and stamp is not None and stamp == self._source_stamp
+                and self._results.available()):
+            return []
+        return [name for name in ("noise", "guider", "sampler", "sigmas", "latent_image", "h3_context", "segment_plan")
+                if (name not in ("h3_context", "segment_plan") or name in inputs) and inputs.get(name) is None]
 
     def plan_segments(self, total_v, total_a, split_mode, chunk_seconds, overlap_seconds,
                       num_segments, custom_cuts, fps, align_51_frames=False):
@@ -153,8 +178,27 @@ class PJ_SegmentSampler:
         keep_original_audio=True,
         unload_model_after_sampling=True,
         fps=24.0,
+        refine_action="常规精修",
+        source_result=None,
+        refine_request_id=0,
+        repair_boundary_tokens=2,
+        h3_context=None,
         **kwargs,
     ):
+
+        if refine_action == "复用高清结果":
+            saved = self._results.load()
+            if saved is None:
+                raise ValueError("没有已完成的高清结果，请先完成一次二采")
+            return saved
+        if refine_action == "更新一采变更" and source_result is not None:
+            revision = source_result.get("pj_revision")
+            stamp = {"lineage": revision["lineage"], "version": revision["version"]} if revision else None
+            self._validate_source_version(stamp)
+            if stamp is not None and stamp == self._source_stamp:
+                saved = self._results.load()
+                if saved is not None:
+                    return saved
 
         # Compatibility fallbacks
         if isinstance(run_mode, bool) or str(run_mode).lower() in ("true", "false"):
@@ -192,8 +236,31 @@ class PJ_SegmentSampler:
             full_length=segment_plan is None or "不分段" in str(run_mode) or "全量采样" in str(run_mode),
         )
         n_chunks = len(chunks)
+        deliveries = delivery_chunks(chunks, segment_plan)
+        source = source_result if source_result is not None else latent_image
+        source_samples = source["samples"]
+        source_video = source_samples.unbind()[0] if source_samples.is_nested else source_samples
+        if source_video.shape[2] != total_v:
+            raise ValueError("一采版本输入与高清输入的时间长度不一致；局部更新要求放大器保持时间长度")
+        source_revision = source.get("pj_revision")
+        source_stamp = ({"lineage": source_revision["lineage"], "version": source_revision["version"]}
+                        if source_revision else None)
+        if refine_action in ("仅重做目标段", "更新一采变更"):
+            self._validate_source_version(source_stamp)
+        if refine_action in ("仅重做目标段", "更新一采变更"):
+            saved = self._results.load()
+            if saved is not None:
+                return self._repair(noise, guider, sampler, sigmas, latent_image, chunks, fps,
+                                    saved, source_revision, source_stamp, refine_action, run_mode,
+                                    target_time_second, custom_rerun_segments, refine_request_id,
+                                    repair_boundary_tokens, keep_original_audio, unload_model_after_sampling,
+                                    h3_context, deliveries)
+            if refine_action == "仅重做目标段":
+                raise ValueError("没有已完成的高清结果，不能局部替换；请先完成一次二采")
+            if source_revision is None:
+                raise ValueError("更新一采变更需要连接带版本信息的一采结果到 source_result")
         self._cache.retain(n_chunks)
-        context_signature = sampling_signature(guider, sampler, sigmas)
+        context_signature = fingerprint((sampling_signature(guider, sampler, sigmas), h3_context))
 
         print("\n" + "=" * 65)
         print(f"[PJ二采分段采样器] 输入潜空间总计: {total_v} 视频步 (~{segment_seconds(0, total_v, fps)[1]:.2f}s), 音频: {total_a} 步")
@@ -241,7 +308,7 @@ class PJ_SegmentSampler:
                 chunk_latent_samples = chunk_v
             bounds = (v_start, v_end, a_start, a_end)
             chunk_mask = slice_mask(latent_image.get("noise_mask"), bounds)
-            cache_signature = fingerprint(("refine-boundaries-v1", context_signature, bounds, chunk_latent_samples,
+            cache_signature = fingerprint(("refine-boundaries-v2", context_signature, bounds, deliveries[idx], zero_overlap(segment_plan), chunk_latent_samples,
                                            chunk_mask, latent_image.get("batch_index"), type(noise),
                                            {k: v for k, v in vars(noise).items() if k != "seed"} if noise is not None else None))
             cache_valid = self._cache.entries.get(idx) == cache_signature
@@ -280,7 +347,7 @@ class PJ_SegmentSampler:
             sources = [(chunks[i], value.unbind()[0] if is_nested else value)
                        for i, value in enumerate(sampled_chunks)
                        if max(v_start, chunks[i][0]) < min(v_end, chunks[i][1])]
-            if sources:
+            if sources and not zero_overlap(segment_plan):
                 video_mask = chunk_mask.unbind()[0] if chunk_mask is not None and chunk_mask.is_nested else chunk_mask
                 chunk_v, video_mask = constrain_boundaries(chunk_v, video_mask, bounds, sources)
                 if is_nested:
@@ -307,7 +374,8 @@ class PJ_SegmentSampler:
             else:
                 chunk_noise = segment_noise[:, :, v_start:v_end].clone()
             del segment_noise
-            chunk_guider = segment_guider(guider, bounds, True)
+            chunk_guider = (prepare_segment_guider(guider, h3_context, bounds, chunk_v.shape, segment_index=idx)
+                            if h3_context is not None else segment_guider(guider, bounds, True))
 
             chunk_x0_output = {}
             chunk_callback = latent_preview.prepare_callback(
@@ -354,6 +422,8 @@ class PJ_SegmentSampler:
         print("\n[PJ二采分段采样器] 视频重叠区保留前段结果，按完整时间线拼接")
         video_intervals = [(c[0], c[1]) for c in chunks]
         audio_intervals = [(c[2], c[3]) for c in chunks]
+        delivered_video = [c[:2] for c in deliveries]
+        delivered_audio = [c[2:] for c in deliveries]
 
         chunk_videos = []
         chunk_audios = []
@@ -367,7 +437,7 @@ class PJ_SegmentSampler:
                 chunk_videos.append(c)
 
         blended_video = blend_sequence(
-            chunk_videos, video_intervals, full_video, "保留边界"
+            chunk_videos, video_intervals, full_video, "保留边界", delivery_intervals=delivered_video
         )
 
         if keep_original_audio and orig_audio_for_bypass is not None:
@@ -375,7 +445,7 @@ class PJ_SegmentSampler:
             blended_audio = orig_audio_for_bypass
         elif chunk_audios and total_a > 0:
             blended_audio = blend_sequence(
-                chunk_audios, audio_intervals, full_audio, norm_blend, is_audio=True
+                chunk_audios, audio_intervals, full_audio, norm_blend, is_audio=True, delivery_intervals=delivered_audio
             )
         else:
             blended_audio = None
@@ -403,11 +473,11 @@ class PJ_SegmentSampler:
                     if chunk_audios:
                         valid_x0_audios.append(chunk_audios[i])
             blended_x0_video = blend_sequence(
-                valid_x0_videos, video_intervals, full_video, "保留边界"
+                valid_x0_videos, video_intervals, full_video, "保留边界", delivery_intervals=delivered_video
             )
             if blended_audio is not None:
                 denoised_audio = blended_audio if keep_original_audio else blend_sequence(
-                    valid_x0_audios, audio_intervals, full_audio, norm_blend, is_audio=True
+                    valid_x0_audios, audio_intervals, full_audio, norm_blend, is_audio=True, delivery_intervals=delivered_audio
                 )
                 result_denoised = comfy.nested_tensor.NestedTensor((blended_x0_video, denoised_audio))
             else:
@@ -421,7 +491,80 @@ class PJ_SegmentSampler:
         print("[PJ二采分段采样器] 全部多段二采精修完成！准备输出结果。\n" + "=" * 65)
 
         out_denoised = dict(latent_image, samples=result_denoised if result_denoised is not None else result_samples)
-        return (dict(latent_image, samples=result_samples), out_denoised)
+        output = dict(latent_image, samples=result_samples, pj_refine_source=source_stamp)
+        out_denoised["pj_refine_source"] = source_stamp
+        result = self._results.commit(output, out_denoised, changes=[(0, total_v)],
+                                      audio_changes=[] if keep_original_audio else [(0, total_a)],
+                                      fps=fps, reset=True)
+        self._source_stamp = source_stamp
+        return result
+
+    def _validate_source_version(self, stamp):
+        if (stamp is not None and self._source_stamp is not None
+                and stamp["lineage"] == self._source_stamp["lineage"]
+                and stamp["version"] < self._source_stamp["version"]):
+            raise ValueError("一采版本已过期，不能用旧版本覆盖当前高清结果；请连接最新一采结果")
+
+    def _repair(self, noise, guider, sampler, sigmas, initial, chunks, fps, saved,
+                source_revision, source_stamp, action, run_mode, target_time,
+                custom_targets, request_id, boundary_tokens, keep_audio, unload, h3_context=None, deliveries=None):
+        baseline, previous_x0 = saved
+        deliveries = chunks if deliveries is None else deliveries
+        editable = None
+        audio_changes = []
+        if action == "更新一采变更":
+            if source_revision is None:
+                raise ValueError("更新一采变更需要连接带版本信息的一采结果到 source_result")
+            editable = changed_intervals(source_revision, baseline.get("pj_refine_source"))
+            audio_changes = changed_intervals(source_revision, baseline.get("pj_refine_source"), "audio")
+            if not editable and not audio_changes:
+                return saved
+            targets = [i for i, (start, end, _, _) in enumerate(deliveries)
+                       if any(max(start, left) < min(end, right) for left, right in editable)]
+        elif "缺陷秒数" in run_mode:
+            targets = [i for i, (start, end, _, _) in enumerate(deliveries)
+                       if segment_seconds(start, end, fps)[0] <= target_time < segment_seconds(start, end, fps)[1]][:1]
+        elif run_mode.startswith("仅精修第"):
+            targets = [int(run_mode.removeprefix("仅精修第").removesuffix("段")) - 1]
+        elif "自定义" in run_mode:
+            targets = [int(value.strip()) - 1 for value in custom_targets.split(",") if value.strip()]
+        else:
+            targets = list(range(len(chunks)))
+        seed = getattr(noise, "seed", 0)
+        request = fingerprint((action, request_id, source_stamp, targets, editable, seed,
+                               sampling_signature(guider, sampler, sigmas), initial, boundary_tokens, keep_audio,
+                               type(noise), vars(noise), h3_context, deliveries))
+        if self._results.check_request(request):
+            return saved
+        if targets:
+            output, denoised, changed = repair_segments(
+                noise, guider, sampler, sigmas, baseline, chunks, targets, seed,
+                offsets=[0] * len(chunks), boundary_tokens=boundary_tokens,
+                keep_audio=keep_audio, initial_latent=initial, editable_ranges=editable,
+                denoised_baseline=previous_x0, h3_context=h3_context, delivery_bounds=deliveries)
+        else:
+            output, denoised, changed = dict(baseline), dict(previous_x0), []
+        if audio_changes:
+            if not keep_audio:
+                raise ValueError("一采变更联动当前仅重绘视频，请开启保留输入音频以同步新的音轨")
+            incoming = initial["samples"].unbind()
+            audio = incoming[1].to(device="cpu", copy=True)
+            for value in (output, denoised):
+                value["samples"] = comfy.nested_tensor.NestedTensor((value["samples"].unbind()[0], audio))
+        if not changed and not audio_changes:
+            return saved
+        # Explicit local refinement may leave earlier source changes pending.
+        stamp = source_stamp if action == "更新一采变更" else baseline.get("pj_refine_source")
+        output["pj_refine_source"] = stamp
+        denoised["pj_refine_source"] = stamp
+        result = self._results.commit(output, denoised, changes=changed, audio_changes=audio_changes,
+                                      fps=fps, request_key=request)
+        self._source_stamp = stamp
+        self._cache.retain(0)
+        if unload:
+            comfy.model_management.unload_all_models()
+            comfy.model_management.soft_empty_cache()
+        return result
 
 
 PJSegmentSampler = PJ_SegmentSampler

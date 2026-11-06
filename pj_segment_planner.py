@@ -14,7 +14,8 @@ import torch
 
 import folder_paths
 
-from .segment_timing import FPS, frames_for_tokens, tokens_for_frames, plan_segments, plan_relay_segments, segment_seconds
+from .segment_timing import (FPS, frames_for_tokens, tokens_for_frames_floor, plan_segments, plan_relay_segments,
+                             segment_seconds, zero_overlap, delivery_chunks)
 
 try:
     import soundfile as sf
@@ -165,7 +166,7 @@ class PJ_SegmentPlanner:
                         "min": 0.0,
                         "max": 10.0,
                         "step": 0.25,
-                        "tooltip": "目标参考重叠；后端按实际段长选择最近的合法重叠，不保证精确等于输入秒数",
+                        "tooltip": "0 不继承重叠画面，合法采样所需的右侧填充会裁掉；正值就近匹配H3合法重叠。自定义区间以切点为准",
                     },
                 ),
                 "num_segments": (
@@ -243,16 +244,24 @@ class PJ_SegmentPlanner:
             if len(streams) > 1:
                 total_a = streams[1].shape[-1]
             mode_desc = "直连潜空间"
+            length_policy = "existing_latent"
+            length_note = "已有潜空间保留实际总长度。"
         else:
             source_frames = images.shape[0] * FPS / source_fps if images is not None else round(15 * FPS)
-            total_v = tokens_for_frames(source_frames)
+            total_v = tokens_for_frames_floor(source_frames)
             mode_desc = "直连视频图像（H3 帧网格预览）" if images is not None else "规则待命模式"
+            length_policy = "floor_h3"
+            length_note = ("输入不足5帧，预览使用H3最小5帧窗口。" if source_frames < 5 else
+                           "总长度向下取整到H3合法帧数。")
         total_frames = frames_for_tokens(total_v)
         effective_seconds = total_frames / fps
         if total_a is None:
             total_a = round(effective_seconds * 40)
         chunks = plan_segments(total_v, total_a, split_mode, chunk_seconds, overlap_seconds,
                                num_segments, custom_cuts, fps, align_51_frames)
+        rules = {"split_mode": split_mode, "overlap_seconds": overlap_seconds}
+        delivered = delivery_chunks(chunks, rules)
+        no_overlap = zero_overlap(rules)
 
         n_chunks = len(chunks)
         relay_n_chunks = len(plan_relay_segments(total_v, total_a, chunk_seconds))
@@ -271,19 +280,25 @@ class PJ_SegmentPlanner:
 
         summary_lines.append(f"• 规划模式: {split_mode} | 总计切分: {n_chunks} 个分段 | FPS: {fps}")
         timing_note = "秒数仅供参考；后端就近匹配H3合法帧数，实际结果以下方明细为准。"
+        timing_note += " " + length_note
+        if no_overlap:
+            timing_note += " 零重叠：合法采样窗口的右侧填充将裁掉，不继承前段画面。"
         summary_lines.append(f"• {timing_note}")
         summary_lines.append("--------------------------------------------------")
 
         for i, (vs, ve, as_, ae) in enumerate(chunks):
-            s_sec, e_sec = segment_seconds(vs, ve, fps)
+            delivery_vs, delivery_ve, delivery_as, delivery_ae = delivered[i]
+            s_sec, e_sec = segment_seconds(delivery_vs, delivery_ve, fps)
             s_frame = int(round(s_sec * fps))
             e_frame = min(total_frames, int(round(e_sec * fps)))
             dur_sec = round((e_frame - s_frame) / fps, 2)
-            overlap_frames = max(0, min(e_frame, frames_for_tokens(chunks[i - 1][1])) - s_frame) if i else 0
+            overlap_frames = max(0, min(e_frame, frames_for_tokens(delivered[i - 1][1])) - s_frame) if i else 0
             overlap_sec = round(overlap_frames / fps, 3)
+            padding_frames = frames_for_tokens(ve) - frames_for_tokens(delivery_ve)
             summary_lines.append(
-                f"  段 {i + 1:02d}: [{s_sec:5.2f}s ~ {e_sec:5.2f}s] ({dur_sec}s, 帧 {s_frame}~{e_frame}) (步 {vs}:{ve})"
+                f"  段 {i + 1:02d}: [{s_sec:5.2f}s ~ {e_sec:5.2f}s] ({dur_sec}s, 帧 {s_frame}~{e_frame}) (交付步 {delivery_vs}:{delivery_ve})"
                 + (f" | 与前段重叠 {overlap_sec:.3f}s / {overlap_frames}帧" if i else "")
+                + (f" | 采样右填充 {padding_frames}帧（裁除）" if padding_frames else "")
             )
             chunks_sec_info.append({
                 "segment": i + 1,
@@ -298,6 +313,13 @@ class PJ_SegmentPlanner:
                 "ve": ve,
                 "as": as_,
                 "ae": ae,
+                "delivery_vs": delivery_vs,
+                "delivery_ve": delivery_ve,
+                "delivery_as": delivery_as,
+                "delivery_ae": delivery_ae,
+                "sample_start_frame": frames_for_tokens(vs),
+                "sample_end_frame": frames_for_tokens(ve),
+                "padding_frames": padding_frames,
             })
         summary_text = "\n".join(summary_lines)
 
@@ -311,6 +333,8 @@ class PJ_SegmentPlanner:
         plan_dict = {
             "has_media": has_media,
             "chunks": chunks,
+            "delivery_chunks": delivered,
+            "zero_overlap": no_overlap,
             "chunks_sec_info": chunks_sec_info,
             "n_chunks": n_chunks,
             "relay_n_chunks": relay_n_chunks,
@@ -325,6 +349,7 @@ class PJ_SegmentPlanner:
             "custom_cuts": custom_cuts,
             "align_51_frames": False,
             "timing_policy": "nearest_h3",
+            "length_policy": length_policy,
             "fps": fps,
             "summary": summary_text,
             "has_video": video_filename is not None,
@@ -342,9 +367,11 @@ class PJ_SegmentPlanner:
                 "n_chunks": n_chunks,
                 "relay_n_chunks": relay_n_chunks,
                 "chunks": chunks_sec_info,
+                "zero_overlap": no_overlap,
                 "summary": summary_text,
                 "mode_desc": mode_desc,
                 "timing_policy": "nearest_h3",
+                "length_policy": length_policy,
                 "timing_note": timing_note,
             }]
         }

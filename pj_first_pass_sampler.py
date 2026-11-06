@@ -3,11 +3,16 @@ import torch
 import comfy.utils
 import comfy.model_management
 import comfy.nested_tensor
+import comfy.samplers
 import latent_preview
 
 from .segment_boundaries import constrain_boundaries, restore_preserved
-from .segment_timing import plan_segments, plan_relay_segments, resolve_plan, segment_seconds
+from .segment_timing import (plan_segments, plan_relay_segments, resolve_plan, segment_seconds,
+                            zero_overlap, delivery_chunks)
 from .segment_relay import sample_relay
+from .pj_h3_context import prepare_segment_guider
+from .segment_local_repair import repair_segments, repair_sigmas, slice_latent
+from .segment_revision import RevisionStore
 from .segment_sampling import (SegmentCache, sampling_signature, fingerprint, generate_noise,
                                slice_mask, segment_guider, blend_sequence)
 
@@ -26,17 +31,18 @@ class PJ_FirstPass_SegmentSampler:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "noise": ("NOISE", {"tooltip": "基础噪声源 (可连接 RandomNoise 节点)"}),
-                "guider": ("GUIDER", {"tooltip": "引导器 (连接 BasicGuider，内含模型与提示词/参考条件)"}),
-                "sampler": ("SAMPLER", {"tooltip": "采样算法 (推荐 er_sde 或 euler)"}),
-                "sigmas": ("SIGMAS", {"tooltip": "调度器步长 (通常为一采全降噪，如 6 步)"}),
-                "latent_image": ("LATENT", {"tooltip": "目标潜空间，可接H3空音视频潜空间或PJ编辑区域准备的输出"}),
+                "noise": ("NOISE", {"tooltip": "基础噪声源 (可连接 RandomNoise 节点)", "lazy": True}),
+                "guider": ("GUIDER", {"tooltip": "引导器 (连接 BasicGuider，内含模型与提示词/参考条件)", "lazy": True}),
+                "sampler": ("SAMPLER", {"tooltip": "采样算法 (推荐 er_sde 或 euler)", "lazy": True}),
+                "sigmas": ("SIGMAS", {"tooltip": "调度器步长 (通常为一采全降噪，如 6 步)", "lazy": True}),
+                "latent_image": ("LATENT", {"tooltip": "目标潜空间，可接H3空音视频潜空间或PJ编辑区域准备的输出", "lazy": True}),
             },
             "optional": {
                 "segment_plan": (
                     "PJ_SEGMENT_PLAN",
                     {
                         "tooltip": "可选；连接时按规划分段，未连接时按输入完整长度采样",
+                        "lazy": True,
                     },
                 ),
                 "sync_ref_video": (
@@ -51,7 +57,7 @@ class PJ_FirstPass_SegmentSampler:
                 "run_mode": (
                     ["智能缓存(仅重跑未锁定分段)", "整段全量采样(一采不分段)", "全部重新采样(刷新全部缓存)"]
                     + [f"仅重抽第{i}段" for i in range(1, 21)]
-                    + ["按缺陷秒数重抽 (下方输入秒数)", "自定义指定分段(下方输入)"],
+                    + ["按缺陷秒数重抽 (下方输入秒数)", "自定义指定分段(下方输入)", "全部目标段"],
                     {
                         "default": "智能缓存(仅重跑未锁定分段)",
                         "tooltip": "【重抽控制台】哪段一采不满意直接选该段单独重抽；若选【整段全量采样(一采不分段)】则一采一口气整段生成！",
@@ -151,6 +157,16 @@ class PJ_FirstPass_SegmentSampler:
                     "default": 1, "min": 1, "max": 100000, "step": 1,
                     "tooltip": "重做该段及之后所有段；前段缓存失效或缺失时从更早处开始。修改对应种子偏移可得到不同结果。",
                 }),
+                "repair_action": (["原采样方式", "载入回修基准", "仅重绘目标段", "复用一采结果"], {"default": "原采样方式"}),
+                "repair_denoise": ("FLOAT", {"default": 0.4, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "repair_scheduler": (comfy.samplers.SCHEDULER_NAMES, {"default": "simple"}),
+                "repair_steps": ("INT", {"default": 6, "min": 1, "max": 10000}),
+                "repair_boundary_tokens": ("INT", {"default": 2, "min": 0, "max": 1000,
+                    "tooltip": "局部重绘两端保留的视频潜步数；不是解码后的画面帧数"}),
+                "repair_request_id": ("INT", {"default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF,
+                    "tooltip": "相同请求复用已完成结果；增加此值可用相同种子再重绘一次"}),
+                "repair_baseline": ("LATENT", {"tooltip": "可选：接官方采样器等已有完整结果，作为首次回修基准", "lazy": True}),
+                "h3_context": ("PJ_H3_CONTEXT", {"tooltip": "可选：按段重建 H3 提示词、参考素材与运动引导", "lazy": True}),
             },
         }
 
@@ -161,6 +177,80 @@ class PJ_FirstPass_SegmentSampler:
 
     def __init__(self):
         self._cache = SegmentCache()
+        self._revisions = RevisionStore()
+        self._baseline_key = None
+
+    def check_lazy_status(self, repair_action="原采样方式", **kwargs):
+        if repair_action == "原采样方式":
+            required = ["noise", "guider", "sampler", "sigmas", "latent_image", "segment_plan", "h3_context"]
+        elif repair_action == "载入回修基准":
+            required = ["repair_baseline"]
+        else:
+            required = ["noise", "guider", "sampler", "segment_plan", "h3_context"] if repair_action == "仅重绘目标段" and kwargs.get("repair_denoise", 0.4) > 0 else []
+            if not self._revisions.available():
+                required.append("repair_baseline")
+        return [name for name in required if name in kwargs and kwargs[name] is None]
+
+    def _commit_generation(self, outputs, fps):
+        samples = outputs[0]["samples"]
+        streams = samples.unbind() if samples.is_nested else [samples]
+        committed = self._revisions.commit(outputs[0], outputs[1], changes=[(0, streams[0].shape[2])],
+                                           audio_changes=[(0, streams[1].shape[-1])] if len(streams) > 1 else [],
+                                           fps=fps, reset=True)
+        self._baseline_key = None
+        return committed
+
+    def _repair(self, noise, guider, sampler, latent_image, segment_plan, run_mode,
+                target_time_second, custom_rerun_segments, base_seed, generation_mode,
+                sync_ref_video, repair_action, repair_denoise, repair_scheduler, repair_steps,
+                repair_boundary_tokens, repair_request_id, repair_baseline, fps, kwargs, h3_context):
+        saved = self._revisions.load()
+        if repair_action == "载入回修基准" and repair_baseline is None:
+            raise ValueError("载入回修基准需要连接已有完整潜空间")
+        if repair_baseline is not None and (saved is None or repair_action == "载入回修基准"):
+            baseline_key = fingerprint(repair_baseline)
+            saved = self._commit_generation((repair_baseline, None), fps)
+            self._baseline_key = baseline_key
+        if saved is None:
+            raise ValueError("没有已成功的一采结果；请先完成一次采样，或连接已有完整潜空间到回修基准")
+        baseline = saved[0]
+        if repair_action in ("载入回修基准", "复用一采结果") or repair_denoise <= 0:
+            return baseline, saved[1] if saved[1] is not None else dict(baseline)
+        samples = baseline["samples"]
+        streams = samples.unbind() if samples.is_nested else [samples]
+        if generation_mode == "22帧接力" and segment_plan is not None:
+            chunks = plan_relay_segments(streams[0].shape[2], streams[1].shape[-1] if len(streams) > 1 else 0,
+                                         segment_plan.get("chunk_seconds", 6.0))
+            deliveries = chunks
+        else:
+            chunks, fps = resolve_plan(samples, segment_plan, "按秒自动切分", 6.0, 1.5,
+                                       3, "0-6,4.5-10.5,9-15", fps, False,
+                                       full_length=segment_plan is None)
+            deliveries = delivery_chunks(chunks, segment_plan)
+        if "缺陷秒数" in str(run_mode):
+            targets = [i for i, bounds in enumerate(deliveries)
+                       if segment_seconds(*bounds[:2], fps)[0] <= target_time_second < segment_seconds(*bounds[:2], fps)[1]][:1]
+        elif str(run_mode).startswith("仅重抽第"):
+            targets = [int(run_mode.replace("仅重抽第", "").replace("段", "").strip()) - 1]
+        elif "自定义" in str(run_mode):
+            targets = [int(value.strip()) - 1 for value in str(custom_rerun_segments).split(",") if value.strip()]
+        else:
+            targets = list(range(len(chunks)))
+        seed = getattr(noise, "seed", base_seed)
+        if not isinstance(seed, int):
+            seed = base_seed
+        offsets = [int(kwargs.get(f"seg{i}_seed_offset", i - 1)) for i in range(1, 21)]
+        sigmas = repair_sigmas(guider, repair_scheduler, repair_steps, repair_denoise)
+        request_key = fingerprint((sampling_signature(guider, sampler, sigmas), targets, chunks, deliveries, seed,
+                                   offsets, repair_boundary_tokens, repair_request_id, sync_ref_video,
+                                   self._baseline_key, type(noise), vars(noise) if noise is not None else None, h3_context))
+        if self._revisions.check_request(request_key):
+            return baseline, slice_latent(baseline, chunks[0])
+        output, _, changes = repair_segments(noise, guider, sampler, sigmas, baseline, chunks,
+                                                targets, seed, offsets, repair_boundary_tokens,
+                                                sync_ref_video, h3_context=h3_context, delivery_bounds=deliveries)
+        return self._revisions.commit(output, slice_latent(output, chunks[0]), changes=changes,
+                                      fps=fps, request_key=request_key)
 
     def plan_segments(self, total_v, total_a, split_mode, chunk_seconds, overlap_seconds,
                       num_segments, custom_cuts, fps, align_51_frames=False):
@@ -193,9 +283,25 @@ class PJ_FirstPass_SegmentSampler:
         generation_mode="分段编辑",
         relay_action="全部生成",
         relay_start_segment=1,
+        repair_action="原采样方式",
+        repair_denoise=0.4,
+        repair_scheduler="simple",
+        repair_steps=6,
+        repair_boundary_tokens=2,
+        repair_request_id=0,
+        repair_baseline=None,
+        h3_context=None,
         **kwargs,
     ):
-
+        if repair_action != "原采样方式":
+            result = self._repair(noise, guider, sampler, latent_image, segment_plan, run_mode,
+                                  target_time_second, custom_rerun_segments, base_seed, generation_mode,
+                                  sync_ref_video, repair_action, repair_denoise, repair_scheduler, repair_steps,
+                                  repair_boundary_tokens, repair_request_id, repair_baseline, fps, kwargs, h3_context)
+            if unload_model_after_sampling:
+                comfy.model_management.unload_all_models()
+                comfy.model_management.soft_empty_cache()
+            return result
         if generation_mode == "整段采样" or segment_plan is None:
             run_mode = "整段全量采样(一采不分段)"
 
@@ -228,11 +334,11 @@ class PJ_FirstPass_SegmentSampler:
             offsets = [int(kwargs.get(f"seg{i}_seed_offset", i - 1)) for i in range(1, 21)]
             start_segment = max(1, int(relay_start_segment)) if relay_action == "从指定段重做" else 1
             result = sample_relay(noise, guider, sampler, sigmas, latent_image, chunks, self._cache,
-                                  seed, offsets, start_segment, sync_ref_video)
+                                  seed, offsets, start_segment, sync_ref_video, h3_context=h3_context)
             if unload_model_after_sampling:
                 comfy.model_management.unload_all_models()
                 comfy.model_management.soft_empty_cache()
-            return result
+            return self._commit_generation(result, fps)
 
         chunks, fps = resolve_plan(
             latent, segment_plan, split_mode, chunk_seconds, overlap_seconds,
@@ -240,9 +346,15 @@ class PJ_FirstPass_SegmentSampler:
             full_length=segment_plan is None or generation_mode == "整段采样" or "不分段" in str(run_mode) or "全量采样" in str(run_mode),
         )
         n_chunks = len(chunks)
-        constrain = boundary_constraints and n_chunks > 1
+        no_overlap = zero_overlap(segment_plan)
+        deliveries = delivery_chunks(chunks, segment_plan)
+        constrain = boundary_constraints and n_chunks > 1 and not no_overlap
         self._cache.retain(n_chunks)
         context_signature = sampling_signature(guider, sampler, sigmas)
+        if h3_context is not None:
+            context_signature = fingerprint((context_signature, h3_context))
+        if no_overlap:
+            context_signature = fingerprint((context_signature, "delivery-v1", deliveries))
         if constrain:
             context_signature = fingerprint((context_signature, "boundaries-v2", chunks, latent_image))
 
@@ -265,7 +377,7 @@ class PJ_FirstPass_SegmentSampler:
         # 计算目标缺陷秒数所属的分段编号 (如果处于缺陷秒数重抽模式)
         target_defect_seg = None
         if "缺陷秒数" in str(run_mode):
-            for seg_i, (vs, ve, as_, ae) in enumerate(chunks):
+            for seg_i, (vs, ve, as_, ae) in enumerate(deliveries):
                 s_sec, e_sec = segment_seconds(vs, ve, fps)
                 if s_sec <= target_time_second < e_sec:
                     target_defect_seg = seg_i + 1
@@ -300,6 +412,18 @@ class PJ_FirstPass_SegmentSampler:
                 should_resample = not (locks[idx] if idx < len(locks) else False)
             cached = self._cache.load(idx, signature) if not should_resample else None
             retained.append(cached[0] if cached is not None else None)
+
+        if h3_context is not None and h3_context["motion_context"] and not no_overlap:
+            for idx in range(1, n_chunks):
+                start, end = chunks[idx][:2]
+                previous_start, previous_end = chunks[idx - 1][:2]
+                overlap = min(end, previous_end) - start
+                if (previous_start <= start < previous_end and start % 5 == 0 and overlap % 5 == 2
+                        and retained[idx - 1] is None):
+                    retained[idx] = None
+            for idx, value in enumerate(retained):
+                if value is None:
+                    self._cache.entries.pop(idx, None)
 
         # Invalidate before work: an interrupted boundary rebuild must not expose a mixed generation.
         rebuilding = constrain and any(value is None for value in retained)
@@ -345,7 +469,19 @@ class PJ_FirstPass_SegmentSampler:
             else:
                 chunk_noise = segment_noise[:, :, v_start:v_end].clone()
             del segment_noise
-            chunk_guider = segment_guider(guider, bounds, sync_ref_video)
+            if h3_context is None:
+                chunk_guider = segment_guider(guider, bounds, sync_ref_video)
+            else:
+                previous_tail = None
+                if sampled_chunks and not no_overlap:
+                    previous_start, previous_end = chunks[idx - 1][:2]
+                    overlap = min(v_end, previous_end) - v_start
+                    if previous_start <= v_start < previous_end and v_start % 5 == 0 and overlap % 5 == 2:
+                        previous_video = sampled_chunks[-1].unbind()[0] if is_nested else sampled_chunks[-1]
+                        offset = v_start - previous_start
+                        previous_tail = previous_video[:, :, offset:offset + overlap]
+                chunk_guider = prepare_segment_guider(guider, h3_context, bounds, chunk_v.shape,
+                                                       previous_tail=previous_tail, segment_index=idx)
 
             chunk_x0_output = {}
             chunk_callback = latent_preview.prepare_callback(
@@ -399,13 +535,15 @@ class PJ_FirstPass_SegmentSampler:
 
         # Perform blending
         blended_video = blend_sequence(
-            chunk_videos, video_intervals, full_video, blend_mode
+            chunk_videos, video_intervals, full_video, blend_mode,
+            delivery_intervals=[bounds[:2] for bounds in deliveries],
         )
 
         # Blend or assemble audio
         if chunk_audios and total_a > 0:
             blended_audio = blend_sequence(
-                chunk_audios, audio_intervals, full_audio, blend_mode, is_audio=True
+                chunk_audios, audio_intervals, full_audio, blend_mode, is_audio=True,
+                delivery_intervals=[bounds[2:] for bounds in deliveries],
             )
             result_samples = comfy.nested_tensor.NestedTensor((blended_video, blended_audio))
         else:
@@ -424,4 +562,4 @@ class PJ_FirstPass_SegmentSampler:
 
         print("[PJ一采分段采样器] 全部一采分段生成与融合完成！准备输出结果。\n" + "=" * 65)
         output = dict(latent_image, samples=result_samples)
-        return (output, {"samples": sampled_chunks[0]})
+        return self._commit_generation((output, {"samples": sampled_chunks[0]}), fps)

@@ -391,3 +391,87 @@ test('relay count uses relay preview, not normal planning count', () => {
         assert.equal(widget(node, 'relay_start_segment').options.max, 9);
     } finally {delete uiContext.app.graph;}
 });
+
+test('local repair exposes its own denoise and target independently of original generation', () => {
+    const node = relayWidgets(sampler('仅重抽第2段', true), '整段采样');
+    for (const [name, value] of Object.entries({repair_action: '仅重绘目标段', repair_denoise: 0.4,
+            repair_steps: 6, repair_scheduler: 'simple', repair_request_id: 0, repair_boundary_tokens: 2}))
+        node.widgets.push({name, value, type: 'number', options: {}});
+    refresh(node, true);
+    assert.equal(visible(node, 'generation_mode'), false);
+    assert.equal(visible(node, 'run_mode'), true);
+    assert.equal(widget(node, 'run_mode').label, '局部重做范围');
+    assert.equal(visible(node, 'repair_denoise'), true);
+    assert.equal(visible(node, 'repair_steps'), false);
+    assert.equal(visible(node, 'seg8_lock'), false);
+    node.properties.pj_advanced_open = true;
+    refresh(node, true);
+    assert.equal(visible(node, 'repair_steps'), true);
+    assert.equal(visible(node, 'repair_boundary_tokens'), true);
+});
+
+test('loading and reusing results hide sampling targets without destroying saved values', () => {
+    for (const action of ['载入回修基准', '复用一采结果']) {
+        const node = relayWidgets(sampler('仅重抽第2段', true));
+        node.widgets.push({name: 'repair_action', value: action, type: 'combo', options: {}});
+        node.properties.pj_advanced_open = true;
+        refresh(node, true);
+        for (const name of ['generation_mode', 'run_mode', 'seg1_seed_offset', 'seg8_lock'])
+            assert.equal(visible(node, name), false, name);
+        assert.equal(widget(node, 'run_mode').value, '仅重抽第2段');
+    }
+    for (const action of ['更新一采变更', '复用高清结果']) {
+        const node = sampler('仅精修第2段');
+        node.widgets.push({name: 'refine_action', value: action, type: 'combo', options: {}});
+        refresh(node);
+        assert.equal(visible(node, 'run_mode'), false);
+        assert.equal(visible(node, 'seg8_lock'), false);
+    }
+});
+
+test('local selection removes cache actions and preserves explicit targets', () => {
+    for (const first of [true, false]) {
+        const node = sampler('智能缓存(仅重跑未锁定分段)', first);
+        node.widgets.push({name: first ? 'repair_action' : 'refine_action',
+            value: first ? '仅重绘目标段' : '仅重做目标段', type: 'combo', options: {}});
+        refresh(node, first);
+        assert.equal(widget(node, 'run_mode').value, '全部目标段');
+        assert.equal(widget(node, 'run_mode').options.values.some(value => value.includes('缓存')), false);
+        widget(node, 'run_mode').value = first ? '仅重抽第2段' : '仅精修第2段';
+        refresh(node, first);
+        assert.match(widget(node, 'run_mode').value, /第2段$/);
+    }
+});
+
+test('unexecuted planner estimates with floor-aligned duration and accepts zero overlap', () => {
+    const planner = {type: 'PJ_SegmentPlanner', properties: {}, widgets: [
+        {name: 'split_mode', value: '按秒自动切分'}, {name: 'chunk_seconds', value: 6},
+        {name: 'overlap_seconds', value: 0}]};
+    uiContext.app.graph = {links: {1: {origin_id: 10}}, getNodeById() {return planner;}};
+    try {
+        const node = sampler('全部精修(刷新全部缓存)');
+        refresh(node);
+        assert.equal(widget(node, 'run_mode').options.values.filter(v => v.startsWith('仅精修第')).length, 3);
+        planner.widgets[2].value = 1.5;
+        refresh(node);
+        assert.equal(widget(node, 'run_mode').options.values.filter(v => v.startsWith('仅精修第')).length, 3);
+    } finally {delete uiContext.app.graph;}
+});
+
+test('H3 context uses concise native Chinese controls', async () => {
+    let extension;
+    const ctx = vm.createContext({app:{registerExtension(value) {extension=value;}}});
+    vm.runInContext(source, ctx);
+    class Node {
+        constructor() {
+            this.inputs = ['clip', 'vae', 'reference_video', 'audio_vae'].map(name => ({name}));
+            this.widgets = ['prompt', 'segment_prompts', 'reference_mode', 'motion_context'].map(name => ({name}));
+        }
+    }
+    await extension.beforeRegisterNodeDef(Node, {name:'PJ_H3SegmentContext'});
+    const node = new Node();
+    node.onNodeCreated();
+    assert.deepEqual(node.inputs.map(i => i.label), ['文本编码器', '视频VAE', '视频参考', '音频VAE']);
+    assert.deepEqual(node.widgets.map(i => i.label), ['全局提示词', '各段补充提示词', '参考用途', '前段运动引导']);
+    assert.equal(node.widgets.length, 4);
+});

@@ -182,11 +182,21 @@ def segment_guider(guider, bounds, sync_refs):
     return clone
 
 
-def blend_sequence(chunks, intervals, original, blend_mode, is_audio=False):
+def blend_sequence(chunks, intervals, original, blend_mode, is_audio=False, delivery_intervals=None):
     """Keep the original extent; only overlapping blocks need weighted arithmetic."""
     axis = original.ndim - 1 if is_audio else 2
     original = original.cpu()
-    if len(chunks) == 1 and intervals[0] == (0, original.shape[axis]):
+    whole_chunk = len(chunks) == len(intervals) == 1 and intervals[0] == (0, original.shape[axis])
+    if delivery_intervals is not None:
+        if len(chunks) != len(intervals) or len(chunks) != len(delivery_intervals):
+            raise ValueError("采样结果、采样窗口和交付窗口数量不一致")
+        cropped = []
+        for chunk, (start, end), (left, right) in zip(chunks, intervals, delivery_intervals):
+            if not start <= left <= right <= end:
+                raise ValueError("交付区间必须位于对应采样窗口内")
+            cropped.append(chunk if (start, end) == (left, right) else chunk.narrow(axis, left - start, right - left))
+        chunks, intervals = cropped, delivery_intervals
+    if whole_chunk and intervals[0] == (0, original.shape[axis]):
         return chunks[0]
     dtype = original.dtype
     for chunk in chunks:

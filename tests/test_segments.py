@@ -108,6 +108,10 @@ class SegmentTests(unittest.TestCase):
         for node in self.nodes:
             if node._cache.directory is not None:
                 node._cache.directory.cleanup()
+            for name in ("_revisions", "_results"):
+                store = getattr(node, name, None)
+                if store is not None and store.directory is not None:
+                    store.directory.cleanup()
 
     def node(self, cls):
         node = cls()
@@ -523,7 +527,7 @@ class SegmentTests(unittest.TestCase):
             with contextlib.redirect_stdout(io.StringIO()):
                 result = PJ_SegmentPlanner().plan(images=torch.zeros(450, 2, 2, 3), fps=30)["result"][0]
         self.assertEqual(result["fps"], 24)
-        self.assertEqual(result["total_frames"], 362)
+        self.assertEqual(result["total_frames"], 345)
         self.assertEqual(preview.call_args.args[2], 30)
 
     def test_full_length_and_unconnected_rule_preview(self):

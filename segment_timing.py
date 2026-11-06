@@ -15,8 +15,31 @@ def tokens_for_frames(frames):
     return max(0, math.ceil((frames - 5) / 17)) * 5 + 2
 
 
+def tokens_for_frames_floor(frames):
+    return max(0, math.floor((frames - 5) / 17)) * 5 + 2
+
+
 def segment_seconds(start, end, fps=FPS):
     return frames_for_tokens(start) / fps, frames_for_tokens(end) / fps
+
+
+def zero_overlap(plan):
+    return (plan is not None and plan.get("split_mode", "按秒自动切分") in
+            ("按秒自动切分", "auto_by_seconds", "固定分段数", "fixed_segments")
+            and plan.get("overlap_seconds") == 0)
+
+
+def delivery_chunks(chunks, plan):
+    """Legal sampling windows may include right padding that is not delivered."""
+    if not zero_overlap(plan):
+        return list(chunks)
+    delivered = []
+    for index, (start, end, audio_start, audio_end) in enumerate(chunks):
+        if index + 1 < len(chunks):
+            end = min(end, chunks[index + 1][0])
+            audio_end = min(audio_end, chunks[index + 1][2])
+        delivered.append((start, end, audio_start, audio_end))
+    return delivered
 
 
 def plan_relay_segments(total_v, total_a, chunk_seconds):

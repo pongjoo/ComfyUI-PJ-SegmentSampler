@@ -9,12 +9,15 @@ import latent_preview
 
 from .segment_boundaries import constrain_boundaries, restore_preserved
 from .segment_sampling import fingerprint, generate_noise, sampling_signature, segment_guider, slice_mask
+from .pj_h3_context import prepare_segment_guider
 
 
 def sample_relay(noise, guider, sampler, sigmas, latent_image, chunks, cache,
-                 seed, offsets, start_segment, sync_ref_video):
+                 seed, offsets, start_segment, sync_ref_video, h3_context=None):
     video, audio = latent_image["samples"].unbind()
     context = sampling_signature(guider, sampler, sigmas)
+    if h3_context is not None:
+        context = fingerprint((context, h3_context))
     noise_options = {k: v for k, v in vars(noise).items() if k != "seed"} if noise is not None else None
     cache.retain(len(chunks))
     previous = None
@@ -51,7 +54,16 @@ def sample_relay(noise, guider, sampler, sigmas, latent_image, chunks, cache,
             if mask is not None:
                 window_latent["noise_mask"] = mask
             chunk_noise = generate_noise(noise, window_latent, segment_seed)
-            chunk_guider = segment_guider(guider, bounds, sync_ref_video)
+            if h3_context is None:
+                chunk_guider = segment_guider(guider, bounds, sync_ref_video)
+            else:
+                previous_tail = None
+                if previous is not None:
+                    overlap = min(ve, chunks[index - 1][1]) - vs
+                    offset = vs - chunks[index - 1][0]
+                    previous_tail = previous.unbind()[0][:, :, offset:offset + overlap]
+                chunk_guider = prepare_segment_guider(guider, h3_context, bounds, samples.unbind()[0].shape,
+                                                       previous_tail=previous_tail, segment_index=index)
             callback = latent_preview.prepare_callback(chunk_guider.model_patcher, sigmas.shape[-1] - 1)
             print(f"[PJ接力] 第 {index + 1}/{len(chunks)} 段采样，视频潜步 [{vs}:{ve}]，种子 {segment_seed}")
             sampled = chunk_guider.sample(
