@@ -77,6 +77,7 @@ class NativeMaskGuider(RecordingGuider):
         class FlowSampling(comfy.model_sampling.ModelSamplingDiscreteFlow, comfy.model_sampling.CONST):
             pass
         flow = FlowSampling()
+        model.model_sampling = flow
         class Inner:
             inner_model = model
             model_patcher = SimpleNamespace(get_model_object=lambda name: flow)
@@ -88,7 +89,7 @@ class NativeMaskGuider(RecordingGuider):
         result = sampler.sampler_function(wrapper, packed_noise, sigmas,
                                           extra_args={"denoise_mask": packed_mask, "seed": kwargs["seed"]}, disable=True)
         parts = comfy.utils.unpack_latents(result, shapes)
-        return NestedTensor(parts) if nested else parts[0]
+        return NestedTensor(parts) if nested else result.reshape(streams[0].shape)
 
 
 class SegmentTests(unittest.TestCase):
@@ -375,10 +376,115 @@ class SegmentTests(unittest.TestCase):
         self.run_node(node)
         self.guider.calls.clear()
         output, denoised = self.run_node(node, run_mode="仅精修第2段")
-        self.assertEqual(len(self.guider.calls), 1)
+        self.assertEqual(len(self.guider.calls), 3)
         self.assertEqual(denoised["samples"].unbind()[0].shape[2], 107)
         self.assertTrue(torch.allclose(denoised["samples"].unbind()[0], output["samples"].unbind()[0] * 2))
         self.assertTrue(torch.equal(output["samples"].unbind()[1], self.latent["samples"].unbind()[1]))
+
+    def test_second_pass_native_boundary_handoff_and_single_owner(self):
+        self.guider = NativeMaskGuider()
+        self.sampler = comfy.samplers.ksampler("er_sde")
+        self.plan["overlap_seconds"] = 0.5
+        node = self.node(PJ_SegmentSampler)
+        output_latent = self.run_node(node)[0]
+        self.assertNotIn("noise_mask", output_latent)
+        output = output_latent["samples"]
+        chunks = plan_segments(107, 603, **self.plan, num_segments=3, custom_cuts="")
+        self.assertIsNone(self.guider.calls[0][3]["denoise_mask"])
+        written = 0
+        for i, (start, end, _, _) in enumerate(chunks):
+            saved = node._cache.load(i, node._cache.entries[i])[0].unbind()[0]
+            noise, samples, _, options = self.guider.calls[i]
+            if i:
+                previous = node._cache.load(i - 1, node._cache.entries[i - 1])[0].unbind()[0]
+                count = chunks[i - 1][1] - start
+                vm, am = options["denoise_mask"].unbind()
+                self.assertTrue(torch.equal(samples.unbind()[0][:, :, :count], previous[:, :, -count:]))
+                self.assertTrue(torch.all(vm[:, :, :count] == 0))
+                self.assertTrue(torch.all(vm[:, :, count:] == 1))
+                self.assertTrue(torch.all(am == 1))
+                self.assertTrue(torch.equal(saved[:, :, :count], previous[:, :, -count:]))
+                prior_noise = self.guider.calls[i - 1][0].unbind()[0]
+                self.assertTrue(torch.equal(noise.unbind()[0][:, :, :count], prior_noise[:, :, -count:]))
+            self.assertTrue(torch.equal(output.unbind()[0][:, :, written:end], saved[:, :, written - start:]))
+            written = end
+        self.assertTrue(torch.equal(output.unbind()[1], self.latent["samples"].unbind()[1]))
+
+    def test_second_pass_rerun_rebuilds_suffix_even_when_locked(self):
+        self.guider = NativeMaskGuider()
+        node = self.node(PJ_SegmentSampler)
+        before = self.run_node(node)[0]["samples"].unbind()[0]
+        self.guider.calls.clear()
+        locks = {f"seg{i}_lock": True for i in range(1, 21)}
+        after = self.run_node(node, noise=Noise_RandomNoise(77), run_mode="仅精修第2段", **locks)[0]["samples"].unbind()[0]
+        self.assertEqual(len(self.guider.calls), 3)
+        self.assertTrue(torch.equal(before[:, :, :42], after[:, :, :42]))
+        self.assertFalse(torch.equal(before[:, :, 42:], after[:, :, 42:]))
+        self.guider.calls.clear()
+        repeated = self.run_node(node, run_mode="智能缓存(仅重跑未锁定分段)", **locks)[0]["samples"].unbind()[0]
+        self.assertEqual(len(self.guider.calls), 0)
+        self.assertTrue(torch.equal(after, repeated))
+
+    def test_second_pass_interruption_and_missing_cache_rebuild_suffix(self):
+        node = self.node(PJ_SegmentSampler)
+        self.run_node(node)
+        with patch.object(self.guider, "sample", side_effect=RuntimeError("cancelled")):
+            with self.assertRaisesRegex(RuntimeError, "cancelled"):
+                self.run_node(node, run_mode="仅精修第2段")
+        self.assertEqual(list(node._cache.entries), [0])
+        self.guider.calls.clear()
+        self.run_node(node, run_mode="仅精修第4段")
+        self.assertEqual(len(self.guider.calls), 3)
+        (Path(node._cache.directory.name) / "1.pt").unlink()
+        self.guider.calls.clear()
+        self.run_node(node, run_mode="智能缓存(仅重跑未锁定分段)", **{f"seg{i}_lock": True for i in range(1, 21)})
+        self.assertEqual(len(self.guider.calls), 3)
+
+    def test_second_pass_contained_windows_keep_earliest_owner_and_gaps(self):
+        self.guider = NativeMaskGuider()
+        video = torch.randn(1, 24, 107, 2, 2)
+        self.latent = {"samples": video}
+        plan = dict(self.plan, split_mode="自定义切点", custom_cuts="0-6, 0.7-1.4, 1.4-8, 12-15")
+        node = self.node(PJ_SegmentSampler)
+        output = self.run_node(node, segment_plan=plan)[0]["samples"]
+        chunks = plan_segments(107, 0, **plan, num_segments=3)
+        expected = video.clone()
+        for i in reversed(range(len(chunks))):
+            start, end, _, _ = chunks[i]
+            expected[:, :, start:end] = node._cache.load(i, node._cache.entries[i])[0]
+        self.assertTrue(torch.equal(output, expected))
+        self.assertTrue(torch.all(self.guider.calls[1][3]["denoise_mask"] == 0))
+        self.assertIsNone(self.guider.calls[-1][3]["denoise_mask"])
+        self.assertTrue(torch.equal(output[:, :, chunks[2][1]:chunks[3][0]], video[:, :, chunks[2][1]:chunks[3][0]]))
+
+    def test_second_pass_preserves_spatial_mask_audio_and_source(self):
+        self.guider = NativeMaskGuider()
+        video = torch.randn(1, 24, 107, 4, 4, dtype=torch.bfloat16)
+        audio = torch.randn(1, 32, 2, 603, dtype=torch.bfloat16)
+        vm = torch.ones(1, 1, 1, 2, 2)
+        vm[..., 0] = 0
+        am = torch.zeros(1, 1, 1, 1)
+        self.latent = {"samples": NestedTensor((video, audio)), "noise_mask": NestedTensor((vm, am))}
+        source_video = video.clone()
+        output, denoised = self.run_node(self.node(PJ_SegmentSampler))
+        for value in (output, denoised):
+            v, a = value["samples"].unbind()
+            self.assertTrue(torch.equal(v[..., 0], source_video[..., 0]))
+            self.assertTrue(torch.equal(a, audio))
+        self.assertTrue(torch.equal(video, source_video))
+        self.assertTrue(torch.equal(vm[..., 0], torch.zeros_like(vm[..., 0])))
+        self.assertTrue(torch.all(self.guider.calls[1][3]["denoise_mask"].unbind()[1] == 0))
+
+    def test_second_pass_keeps_promoted_solver_output(self):
+        self.latent["samples"] = self.latent["samples"].to(dtype=torch.bfloat16)
+        native_sample = self.guider.sample
+        def float_sample(*args, **kwargs):
+            return native_sample(*args, **kwargs).to(dtype=torch.float32)
+        with patch.object(self.guider, "sample", side_effect=float_sample):
+            output = self.run_node(self.node(PJ_SegmentSampler))[0]["samples"].unbind()[0]
+        self.assertEqual(output.dtype, torch.float32)
+        self.assertTrue(torch.isfinite(output).all())
+        self.assertEqual(self.latent["samples"].unbind()[0].dtype, torch.bfloat16)
 
     def test_reference_and_keyframe_conditions_use_guider_contract(self):
         ref = {"kind": "video_audio", "latent": torch.zeros(1, 24, 107, 2, 2), "latent_t": 107,

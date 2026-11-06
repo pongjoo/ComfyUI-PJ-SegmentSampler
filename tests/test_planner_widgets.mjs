@@ -43,7 +43,7 @@ vm.runInContext(source, uiContext);
 vm.runInContext('updateSamplerControls = () => {};', uiContext);
 function sampler(mode, first = false) {
     const values = {run_mode: mode, target_time_second: 5, custom_rerun_segments: '2',
-        sync_ref_video: false, boundary_constraints: false, blend_mode: '硬切', unload_model_after_sampling: false};
+        sync_ref_video: false, boundary_constraints: false, blend_mode: '硬切', keep_original_audio: false, unload_model_after_sampling: false};
     for (let i = 1; i <= 20; i++) {
         values[`seg${i}_lock`] = i === 8;
         if (first) values[`seg${i}_seed_offset`] = i - 1;
@@ -58,6 +58,25 @@ function refresh(node, first = false) {
 }
 const widget = (node, name) => node.widgets.find(w => w.name === name);
 const visible = (node, name) => widget(node, name).type !== 'pj_hidden';
+
+test('second pass exposes blending only for regenerated audio', () => {
+    const node = sampler('全部精修(刷新全部缓存)');
+    node.properties.pj_advanced_open = true;
+    widget(node, 'keep_original_audio').value = true;
+    refresh(node);
+    assert.equal(visible(node, 'blend_mode'), false);
+    assert.equal(widget(node, 'run_mode').label, '精修范围（含后续段）');
+    widget(node, 'keep_original_audio').value = false;
+    refresh(node);
+    assert.equal(visible(node, 'blend_mode'), true);
+    assert.equal(widget(node, 'blend_mode').label, '音频重叠过渡');
+    assert.equal(widget(node, 'blend_mode').value, '硬切');
+    uiContext.node = node;
+    vm.runInContext('attachSamplerHandlers(node, false)', uiContext);
+    widget(node, 'keep_original_audio').value = true;
+    widget(node, 'keep_original_audio').callback();
+    assert.equal(visible(node, 'blend_mode'), false);
+});
 
 test('hidden widget sockets do not draw and expanding restores the original renderer', () => {
     const node = sampler('全部精修(刷新全部缓存)');

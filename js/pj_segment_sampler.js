@@ -327,7 +327,7 @@ function syncSamplerSegmentCount(node, isFirstPass) {
 
         runModeWidget.options = runModeWidget.options || {};
         runModeWidget.options.values = newOptions;
-        runModeWidget.label = isFirstPass ? "本次生成范围" : "本次精修范围";
+        runModeWidget.label = isFirstPass ? "本次生成范围" : "精修范围（含后续段）";
 
         // 仅清洗后端不支持的值，不因预览段数变化重置目标。
         if (!newOptions.includes(runModeWidget.value)) {
@@ -366,6 +366,10 @@ function syncSamplerSegmentCount(node, isFirstPass) {
 
         // 预览外已有的设置也需要可见，避免载入工作流后无法修改。
         toggleWidget(node, lockW, inRange && !relay && runMode.includes("智能缓存"));
+        if (!isFirstPass && lockW) {
+            lockW.options = lockW.options || {};
+            lockW.options.tooltip = "仅当前段及前段均可复用时生效；前段重做会重建全部后续段。";
+        }
 
         // 一采独立种子偏移：在当前分段数内展示
         if (isFirstPass) {
@@ -375,9 +379,13 @@ function syncSamplerSegmentCount(node, isFirstPass) {
 
     const boundary = isFirstPass && !!node.widgets.find(w => w.name === "boundary_constraints")?.value;
     toggleWidget(node, node.widgets.find(w => w.name === "boundary_constraints"), isFirstPass && !full && !relay);
+    const blend = node.widgets.find(w => w.name === "blend_mode");
+    if (!isFirstPass && blend) blend.label = "音频重叠过渡";
+    const showBlend = !full && !boundary && !relay &&
+        (isFirstPass || node.widgets.find(w => w.name === "keep_original_audio")?.value === false);
     for (const name of ["sync_ref_video", "blend_mode", "unload_model_after_sampling"]) {
         toggleWidget(node, node.widgets.find(w => w.name === name),
-            !!node.properties?.pj_advanced_open && (name !== "blend_mode" || (!full && !boundary && !relay)));
+            !!node.properties?.pj_advanced_open && (name !== "blend_mode" || showBlend));
     }
     updateSamplerControls(node, isFirstPass);
     autoResizeNode(node);
@@ -447,7 +455,7 @@ function attachSamplerHandlers(node, isFirstPass) {
         if (!node.title || node.title.startsWith("PJ_Segment") || node.title.startsWith("PJSegment")) node.title = "PJ二采分段精修采样器 (分段精修/局部重做)";
     }
 
-    const watchNames = ["generation_mode", "relay_action", "relay_start_segment", "run_mode", "target_time_second", "custom_rerun_segments", "sync_ref_video", "boundary_constraints", "blend_mode", "unload_model_after_sampling"];
+    const watchNames = ["generation_mode", "relay_action", "relay_start_segment", "run_mode", "target_time_second", "custom_rerun_segments", "sync_ref_video", "boundary_constraints", "blend_mode", "keep_original_audio", "unload_model_after_sampling"];
     for (const name of watchNames) {
         const w = node.widgets.find(widget => widget.name === name);
         if (w && !w._pj_attached) {

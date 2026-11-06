@@ -6,6 +6,7 @@ import comfy.nested_tensor
 import latent_preview
 
 from .segment_timing import plan_segments, resolve_plan, segment_seconds
+from .segment_boundaries import constrain_boundaries, restore_preserved
 from .segment_sampling import (SegmentCache, sampling_signature, fingerprint, generate_noise,
                                slice_mask, segment_guider, blend_sequence)
 
@@ -15,8 +16,8 @@ class PJ_SegmentSampler:
     PJ二采分段精修采样器 (Second-Pass Segment Sampler)
     专为 MiniMax H3 及长视频 2.0MP 高清精修设计：
     1. 按时间切分潜空间，降低单段采样工作量；
-    2. 使用 H3 17n+5 帧网格，可选51帧整数步进；
-    3. 支持各分段独立缓存与局部重跑；
+    2. 使用 H3 17n+5 帧网格，视频重叠区继承前段结果；
+    3. 局部重跑从目标段起重建后续缓存；
     4. 可保留输入音频潜空间；不保证画面与音频嘴型一致；
     5. 可在采样结束后请求 ComfyUI 卸载模型！
     """
@@ -44,7 +45,7 @@ class PJ_SegmentSampler:
                     + ["按缺陷秒数精修 (下方输入秒数)", "自定义指定分段(下方输入)"],
                     {
                         "default": "智能缓存(仅重跑未锁定分段)",
-                        "tooltip": "二采精修控制台：可选择只对某一段进行二采重采样，其余段直接从缓存复用",
+                        "tooltip": "从选定段开始重采并重建后续段；前面的有效缓存可复用，后续锁定不能阻止接缝更新",
                     },
                 ),
                 "target_time_second": (
@@ -54,7 +55,7 @@ class PJ_SegmentSampler:
                         "min": 0.0,
                         "max": 600.0,
                         "step": 0.5,
-                        "tooltip": "若选择【按缺陷秒数精修】，直接输入画面瑕疵出现的秒数，节点自动识别所属分段并执行精修！",
+                        "tooltip": "按缺陷秒数定位起始段，并重建该段及后续段",
                     },
                 ),
                 "custom_rerun_segments": (
@@ -62,32 +63,32 @@ class PJ_SegmentSampler:
                     {
                         "default": "5",
                         "multiline": False,
-                        "tooltip": "自定义重抽分段编号，支持单段或多段逗号分隔，例如：5 或 2, 5, 7",
+                        "tooltip": "从所选段号中最早的一段起重建后续段，例如2,5表示从第2段起重做",
                     },
                 ),
-                "seg1_lock": ("BOOLEAN", {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "打勾后，跳过第1段二采计算直接读缓存"}),
-                "seg2_lock": ("BOOLEAN", {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "打勾后，跳过第2段二采计算直接读缓存"}),
-                "seg3_lock": ("BOOLEAN", {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "打勾后，跳过第3段二采计算直接读缓存"}),
-                "seg4_lock": ("BOOLEAN", {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "打勾后，跳过第4段二采计算直接读缓存"}),
-                "seg5_lock": ("BOOLEAN", {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "打勾后，跳过第5段二采计算直接读缓存"}),
-                "seg6_lock": ("BOOLEAN", {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "打勾后，跳过第6段二采计算直接读缓存"}),
-                "seg7_lock": ("BOOLEAN", {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "打勾后，跳过第7段二采计算直接读缓存"}),
-                "seg8_lock": ("BOOLEAN", {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "打勾后，跳过第8段二采计算直接读缓存"}),
-                "seg9_lock": ("BOOLEAN", {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "打勾后，跳过第9段二采计算直接读缓存"}),
-                "seg10_lock": ("BOOLEAN", {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "打勾后，跳过第10段二采计算直接读缓存"}),
-                "seg11_lock": ("BOOLEAN", {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "打勾后，跳过第11段二采计算直接读缓存"}),
-                "seg12_lock": ("BOOLEAN", {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "打勾后，跳过第12段二采计算直接读缓存"}),
-                "seg13_lock": ("BOOLEAN", {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "打勾后，跳过第13段二采计算直接读缓存"}),
-                "seg14_lock": ("BOOLEAN", {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "打勾后，跳过第14段二采计算直接读缓存"}),
-                "seg15_lock": ("BOOLEAN", {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "打勾后，跳过第15段二采计算直接读缓存"}),
-                "seg16_lock": ("BOOLEAN", {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "打勾后，跳过第16段二采计算直接读缓存"}),
-                "seg17_lock": ("BOOLEAN", {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "打勾后，跳过第17段二采计算直接读缓存"}),
-                "seg18_lock": ("BOOLEAN", {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "打勾后，跳过第18段二采计算直接读缓存"}),
-                "seg19_lock": ("BOOLEAN", {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "打勾后，跳过第19段二采计算直接读缓存"}),
-                "seg20_lock": ("BOOLEAN", {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "打勾后，跳过第20段二采计算直接读缓存"}),
+                "seg1_lock": ("BOOLEAN", {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "有效缓存且前段未重做时复用第1段；前段重做会重建后续段"}),
+                "seg2_lock": ("BOOLEAN", {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "有效缓存且前段未重做时复用第2段；前段重做会重建后续段"}),
+                "seg3_lock": ("BOOLEAN", {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "有效缓存且前段未重做时复用第3段；前段重做会重建后续段"}),
+                "seg4_lock": ("BOOLEAN", {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "有效缓存且前段未重做时复用第4段；前段重做会重建后续段"}),
+                "seg5_lock": ("BOOLEAN", {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "有效缓存且前段未重做时复用第5段；前段重做会重建后续段"}),
+                "seg6_lock": ("BOOLEAN", {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "有效缓存且前段未重做时复用第6段；前段重做会重建后续段"}),
+                "seg7_lock": ("BOOLEAN", {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "有效缓存且前段未重做时复用第7段；前段重做会重建后续段"}),
+                "seg8_lock": ("BOOLEAN", {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "有效缓存且前段未重做时复用第8段；前段重做会重建后续段"}),
+                "seg9_lock": ("BOOLEAN", {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "有效缓存且前段未重做时复用第9段；前段重做会重建后续段"}),
+                "seg10_lock": ("BOOLEAN", {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "有效缓存且前段未重做时复用第10段；前段重做会重建后续段"}),
+                "seg11_lock": ("BOOLEAN", {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "有效缓存且前段未重做时复用第11段；前段重做会重建后续段"}),
+                "seg12_lock": ("BOOLEAN", {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "有效缓存且前段未重做时复用第12段；前段重做会重建后续段"}),
+                "seg13_lock": ("BOOLEAN", {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "有效缓存且前段未重做时复用第13段；前段重做会重建后续段"}),
+                "seg14_lock": ("BOOLEAN", {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "有效缓存且前段未重做时复用第14段；前段重做会重建后续段"}),
+                "seg15_lock": ("BOOLEAN", {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "有效缓存且前段未重做时复用第15段；前段重做会重建后续段"}),
+                "seg16_lock": ("BOOLEAN", {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "有效缓存且前段未重做时复用第16段；前段重做会重建后续段"}),
+                "seg17_lock": ("BOOLEAN", {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "有效缓存且前段未重做时复用第17段；前段重做会重建后续段"}),
+                "seg18_lock": ("BOOLEAN", {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "有效缓存且前段未重做时复用第18段；前段重做会重建后续段"}),
+                "seg19_lock": ("BOOLEAN", {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "有效缓存且前段未重做时复用第19段；前段重做会重建后续段"}),
+                "seg20_lock": ("BOOLEAN", {"default": False, "label_on": "已锁定", "label_off": "未锁定", "tooltip": "有效缓存且前段未重做时复用第20段；前段重做会重建后续段"}),
                 "blend_mode": (
                     ["余弦平滑(推荐)", "线性过渡", "硬切"],
-                    {"default": "余弦平滑(推荐)", "tooltip": "重叠区融合算法"},
+                    {"default": "余弦平滑(推荐)", "tooltip": "仅用于未保留原音时的音频重叠过渡；视频始终承接前段并去重拼接"},
                 ),
                 "keep_original_audio": (
                     "BOOLEAN",
@@ -220,7 +221,7 @@ class PJ_SegmentSampler:
                     target_defect_seg = seg_i + 1
                     break
             if target_defect_seg is not None:
-                print(f"[PJ二采分段采样器] 🎯 目标秒数 {target_time_second:.2f}s 自动匹配到第 {target_defect_seg} 段，将仅对该段精修！")
+                print(f"[PJ二采分段采样器] 目标秒数 {target_time_second:.2f}s 匹配第 {target_defect_seg} 段，从该段起重建后续结果")
             else:
                 target_defect_seg = 1
                 print(f"[PJ二采分段采样器] ⚠️ 目标秒数 {target_time_second:.2f}s 超出范围，默认精修第 1 段")
@@ -228,6 +229,7 @@ class PJ_SegmentSampler:
         sampled_chunks = []
         x0_chunks = []
         has_any_x0 = False
+        rebuilding = False
         disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
 
         for idx, (v_start, v_end, a_start, a_end) in enumerate(chunks):
@@ -239,7 +241,7 @@ class PJ_SegmentSampler:
                 chunk_latent_samples = chunk_v
             bounds = (v_start, v_end, a_start, a_end)
             chunk_mask = slice_mask(latent_image.get("noise_mask"), bounds)
-            cache_signature = fingerprint((context_signature, bounds, chunk_latent_samples,
+            cache_signature = fingerprint(("refine-boundaries-v1", context_signature, bounds, chunk_latent_samples,
                                            chunk_mask, latent_image.get("batch_index"), type(noise),
                                            {k: v for k, v in vars(noise).items() if k != "seed"} if noise is not None else None))
             cache_valid = self._cache.entries.get(idx) == cache_signature
@@ -263,13 +265,33 @@ class PJ_SegmentSampler:
                     should_resample = True
 
             # Cache hit check
-            cached = self._cache.load(idx, cache_signature) if not should_resample else None
+            cached = self._cache.load(idx, cache_signature) if not rebuilding and not should_resample else None
             if cached is not None:
                 sampled_chunks.append(cached[0])
                 x0_chunks.append(cached[1])
                 has_any_x0 |= cached[1] is not None
                 print(f"[PJ分段采样] 第 {idx + 1}/{n_chunks} 段复用缓存")
                 continue
+
+            if not rebuilding:
+                # Invalidate the dependent suffix before sampling, including on cancellation.
+                self._cache.retain(idx)
+                rebuilding = True
+            sources = [(chunks[i], value.unbind()[0] if is_nested else value)
+                       for i, value in enumerate(sampled_chunks)
+                       if max(v_start, chunks[i][0]) < min(v_end, chunks[i][1])]
+            if sources:
+                video_mask = chunk_mask.unbind()[0] if chunk_mask is not None and chunk_mask.is_nested else chunk_mask
+                chunk_v, video_mask = constrain_boundaries(chunk_v, video_mask, bounds, sources)
+                if is_nested:
+                    audio_mask = (chunk_mask.unbind()[1] if chunk_mask is not None and chunk_mask.is_nested
+                                  else torch.ones((chunk_a.shape[0], 1, 1, chunk_a.shape[-1]),
+                                                  device=chunk_a.device, dtype=torch.float32))
+                    chunk_latent_samples = comfy.nested_tensor.NestedTensor((chunk_v, chunk_a))
+                    chunk_mask = comfy.nested_tensor.NestedTensor((video_mask, audio_mask))
+                else:
+                    chunk_latent_samples, chunk_mask = chunk_v, video_mask
+            del sources
 
             print(f"\n[PJ二采分段采样器] >>> 开始精修第 {idx + 1}/{n_chunks} 段 (视频 [{v_start}:{v_end}]) ...")
 
@@ -302,6 +324,7 @@ class PJ_SegmentSampler:
                 seed=getattr(noise, "seed", None),
             )
             chunk_out_cpu = chunk_out.to("cpu")
+            restore_preserved(chunk_out_cpu, chunk_latent_samples, chunk_mask)
             sampled_chunks.append(chunk_out_cpu)
 
             if "x0" in chunk_x0_output:
@@ -313,6 +336,7 @@ class PJ_SegmentSampler:
                         comfy.utils.unpack_latents(x0_c, latent_shapes)
                     )
                 x0_chunks.append(chunk_guider.model_patcher.model.process_latent_out(x0_c.cpu()))
+                restore_preserved(x0_chunks[-1], chunk_latent_samples, chunk_mask)
                 del x0_c
             else:
                 x0_chunks.append(None)
@@ -327,7 +351,7 @@ class PJ_SegmentSampler:
             print(f"[PJ二采分段采样器] <<< 第 {idx + 1}/{n_chunks} 段精修完成，已存入缓存。")
 
         # Blending
-        print(f"\n[PJ二采分段采样器] 正在执行视频重叠区融合 (融合算法: {blend_mode}) ...")
+        print("\n[PJ二采分段采样器] 视频重叠区保留前段结果，按完整时间线拼接")
         video_intervals = [(c[0], c[1]) for c in chunks]
         audio_intervals = [(c[2], c[3]) for c in chunks]
 
@@ -343,7 +367,7 @@ class PJ_SegmentSampler:
                 chunk_videos.append(c)
 
         blended_video = blend_sequence(
-            chunk_videos, video_intervals, full_video, norm_blend
+            chunk_videos, video_intervals, full_video, "保留边界"
         )
 
         if keep_original_audio and orig_audio_for_bypass is not None:
@@ -379,7 +403,7 @@ class PJ_SegmentSampler:
                     if chunk_audios:
                         valid_x0_audios.append(chunk_audios[i])
             blended_x0_video = blend_sequence(
-                valid_x0_videos, video_intervals, full_video, norm_blend
+                valid_x0_videos, video_intervals, full_video, "保留边界"
             )
             if blended_audio is not None:
                 denoised_audio = blended_audio if keep_original_audio else blend_sequence(
