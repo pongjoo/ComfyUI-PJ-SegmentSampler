@@ -12,15 +12,15 @@
 | 局部回修 | segment_local_repair.py | repair_sigmas、repair_segments；旧结果拥有保留区，新输入可提供精修中部，仅写交付区，返回完整 sampled/x0 及变更范围 |
 | 完整版本 | segment_revision.py / RevisionStore | 当前磁盘快照与临时候选；available/load/commit/check_request；原子提交、有限变更历史和过期请求检查，无持久张量 |
 | 顺序接力 | segment_relay.py / sample_relay | 固定 22 帧接力、窗口噪声、可选逐段条件、依赖摘要和后缀失效、CPU 拼合 |
-| 一采编排 | pj_first_pass_sampler.py | 原生成、载入基准、局部重绘、完整结果复用；拥有一采段缓存与完整版本，惰性输入跳过无关上游 |
-| 二采编排 | pj_segment_sampler.py | 常规精修、局部替换、一采变更更新、高清复用；拥有高清快照和已消费一采版本，不修改一采存储 |
-| 前端 | js/pj_segment_sampler.js | 旧控件迁移、按模式/连接/段数显隐、高级折叠、预览尺寸；不决定采样状态 |
+| 一采编排 | pj_first_pass_sampler.py / execute、execute_with_ui | 原生成、载入基准、局部重绘、完整结果复用；拥有一采段缓存与完整版本，原生入口附带执行摘要 |
+| 二采编排 | pj_segment_sampler.py / execute、execute_with_ui | 常规精修、局部替换、一采变更更新、高清复用；拥有高清快照和已消费一采版本，不修改一采存储 |
+| 前端 | js/pj_segment_sampler.js | 旧控件迁移、显隐、高级折叠、预览尺寸；按执行摘要更新目标菜单，不决定采样状态 |
 | 阶段示例 | workflows/局部回修_执行阶段示例.json | 原生 ComfySwitchNode 选择输出，未选择的放大/采样分支不执行 |
 | 输出分析 | scripts/analyze_segment_outputs.py | 本地张量/解码数据检查：形状、有限值、变更范围、保护区、时间覆盖；画面指标只报告线索 |
 | 真实验证 | scripts/validate_h3_repair.py | 只读本机队列检查，独立原生执行器运行局部候选矩阵、完整潜空间放大后二采联动、长视频接力和完整解码；原始数据写 diagnostics/ |
 | 采样与版本检查 | tests/test_segments.py、test_local_repair.py、test_refine_revision.py、test_revision_requests.py、test_revision_review.py | CPU 小张量、原生接口及失败恢复契约 |
-| 条件与执行检查 | tests/test_h3_context.py、test_context_sampling.py、test_stage_execution.py、test_zero_overlap.py | 原生 H3 条件构造、长窗口调度、原生 PromptExecutor 惰性分支、零交付重叠 |
-| 分析与前端检查 | tests/test_output_analysis.py、test_planner_widgets.mjs、serve_dashboard.py、dashboard.html | 检查报告、迁移/显隐和独立 DOM 布局；不代替画质验收 |
+| 条件与执行检查 | tests/test_h3_context.py、test_context_sampling.py、test_stage_execution.py、test_execution_cache.py、test_zero_overlap.py | 原生 H3 条件构造、长窗口调度、原生 PromptExecutor 惰性分支及三类缓存、零交付重叠 |
+| 分析与前端检查 | tests/test_output_analysis.py、test_validation_media.py、test_planner_widgets.mjs、serve_dashboard.py、dashboard.html | 检查报告、本地素材读取、迁移/显隐和独立 DOM 布局；不代替画质验收 |
 
 ## 数据流与接口
 
@@ -40,10 +40,12 @@ repair_segments 的 baseline 拥有保留区，initial_latent 可为新放大结
 
 每个采样器实例独占临时目录，张量写磁盘并以 weights_only=True 加载。SegmentCache 管逐段复用，RevisionStore 管完整提交和请求记录，采样器决定提交时机。无全局张量缓存，不承诺跨重启恢复。
 
+ComfyUI 调用 execute_with_ui，以 IS_CHANGED / NOT_IDEMPOTENT 避免原生输出缓存遮住节点当前版本。普通相同请求通过输入指纹与当前版本复用磁盘快照；execute 的既有元组返回契约不变。执行摘要仅含实际视频潜步数、模式、规则和段数，不加入 LATENT；未提交时保留旧摘要，提交后的卸载错误不撤销新摘要。
+
 pj_revision 仅附在完整结果，记录 lineage、version、视频/音频潜步长度及逐版本变更区间。历史有界，较旧消费者需要全量更新。二采通过 source_result 读取完整一采元数据，不依赖放大器透传；二采保留自己的已消费版本，不跨节点写缓存。
 
 局部候选成功后才替换完整快照，失败保留旧版。当前请求可幂等复用，已被后续操作替代的近期请求拒绝覆盖；新抽卡使用新种子或操作编号。连续接力段缓存仍按依赖撤销后缀，两种策略不混用。
 
-前端折叠状态归节点属性 pj_advanced_open。前端不推断真实长度和版本消费状态，原生惰性输入与 Switch 决定执行依赖。规划器保留 OUTPUT_NODE 预览行为，因此普通队列仍独立执行其媒体来源；阶段示例使用纯规则规划器，不能把采样器惰性复用等同于禁止其他输出分支执行。完整潜空间放大保持第三方公开接口，不绕过其归一化/分块规则增加局部近似缓存。
+前端折叠状态归节点属性 pj_advanced_open。实际长度从 pj_sampling_summary 执行消息读取，仅保留在当前节点运行时；规则改变时重算段数、连接改变时丢弃旧摘要，不写工作流属性。版本消费由后端判断，原生惰性输入与 Switch 决定执行依赖。规划器保留 OUTPUT_NODE 预览行为，因此普通队列仍独立执行其媒体来源；阶段示例使用纯规则规划器，不能把采样器惰性复用等同于禁止其他输出分支执行。完整潜空间放大保持第三方公开接口，不绕过其归一化/分块规则增加局部近似缓存。
 
 复用命令在 [README](../README.md) 维护；具体自动检查、真实权重配置和结果统一见 [验证报告](VALIDATION.md)，阶段决策见 [开发台账](DEV_LOG.md)，未交付项与发布状态见 [任务清单](../tasks/todo.md)。
