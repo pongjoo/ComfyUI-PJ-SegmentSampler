@@ -11,10 +11,15 @@ import importlib.util
 import json
 import logging
 from pathlib import Path
+import shutil
+import subprocess
 import sys
 import time
 import urllib.parse
 import urllib.request
+
+import numpy as np
+from PIL import Image, ImageOps
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -47,6 +52,11 @@ def arguments():
     parser.add_argument("--overlap-seconds", type=float, default=0.,
                         help="Requested overlap for local-repair and refinement plans.")
     parser.add_argument("--prompt", default="A locked-off tripod shot of a single red toy car moving slowly from left to right on a plain wooden table. The beige wall and soft indoor lighting remain completely steady. One continuous shot, no cuts, no camera movement.")
+    parser.add_argument("--prompt-file", help="Read the prompt verbatim from a local UTF-8 text file.")
+    parser.add_argument("--reference-video", help="Local source video, resampled to 24 FPS and cropped to --frames.")
+    parser.add_argument("--reference-video-start", type=float, default=0., help="Source-video start time in seconds.")
+    parser.add_argument("--reference-image", action="append", default=[], help="Local product reference; repeat for multiple images of the same dimensions.")
+    parser.add_argument("--mask-file", help="Optional torch-saved [frames,height,width] pixel mask for an imported --baseline-file.")
     parser.add_argument("--extra-model-paths", action="append", default=[])
     parser.add_argument("--server-url", default="http://127.0.0.1:7188")
     parser.add_argument("--preflight", action="store_true")
@@ -75,6 +85,43 @@ def check_queue(url):
 
 def write_json(path, value):
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+
+
+def reference_inputs(options):
+    """Read local media only; use the same 24 FPS window for text and video conditions."""
+    video, images = None, []
+    if options.reference_video:
+        ffmpeg = shutil.which("ffmpeg")
+        if ffmpeg is None:
+            raise FileNotFoundError("--reference-video requires the existing FFmpeg executable on PATH")
+        command = [ffmpeg, "-v", "error", "-nostdin", "-ss", str(options.reference_video_start),
+                   "-i", str(Path(options.reference_video).resolve()), "-map", "0:v:0",
+                   "-vf", f"fps=24,scale={options.width}:{options.height}:flags=lanczos",
+                   "-frames:v", str(options.frames), "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]
+        decoded = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True).stdout
+        expected = options.frames * options.height * options.width * 3
+        if len(decoded) != expected:
+            raise ValueError(f"Reference video does not cover {options.frames} frames at 24 FPS from the requested start")
+        array = np.frombuffer(decoded, dtype=np.uint8).reshape(options.frames, options.height, options.width, 3).copy()
+        video = torch.from_numpy(array).float().div_(255)
+    for filename in options.reference_image:
+        with Image.open(filename) as image:
+            array = np.array(ImageOps.exif_transpose(image).convert("RGB"), copy=True)
+        images.append(torch.from_numpy(array).float().div_(255))
+    if images and any(image.shape != images[0].shape for image in images):
+        raise ValueError("PJ_H3_CONTEXT reference images must share dimensions; prepare a matching image batch first")
+    return video, torch.stack(images) if images else None
+
+
+def reference_report():
+    has_references = bool(options.reference_video or options.reference_image)
+    return {"video": str(Path(options.reference_video).resolve()) if options.reference_video else None,
+            "video_start_seconds": options.reference_video_start, "video_frames": options.frames if options.reference_video else 0,
+            "video_fps": 24, "images": [str(Path(path).resolve()) for path in options.reference_image],
+            "pixel_mask": str(Path(options.mask_file).resolve()) if options.mask_file else None,
+            "per_window_h3_context": has_references,
+            "limitations": (["No SAM/spatial mask was supplied; this is reference-media and linked-refinement validation, not the complete SAM editing workflow."]
+                            if has_references and not options.mask_file else [])}
 
 
 class ValidationServer:
@@ -120,6 +167,12 @@ def run_comparison():
     logging.info("Loading native H3 CLIP, VAE, model and optional LoRA")
     clip = nodes.CLIPLoader().load_clip(options.clip, type="minimax")[0]
     vae = nodes.VAELoader().load_vae(options.vae)[0]
+    reference_video, reference_images = reference_inputs(options)
+    h3_context = None
+    if reference_video is not None or reference_images is not None:
+        h3_context, = PJ_H3SegmentContext().prepare(
+            clip, vae=vae, prompt=options.prompt, reference_video=reference_video,
+            reference_images=reference_images, motion_context=True)
     prepared = MiniMaxH3ImageToVideo.execute(clip, vae, options.prompt,
                                             options.width, options.height, options.frames)
     positive, empty = prepared.result
@@ -131,7 +184,7 @@ def run_comparison():
     sigmas, = BasicScheduler.execute(model, options.scheduler, options.steps, 1.0).result
     check_queue(options.server_url)
     if options.relay_smoke:
-        return run_relay_comparison(clip, vae, guider, sampler, sigmas, empty, started)
+        return run_relay_comparison(clip, vae, guider, sampler, sigmas, empty, started, h3_context)
     if options.baseline_file:
         logging.info("Reusing fixed baseline %s", options.baseline_file)
         saved = torch.load(options.baseline_file, weights_only=True, map_location="cpu")
@@ -142,12 +195,21 @@ def run_comparison():
         baseline = {"samples": comfy.nested_tensor.NestedTensor(saved)}
     else:
         logging.info("Generating baseline with native SamplerCustomAdvanced")
-        baseline, _ = SamplerCustomAdvanced.execute(Noise_RandomNoise(options.seed), guider, sampler, sigmas, empty).result
+        full_guider = guider
+        if h3_context is not None:
+            video, audio = empty["samples"].unbind()
+            full_guider = prepare_segment_guider(guider, h3_context, (0, video.shape[2], 0, audio.shape[-1]), video.shape)
+        baseline, _ = SamplerCustomAdvanced.execute(Noise_RandomNoise(options.seed), full_guider, sampler, sigmas, empty).result
         baseline["samples"] = baseline["samples"].cpu()
+    if options.mask_file:
+        pixel_mask = torch.load(options.mask_file, weights_only=True, map_location="cpu")
+        if not isinstance(pixel_mask, torch.Tensor):
+            raise ValueError("--mask-file must contain a pixel-mask tensor")
+        baseline, = PJ_H3EditPrepare().prepare(baseline, {"samples": baseline["samples"].unbind()[0]}, pixel_mask)
     before = list(baseline["samples"].unbind())
     torch.save(before, output / "before.pt")
     if options.refine_smoke:
-        return run_refine_comparison(vae, guider, sampler, sigmas, empty, baseline, started)
+        return run_refine_comparison(vae, guider, sampler, sigmas, empty, baseline, started, h3_context)
     plan = dict(split_mode="固定分段数", num_segments=options.num_segments, overlap_seconds=options.overlap_seconds,
                 chunk_seconds=6., custom_cuts="", fps=24., align_51_frames=False)
     chunks, _ = resolve_plan(baseline["samples"], plan, "固定分段数", 6., 0.,
@@ -182,11 +244,12 @@ def run_comparison():
                 repair_action="仅重绘目标段", repair_denoise=denoise,
                 repair_scheduler=options.scheduler, repair_steps=options.steps,
                 repair_boundary_tokens=options.boundary_tokens, repair_baseline=baseline,
-                repair_request_id=1, unload_model_after_sampling=False,
+                repair_request_id=1, unload_model_after_sampling=False, h3_context=h3_context,
                 **{f"seg{options.target_segment}_seed_offset": 0})
             torch.save([item.cpu() for item in after_latent["samples"].unbind()], candidate / "after.pt")
             manifest = {
                 "created_at": datetime.now(timezone.utc).isoformat(),
+                "reference_inputs": reference_report(),
                 "baseline": {"source": options.baseline_file or "native SamplerCustomAdvanced", "model": options.model,
                              "clip": options.clip, "vae": options.vae, "lora": options.lora,
                              "seed": options.seed, "repair_seed": seed, "repair_seed_offset": 0,
@@ -215,7 +278,8 @@ def run_comparison():
         after = torch.load(candidate / "after.pt", weights_only=True, map_location="cpu")
         after_frames = nodes.VAEDecode().decode(vae, {"samples": comfy.nested_tensor.NestedTensor(after)})[0].cpu()
         torch.save(after_frames, candidate / "after_frames.pt")
-        report = analyze_outputs(before, after, manifest, before_frames, after_frames)
+        report = analyze_outputs(before, after, manifest, before_frames, after_frames,
+                                 edit_masks=baseline.get("noise_mask"))
         report["real_h3_sampling"] = True
         report["repair_sampling_executed"] = manifest["baseline"]["denoise"] > 0
         if manifest["baseline"]["denoise"] > 0 and not report.get("streams", {}).get("video", {}).get("changed_steps"):
@@ -230,6 +294,7 @@ def run_comparison():
                "elapsed_seconds": time.perf_counter() - started,
                "peak_cuda_allocated_bytes": torch.cuda.max_memory_allocated(),
                "peak_cuda_reserved_bytes": torch.cuda.max_memory_reserved(),
+                "reference_inputs": reference_report(),
                "unconfirmed": ["Automated data checks do not certify perceptual seam quality."]}
     write_json(output / "summary.json", summary)
     if matrix:
@@ -238,8 +303,9 @@ def run_comparison():
     return str(output / "analysis.json")
 
 
-def run_relay_comparison(clip, vae, guider, sampler, sigmas, empty, started):
-    context, = PJ_H3SegmentContext().prepare(clip, vae=vae, prompt=options.prompt, motion_context=True)
+def run_relay_comparison(clip, vae, guider, sampler, sigmas, empty, started, context=None):
+    if context is None:
+        context, = PJ_H3SegmentContext().prepare(clip, vae=vae, prompt=options.prompt, motion_context=True)
     plan = dict(split_mode="按秒自动切分", num_segments=3, overlap_seconds=22 / 24,
                 chunk_seconds=options.relay_chunk_seconds, custom_cuts="", fps=24., align_51_frames=False)
     node = PJ_FirstPass_SegmentSampler()
@@ -294,13 +360,14 @@ def run_relay_comparison(clip, vae, guider, sampler, sigmas, empty, started):
               "decoded_frames": frames.shape[0], "quality_clues": quality,
               "elapsed_seconds": time.perf_counter() - started,
               "peak_cuda_allocated_bytes": torch.cuda.max_memory_allocated(),
+               "reference_inputs": reference_report(),
               "unconfirmed": ["This smoke test checks the native conditioning path and timeline integrity, not perceptual seam quality."]}
     write_json(output / "analysis.json", report)
     print(json.dumps({key: value for key, value in report.items() if key != "quality_clues"}, ensure_ascii=False))
     return str(output / "analysis.json")
 
 
-def run_refine_comparison(vae, guider, sampler, sigmas, empty, baseline, started):
+def run_refine_comparison(vae, guider, sampler, sigmas, empty, baseline, started, h3_context=None):
     plan = dict(split_mode="固定分段数", num_segments=options.num_segments, overlap_seconds=options.overlap_seconds,
                 chunk_seconds=6., custom_cuts="", fps=24., align_51_frames=False)
     first = PJ_FirstPass_SegmentSampler()
@@ -327,7 +394,7 @@ def run_refine_comparison(vae, guider, sampler, sigmas, empty, baseline, started
     old_hd, old_x0 = second.execute(
         Noise_RandomNoise(options.seed), guider, sampler, refine_sigmas, old_input,
         segment_plan=plan, source_result=original, keep_original_audio=True,
-        unload_model_after_sampling=False)
+        unload_model_after_sampling=False, h3_context=h3_context)
     logging.info("Repainting the low-resolution target and retaining its source revision")
     check_queue(options.server_url)
     latest, _ = first.execute(
@@ -336,7 +403,8 @@ def run_refine_comparison(vae, guider, sampler, sigmas, empty, baseline, started
         repair_action="仅重绘目标段", repair_denoise=options.denoise,
         repair_scheduler=options.scheduler, repair_steps=options.steps,
         repair_boundary_tokens=options.boundary_tokens, repair_request_id=1,
-        unload_model_after_sampling=False, **{f"seg{options.target_segment}_seed_offset": 0})
+        unload_model_after_sampling=False, h3_context=h3_context,
+        **{f"seg{options.target_segment}_seed_offset": 0})
     logging.info("Upscaling the complete revised latent before updating only changed HDR intervals")
     new_input = upscale(latest)
     check_queue(options.server_url)
@@ -344,7 +412,7 @@ def run_refine_comparison(vae, guider, sampler, sigmas, empty, baseline, started
         Noise_RandomNoise(options.seed), guider, sampler, refine_sigmas, new_input,
         segment_plan=plan, source_result=latest, refine_action="更新一采变更",
         repair_boundary_tokens=options.boundary_tokens, keep_original_audio=True,
-        unload_model_after_sampling=False)
+        unload_model_after_sampling=False, h3_context=h3_context)
     check_queue(options.server_url)
     repeated, _ = second.execute(None, None, None, None, None,
                                  source_result=latest, refine_action="更新一采变更")
@@ -354,6 +422,7 @@ def run_refine_comparison(vae, guider, sampler, sigmas, empty, baseline, started
                              options.num_segments, "", 24., False)
     actual_frames = frames_for_tokens(before[0].shape[2])
     manifest = {
+        "reference_inputs": reference_report(),
         "baseline": {"source": options.baseline_file or "native SamplerCustomAdvanced",
                      "model": options.model, "clip": options.clip, "vae": options.vae,
                      "lora": options.lora, "lora_strength": options.lora_strength,
@@ -398,6 +467,7 @@ def run_refine_comparison(vae, guider, sampler, sigmas, empty, baseline, started
     if options.denoise > 0 and not report.get("streams", {}).get("video", {}).get("changed_steps"):
         report["hard_failures"].append("The linked HDR update did not change the selected latent region")
     report.update(status="fail" if report["hard_failures"] else "pass", real_h3_sampling=True,
+                  reference_inputs=reference_report(),
                   denoised_validation=x0_report, source_intervals=intervals,
                   repeat_reuses_completed_revision=repeated["pj_revision"] == new_hd["pj_revision"],
                   elapsed_seconds=time.perf_counter() - started,
@@ -410,6 +480,19 @@ def run_refine_comparison(vae, guider, sampler, sigmas, empty, baseline, started
 
 if __name__ == "__main__":
     options = arguments()
+    local_inputs = [options.baseline_file, options.prompt_file, options.reference_video,
+                    options.mask_file, *options.reference_image]
+    for filename in filter(None, local_inputs):
+        if not Path(filename).is_file():
+            raise FileNotFoundError(filename)
+    if options.prompt_file:
+        options.prompt = Path(options.prompt_file).read_text(encoding="utf-8-sig")
+    if options.reference_video_start < 0:
+        raise ValueError("--reference-video-start must be nonnegative")
+    if options.reference_video and shutil.which("ffmpeg") is None:
+        raise FileNotFoundError("--reference-video requires the existing FFmpeg executable on PATH")
+    if options.mask_file and (not options.baseline_file or options.relay_smoke):
+        raise ValueError("--mask-file requires an imported --baseline-file and a local-repair/refinement run")
     if options.width % 32 or options.height % 32 or min(options.width, options.height) < 32:
         raise ValueError("Width and height must be positive multiples of 32")
     if options.frames < 5 or options.frames % 17 != 5:
@@ -445,6 +528,8 @@ if __name__ == "__main__":
         if options.refine_smoke:
             resolved["upscaler_model"] = folder_paths.get_full_path_or_raise("latent_upscale_models", options.upscaler_model)
     write_json(output / "preflight.json", {"weights": resolved, "queue_empty_at_start": True,
+                                           "reference_inputs": reference_report(),
+                                           "baseline_file": options.baseline_file,
                                            "comfy_root": str(COMFY_ROOT), "real_sampling_requested": not options.preflight and not options.executor_smoke_test})
     if options.preflight:
         print(json.dumps({"weights_found": list(resolved), "output_dir": str(output)}, ensure_ascii=False))
@@ -467,7 +552,8 @@ if __name__ == "__main__":
     spec.loader.exec_module(package)
     from pj_h3_validation.pj_first_pass_sampler import PJ_FirstPass_SegmentSampler
     from pj_h3_validation.pj_segment_sampler import PJ_SegmentSampler
-    from pj_h3_validation.pj_h3_context import PJ_H3SegmentContext
+    from pj_h3_validation.pj_h3_context import PJ_H3SegmentContext, prepare_segment_guider
+    from pj_h3_validation.pj_h3_edit_prepare import PJ_H3EditPrepare
     from pj_h3_validation.segment_revision import changed_intervals
     from pj_h3_validation.segment_local_repair import repair_sigmas
     from pj_h3_validation.segment_timing import frames_for_tokens, resolve_plan, plan_relay_segments, delivery_chunks
