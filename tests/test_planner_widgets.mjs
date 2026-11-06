@@ -38,7 +38,8 @@ test('old preview is discarded, current backend preview survives', () => {
     assert.deepEqual(migrate(current), current);
 });
 
-const uiContext = vm.createContext({ app: { registerExtension() {} }, setTimeout() {} });
+let uiExtension;
+const uiContext = vm.createContext({ app: { registerExtension(value) { uiExtension = value; } }, setTimeout() {} });
 vm.runInContext(source, uiContext);
 vm.runInContext('updateSamplerControls = () => {};', uiContext);
 function sampler(mode, first = false) {
@@ -390,6 +391,187 @@ test('relay count uses relay preview, not normal planning count', () => {
         assert.equal(widget(node, 'relay_start_segment').value, 9);
         assert.equal(widget(node, 'relay_start_segment').options.max, 9);
     } finally {delete uiContext.app.graph;}
+});
+
+async function executedSampler(first = true, generation = '22帧接力') {
+    const rules = {split_mode: '按秒自动切分', chunk_seconds: 6, overlap_seconds: 0.5,
+        num_segments: 3, custom_cuts: '0-6, 4.5-10.5, 9-15'};
+    const planner = {id: 10, type: 'PJ_SegmentPlanner',
+        widgets: Object.entries(rules).map(([name, value]) => ({name, value})),
+        properties: {pj_preview_cache: {n_chunks: 3, relay_n_chunks: 3, total_frames: 345}}};
+    const inputs = {20: {id: 20, type: 'EmptyLatent'}, 30: {id: 30, type: 'OfficialBaseline'}};
+    uiContext.app.graph = {links: {1: {origin_id: 10}, 2: {origin_id: 20}, 3: {origin_id: 30}},
+        getNodeById(id) { return id === 10 ? planner : inputs[id]; }};
+    class Node {
+        constructor() {
+            Object.assign(this, sampler(first ? '仅重抽第2段' : '仅精修第2段', first));
+            this.inputs.push({name: 'latent_image', link: 2}, {name: first ? 'repair_baseline' : 'source_result', link: 3});
+            if (first) relayWidgets(this, generation);
+            this.widgets.push({name: first ? 'repair_action' : 'refine_action',
+                value: first ? '原采样方式' : '常规精修', type: 'combo', options: {}});
+        }
+        onExecuted() { this.originalExecuted = true; return 'original'; }
+    }
+    await uiExtension.beforeRegisterNodeDef(Node, {name: first ? 'PJ_FirstPass_SegmentSampler' : 'PJ_SegmentSampler'});
+    const node = new Node();
+    node.onNodeCreated();
+    refresh(node, first);
+    const send = (changes = {}) => node.onExecuted({pj_sampling_summary: [{n_chunks: 7,
+        mode: first && generation === '22帧接力' ? 'relay' : 'segments', plan: {...rules},
+        total_video_tokens: 252, ...changes}]});
+    return {node, planner, rules, send};
+}
+
+test('executed relay uses seven real windows instead of the rule-only preview', async () => {
+    const {node, planner, send} = await executedSampler();
+    try {
+        assert.equal(widget(node, 'relay_start_segment').options.max, 3);
+        assert.equal(send(), 'original');
+        assert.equal(node.originalExecuted, true);
+        assert.equal(widget(node, 'relay_start_segment').options.max, 7);
+        assert.equal(planner.properties.pj_preview_cache.relay_n_chunks, 3);
+        widget(node, 'repair_action').value = '仅重绘目标段';
+        refresh(node, true);
+        assert.equal(widget(node, 'run_mode').options.values.filter(value => value.startsWith('仅重抽第')).length, 7);
+        assert.equal(node.properties.pj_sampling_summary, undefined);
+    } finally { delete uiContext.app.graph; }
+});
+
+test('executed second pass owns its real count and preserves a saved target', async () => {
+    const {node, planner, send} = await executedSampler(false);
+    try {
+        widget(node, 'run_mode').value = '仅精修第18段';
+        send();
+        const choices = widget(node, 'run_mode').options.values;
+        assert.equal(choices.includes('仅精修第7段'), true);
+        assert.equal(choices.includes('仅精修第8段'), false);
+        assert.equal(widget(node, 'run_mode').value, '仅精修第18段');
+        assert.equal(planner.properties.pj_preview_cache.n_chunks, 3);
+    } finally { delete uiContext.app.graph; }
+});
+
+test('rule changes discard the executed count but retain the real media length', async () => {
+    const {node, planner, send} = await executedSampler();
+    try {
+        send({n_chunks: 9});
+        assert.equal(widget(node, 'relay_start_segment').options.max, 9);
+        widget(planner, 'chunk_seconds').value = 8;
+        refresh(node, true);
+        assert.equal(widget(node, 'relay_start_segment').options.max, 5);
+        widget(planner, 'chunk_seconds').value = 6;
+        refresh(node, true);
+        assert.equal(widget(node, 'relay_start_segment').options.max, 7);
+        widget(node, 'relay_start_segment').value = 12;
+        widget(planner, 'chunk_seconds').value = 8;
+        refresh(node, true);
+        assert.equal(widget(node, 'relay_start_segment').value, 12);
+        assert.equal(widget(node, 'relay_start_segment').options.max, 12);
+    } finally { delete uiContext.app.graph; }
+});
+
+test('input reconnection discards both actual count and media length', async () => {
+    for (const inputName of ['segment_plan', 'latent_image', 'repair_baseline', 'source_result']) {
+        const first = inputName !== 'source_result';
+        const {node, send} = await executedSampler(first);
+        try {
+            send();
+            uiContext.node = node;
+            assert.equal(vm.runInContext('resolveTargetSegmentCount(node)', uiContext), 7);
+            const input = node.inputs.find(value => value.name === inputName);
+            const link = input.link;
+            input.link = null;
+            node.onConnectionsChange();
+            input.link = link;
+            refresh(node, first);
+            assert.equal(vm.runInContext('resolveTargetSegmentCount(node)', uiContext), 3, inputName);
+        } finally { delete uiContext.app.graph; }
+    }
+});
+
+test('output reconnection preserves the actual count and media length', async () => {
+    for (const first of [true, false]) {
+        const {node, send} = await executedSampler(first);
+        try {
+            send();
+            node.outputs = [{name: 'output', links: [4]}];
+            for (const connected of [false, true]) {
+                node.outputs[0].links = connected ? [5] : [];
+                node.onConnectionsChange(2, 0, connected);
+                refresh(node, first);
+                assert.equal(vm.runInContext('resolveTargetSegmentCount(node)', uiContext), 7);
+            }
+        } finally { delete uiContext.app.graph; }
+    }
+});
+
+test('changing generation mode keeps media length but does not revive the old count', async () => {
+    const {node, send} = await executedSampler();
+    try {
+        send({n_chunks: 9});
+        assert.equal(widget(node, 'relay_start_segment').options.max, 9);
+        widget(node, 'generation_mode').value = '分段编辑';
+        refresh(node, true);
+        const choices = widget(node, 'run_mode').options.values;
+        assert.equal(choices.includes('仅重抽第7段'), true);
+        assert.equal(choices.includes('仅重抽第8段'), false);
+        widget(node, 'generation_mode').value = '22帧接力';
+        refresh(node, true);
+        assert.equal(widget(node, 'relay_start_segment').options.max, 7);
+    } finally { delete uiContext.app.graph; }
+});
+
+test('changing a latent source behind the same link discards the actual summary', async () => {
+    const {node, send} = await executedSampler();
+    try {
+        send();
+        assert.equal(widget(node, 'relay_start_segment').options.max, 7);
+        uiContext.app.graph.links[2].origin_id = 30;
+        refresh(node, true);
+        assert.equal(widget(node, 'relay_start_segment').options.max, 3);
+    } finally { delete uiContext.app.graph; }
+});
+
+test('imported whole results provide real length before the first local repair', async () => {
+    const {node, send} = await executedSampler(true, '整段采样');
+    try {
+        widget(node, 'repair_action').value = '载入回修基准';
+        send({n_chunks: null, mode: 'full', plan: null});
+        widget(node, 'repair_action').value = '仅重绘目标段';
+        refresh(node, true);
+        const choices = widget(node, 'run_mode').options.values;
+        assert.equal(choices.includes('仅重抽第7段'), true);
+        assert.equal(choices.includes('仅重抽第8段'), false);
+        widget(node, 'generation_mode').value = '22帧接力';
+        widget(node, 'repair_action').value = '原采样方式';
+        refresh(node, true);
+        assert.equal(widget(node, 'relay_start_segment').options.max, 7);
+    } finally { delete uiContext.app.graph; }
+});
+
+test('an old mode or rules cannot replace the current planning count', async () => {
+    const {node, send} = await executedSampler();
+    try {
+        send({mode: 'segments', n_chunks: 10});
+        assert.equal(widget(node, 'relay_start_segment').options.max, 7);
+        send({n_chunks: 10, plan: {chunk_seconds: 8}});
+        assert.equal(widget(node, 'relay_start_segment').options.max, 7);
+    } finally { delete uiContext.app.graph; }
+});
+
+test('actual counts above twenty preserve custom and time selection', async () => {
+    const {node, send} = await executedSampler(false);
+    try {
+        widget(node, 'refine_action').value = '仅重做目标段';
+        widget(node, 'run_mode').value = '自定义指定分段(下方输入)';
+        widget(node, 'custom_rerun_segments').value = '25';
+        send({n_chunks: 30, total_video_tokens: 1202});
+        const choices = widget(node, 'run_mode').options.values;
+        assert.equal(choices.includes('仅精修第20段'), true);
+        assert.equal(choices.includes('仅精修第21段'), false);
+        assert.equal(choices.includes('按缺陷秒数精修 (下方输入秒数)'), true);
+        assert.equal(visible(node, 'custom_rerun_segments'), true);
+        assert.equal(widget(node, 'custom_rerun_segments').value, '25');
+    } finally { delete uiContext.app.graph; }
 });
 
 test('local repair exposes its own denoise and target independently of original generation', () => {

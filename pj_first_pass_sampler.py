@@ -172,13 +172,51 @@ class PJ_FirstPass_SegmentSampler:
 
     RETURN_TYPES = ("LATENT", "LATENT")
     RETURN_NAMES = ("完整潜空间", "首段潜空间")
-    FUNCTION = "execute"
+    FUNCTION = "execute_with_ui"
     CATEGORY = "PJ工具箱/分段采样"
+    # The node owns mutable revisions; native output caches cannot serve old snapshots.
+    NOT_IDEMPOTENT = True
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return float("nan")
 
     def __init__(self):
         self._cache = SegmentCache()
         self._revisions = RevisionStore()
         self._baseline_key = None
+        self._last_execution = None
+        self._sampling_summary = None
+
+    def execute_with_ui(self, **inputs):
+        key = None
+        if inputs.get("repair_action", "原采样方式") == "原采样方式":
+            key = fingerprint((inputs, sampling_signature(inputs["guider"], inputs["sampler"], inputs["sigmas"]),
+                               getattr(inputs.get("noise"), "seed", None)))
+        version = self._revisions.metadata
+        saved = (self._revisions.load() if key is not None and version is not None and
+                 self._last_execution == (key, version["lineage"], version["version"]) else None)
+        previous_summary = self._sampling_summary
+        try:
+            result = saved if saved is not None else self.execute(**inputs)
+        except Exception:
+            if version == self._revisions.metadata:
+                self._sampling_summary = previous_summary
+            raise
+        if version == self._revisions.metadata:
+            self._sampling_summary = previous_summary
+        version = self._revisions.metadata
+        self._last_execution = (key, version["lineage"], version["version"]) if key is not None else None
+        samples = result[0]["samples"]
+        video = samples.unbind()[0] if samples.is_nested else samples
+        summary = dict(self._sampling_summary or {"n_chunks": None, "mode": "full", "plan": None},
+                       total_video_tokens=video.shape[2])
+        return {"ui": {"pj_sampling_summary": [summary]}, "result": result}
+
+    def _record_plan(self, chunks, plan, mode):
+        rules = {key: plan[key] for key in ("split_mode", "chunk_seconds", "overlap_seconds", "num_segments", "custom_cuts")
+                 if key in plan} if plan is not None else None
+        self._sampling_summary = {"n_chunks": len(chunks), "mode": mode, "plan": rules}
 
     def check_lazy_status(self, repair_action="原采样方式", **kwargs):
         if repair_action == "原采样方式":
@@ -211,6 +249,7 @@ class PJ_FirstPass_SegmentSampler:
             baseline_key = fingerprint(repair_baseline)
             saved = self._commit_generation((repair_baseline, None), fps)
             self._baseline_key = baseline_key
+            self._sampling_summary = None
         if saved is None:
             raise ValueError("没有已成功的一采结果；请先完成一次采样，或连接已有完整潜空间到回修基准")
         baseline = saved[0]
@@ -249,8 +288,11 @@ class PJ_FirstPass_SegmentSampler:
         output, _, changes = repair_segments(noise, guider, sampler, sigmas, baseline, chunks,
                                                 targets, seed, offsets, repair_boundary_tokens,
                                                 sync_ref_video, h3_context=h3_context, delivery_bounds=deliveries)
-        return self._revisions.commit(output, slice_latent(output, chunks[0]), changes=changes,
-                                      fps=fps, request_key=request_key)
+        result = self._revisions.commit(output, slice_latent(output, chunks[0]), changes=changes,
+                                        fps=fps, request_key=request_key)
+        self._record_plan(chunks, segment_plan, "relay" if generation_mode == "22帧接力" and segment_plan is not None else
+                          "segments" if segment_plan is not None else "full")
+        return result
 
     def plan_segments(self, total_v, total_a, split_mode, chunk_seconds, overlap_seconds,
                       num_segments, custom_cuts, fps, align_51_frames=False):
@@ -328,6 +370,7 @@ class PJ_FirstPass_SegmentSampler:
                     or total_v < 2 or total_v % 5 != 2 or full_audio.ndim != 4 or full_audio.shape[1:3] != (32, 2)):
                 raise ValueError("22帧接力需要H3原生音视频潜空间，视频长度为5n+2潜步")
             chunks = plan_relay_segments(total_v, total_a, segment_plan.get("chunk_seconds", chunk_seconds))
+            self._record_plan(chunks, segment_plan, "relay")
             seed = getattr(noise, "seed", base_seed)
             if not isinstance(seed, int):
                 seed = base_seed
@@ -346,6 +389,8 @@ class PJ_FirstPass_SegmentSampler:
             full_length=segment_plan is None or generation_mode == "整段采样" or "不分段" in str(run_mode) or "全量采样" in str(run_mode),
         )
         n_chunks = len(chunks)
+        self._record_plan(chunks, segment_plan, "full" if segment_plan is None or generation_mode == "整段采样" or
+                          "不分段" in str(run_mode) or "全量采样" in str(run_mode) else "segments")
         no_overlap = zero_overlap(segment_plan)
         deliveries = delivery_chunks(chunks, segment_plan)
         constrain = boundary_constraints and n_chunks > 1 and not no_overlap

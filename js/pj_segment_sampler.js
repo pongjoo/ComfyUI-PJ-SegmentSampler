@@ -262,26 +262,63 @@ function hasSegmentPlan(node) {
         (input.name === "segment_plan" || input.type === "PJ_SEGMENT_PLAN") && input.link != null);
 }
 
+function samplingSourceKey(node) {
+    return JSON.stringify(["segment_plan", "latent_image", "repair_baseline", "source_result"].map(name => {
+        const input = node.inputs?.find(value => value.name === name);
+        let link = app.graph?.links[input?.link];
+        const path = [input?.link ?? null];
+        const visited = new Set();
+        while (link && !visited.has(link.origin_id)) {
+            visited.add(link.origin_id);
+            path.push([link.origin_id, link.origin_slot]);
+            const origin = app.graph.getNodeById(link.origin_id);
+            if (origin?.type !== "Reroute" && origin?.type !== "ReroutePrimitive") break;
+            link = app.graph.links[origin.inputs?.[0]?.link];
+        }
+        return path;
+    }));
+}
+
+function currentSamplingSummary(node, planner) {
+    const summary = node._pjSamplingSummary;
+    if (!summary) return null;
+    if (summary.sourceKey !== samplingSourceKey(node)) {
+        delete node._pjSamplingSummary;
+        return null;
+    }
+    const generation = node.widgets?.find(w => w.name === "generation_mode")?.value;
+    const local = node.widgets?.find(w => w.name === "repair_action")?.value === "仅重绘目标段";
+    const mode = !hasSegmentPlan(node) || (generation === "整段采样" && !local) ? "full" :
+        generation === "22帧接力" ? "relay" : "segments";
+    if (summary.mode !== mode || !["split_mode", "chunk_seconds", "overlap_seconds", "num_segments", "custom_cuts"]
+        .every(name => summary.plan?.[name] === planner?.widgets?.find(w => w.name === name)?.value)) {
+        summary.n_chunks = null;
+    }
+    return summary;
+}
+
 // 获取上游规划器的分段数；没有规划时只处理完整输入。
 function resolveTargetSegmentCount(node) {
     if (!hasSegmentPlan(node)) return 1;
     // 1. 优先实时读取上游 PJ_SegmentPlanner 最新控件值
     const originNode = getUpstreamPlannerNode(node);
+    const actual = currentSamplingSummary(node, originNode);
+    if (actual?.n_chunks) return actual.n_chunks;
     if (originNode) {
         if (node.widgets?.find(w => w.name === "generation_mode")?.value === "22帧接力") {
             const preview = originNode.properties?.pj_preview_cache;
-            if (preview?.relay_n_chunks) return preview.relay_n_chunks;
+            if (!actual && preview?.relay_n_chunks) return preview.relay_n_chunks;
             const frames = preview?.total_frames || 345;
-            const total = Math.max(2, Math.floor((frames - 5) / 17) * 5 + 2);
+            const total = actual?.total_video_tokens ?? Math.max(2, Math.floor((frames - 5) / 17) * 5 + 2);
             const seconds = Number(originNode.widgets?.find(w => w.name === "chunk_seconds")?.value ?? 6);
             const window = Math.max(2, Math.floor((seconds * 24 - 5) / 17 + 0.5)) * 5 + 2;
             return 1 + Math.max(0, Math.ceil((total - window) / (window - 7)));
         }
         // 次级缓存读取：上游规划器已执行或有预览缓存时直接获取
-        if (originNode.pj_cached_n_chunks) {
+        if (!actual && originNode.pj_cached_n_chunks) {
             return Math.min(20, Math.max(1, originNode.pj_cached_n_chunks));
         }
-        if (originNode.properties?.["pj_preview_cache"]?.n_chunks) {
+        if (!actual && originNode.properties?.["pj_preview_cache"]?.n_chunks) {
             return Math.min(20, Math.max(1, originNode.properties["pj_preview_cache"].n_chunks));
         }
 
@@ -296,7 +333,7 @@ function resolveTargetSegmentCount(node) {
         } else {
             // 未执行时仅按向下对齐的约15秒参考长度估算，使用同一H3网格。
             const frames = originNode.properties?.pj_preview_cache?.total_frames ?? 345;
-            const total = Math.max(2, Math.floor((frames - 5) / 17) * 5 + 2);
+            const total = actual?.total_video_tokens ?? Math.max(2, Math.floor((frames - 5) / 17) * 5 + 2);
             const chunk = Number(originNode.widgets?.find(w => w.name === "chunk_seconds")?.value ?? 6);
             const ov = Number(originNode.widgets?.find(w => w.name === "overlap_seconds")?.value ?? 1.5);
             const groups = Math.min(Math.max(0, (total - 2) / 5), Math.max(1, Math.floor((chunk * 24 - 5) / 17 + 0.5)));
@@ -474,6 +511,21 @@ function attachSamplerHandlers(node, isFirstPass) {
     if (!node.widgets) return;
     node.properties = node.properties || {};
 
+    if (!node._pj_summary_attached) {
+        node._pj_summary_attached = true;
+        const onExecuted = node.onExecuted;
+        node.onExecuted = function (message) {
+            const result = onExecuted?.apply(this, arguments);
+            const summary = message?.pj_sampling_summary?.[0];
+            if (Number.isInteger(summary?.total_video_tokens) && summary.total_video_tokens > 0) {
+                this._pjSamplingSummary = {...summary, sourceKey: samplingSourceKey(this)};
+                if (!Number.isInteger(summary.n_chunks) || summary.n_chunks < 1) this._pjSamplingSummary.n_chunks = null;
+                syncSamplerSegmentCount(this, isFirstPass);
+            }
+            return result;
+        };
+    }
+
     node.color = isFirstPass ? "#134e4a" : "#1e293b";
     node.bgcolor = isFirstPass ? "#042f2e" : "#0f172a";
     if (isFirstPass) {
@@ -516,6 +568,7 @@ function attachSamplerHandlers(node, isFirstPass) {
         node._pj_conn_attached = true;
         const origOnConnectionsChange = node.onConnectionsChange;
         node.onConnectionsChange = function () {
+            if (node._pjSamplingSummary?.sourceKey !== samplingSourceKey(node)) delete node._pjSamplingSummary;
             const res = origOnConnectionsChange?.apply(this, arguments);
             setTimeout(() => {
                 if (isFirstPass) updateFirstPassVisibility(node);

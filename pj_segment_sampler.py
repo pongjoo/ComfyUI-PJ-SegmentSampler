@@ -122,13 +122,46 @@ class PJ_SegmentSampler:
 
     RETURN_TYPES = ("LATENT", "LATENT")
     RETURN_NAMES = ("完整潜空间", "去噪潜空间")
-    FUNCTION = "execute"
+    FUNCTION = "execute_with_ui"
     CATEGORY = "PJ工具箱/分段采样"
+    # The node owns mutable revisions; native output caches cannot serve old snapshots.
+    NOT_IDEMPOTENT = True
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return float("nan")
 
     def __init__(self):
         self._cache = SegmentCache()
         self._results = RevisionStore()
         self._source_stamp = None
+        self._last_execution = None
+        self._sampling_summary = None
+
+    def execute_with_ui(self, **inputs):
+        key = None
+        if inputs.get("refine_action", "常规精修") == "常规精修":
+            key = fingerprint((inputs, sampling_signature(inputs["guider"], inputs["sampler"], inputs["sigmas"]),
+                               getattr(inputs.get("noise"), "seed", None)))
+        version = self._results.metadata
+        saved = (self._results.load() if key is not None and version is not None and
+                 self._last_execution == (key, version["lineage"], version["version"]) else None)
+        previous_summary = self._sampling_summary
+        try:
+            result = saved if saved is not None else self.execute(**inputs)
+        except Exception:
+            if version == self._results.metadata:
+                self._sampling_summary = previous_summary
+            raise
+        if version == self._results.metadata:
+            self._sampling_summary = previous_summary
+        version = self._results.metadata
+        self._last_execution = (key, version["lineage"], version["version"]) if key is not None else None
+        samples = result[0]["samples"]
+        video = samples.unbind()[0] if samples.is_nested else samples
+        summary = dict(self._sampling_summary or {"n_chunks": None, "mode": "full", "plan": None},
+                       total_video_tokens=video.shape[2])
+        return {"ui": {"pj_sampling_summary": [summary]}, "result": result}
 
     def check_lazy_status(self, refine_action="常规精修", **inputs):
         if refine_action == "复用高清结果":
@@ -185,7 +218,6 @@ class PJ_SegmentSampler:
         h3_context=None,
         **kwargs,
     ):
-
         if refine_action == "复用高清结果":
             saved = self._results.load()
             if saved is None:
@@ -236,6 +268,10 @@ class PJ_SegmentSampler:
             full_length=segment_plan is None or "不分段" in str(run_mode) or "全量采样" in str(run_mode),
         )
         n_chunks = len(chunks)
+        rules = {key: segment_plan[key] for key in ("split_mode", "chunk_seconds", "overlap_seconds", "num_segments", "custom_cuts")
+                 if key in segment_plan} if segment_plan is not None else None
+        self._sampling_summary = {"n_chunks": n_chunks, "plan": rules,
+                                  "mode": "full" if segment_plan is None or "不分段" in str(run_mode) or "全量采样" in str(run_mode) else "segments"}
         deliveries = delivery_chunks(chunks, segment_plan)
         source = source_result if source_result is not None else latent_image
         source_samples = source["samples"]
@@ -518,6 +554,8 @@ class PJ_SegmentSampler:
             editable = changed_intervals(source_revision, baseline.get("pj_refine_source"))
             audio_changes = changed_intervals(source_revision, baseline.get("pj_refine_source"), "audio")
             if not editable and not audio_changes:
+                return saved
+            if editable and len(sigmas) < 2:
                 return saved
             targets = [i for i, (start, end, _, _) in enumerate(deliveries)
                        if any(max(start, left) < min(end, right) for left, right in editable)]
