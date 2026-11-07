@@ -677,3 +677,21 @@ test('H3 context migrates the old image wire to the first native dynamic port', 
     node.configure(info);
     assert.equal(node.loaded.inputs.length, 3);
 });
+
+test('H3 preparation nodes preserve saved custom colors on configure', async () => {
+    let extension;
+    const ctx = vm.createContext({app:{registerExtension(value) {extension=value;}}});
+    vm.runInContext(source, ctx);
+    for (const name of ['PJ_H3SegmentContext', 'PJ_H3EditPrepare']) {
+        class Node {constructor() {this.inputs = []; this.widgets = [];}}
+        await extension.beforeRegisterNodeDef(Node, {name});
+        const node = new Node();
+        node.onNodeCreated();
+        assert.equal(node.bgcolor, '#042f2e');
+        node.color = '#733333';
+        node.bgcolor = '#542525';
+        node.onConfigure({color: node.color, bgcolor: node.bgcolor});
+        assert.equal(node.color, '#733333');
+        assert.equal(node.bgcolor, '#542525');
+    }
+});

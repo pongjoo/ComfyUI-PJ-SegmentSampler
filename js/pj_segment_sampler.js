@@ -1082,8 +1082,10 @@ app.registerExtension({
                 nodeType.prototype[event] = function () {
                     const result = original?.apply(this, arguments);
                     localizeAndSanitizeCommon(this);
-                    this.color = "#134e4a";
-                    this.bgcolor = "#042f2e";
+                    if (event === "onNodeCreated") {
+                        this.color = "#134e4a";
+                        this.bgcolor = "#042f2e";
+                    }
                     return result;
                 };
             }
