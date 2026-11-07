@@ -1068,6 +1068,15 @@ app.registerExtension({
                 return r;
             };
         } else if (["PJ_H3EditPrepare", "PJ_H3SegmentContext"].includes(nodeData.name)) {
+            if (nodeData.name === "PJ_H3SegmentContext") {
+                const configure = nodeType.prototype.configure;
+                nodeType.prototype.configure = function (info) {
+                    for (const input of info.inputs || []) {
+                        if (input.name === "reference_images") input.name = "ref_images.ref_image_0";
+                    }
+                    return configure?.apply(this, arguments);
+                };
+            }
             for (const event of ["onNodeCreated", "onConfigure"]) {
                 const original = nodeType.prototype[event];
                 nodeType.prototype[event] = function () {

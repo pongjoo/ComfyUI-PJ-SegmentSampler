@@ -2,39 +2,48 @@
 
 import json
 
+from comfy_api.latest import io
 from comfy_extras.nodes_minimax_h3 import MiniMaxH3ImageToVideo, MiniMaxH3ReferenceToVideo
 
 from .segment_sampling import segment_guider
 from .segment_timing import frames_for_tokens
 
 
-class PJ_H3SegmentContext:
+class PJ_H3SegmentContext(io.ComfyNode):
     @classmethod
-    def INPUT_TYPES(cls):
-        return {"required": {
-            "clip": ("CLIP",),
-            "prompt": ("STRING", {"multiline": True, "default": ""}),
-            "segment_prompts": ("STRING", {"multiline": True, "default": "{}", "tooltip": '各段补充提示词，JSON 格式，例如 {"2":"人物转身"}；段号从 1 开始'}),
-            "reference_mode": (["原视频编辑（按时间裁剪）", "素材参考（保持完整）"],),
-            "motion_context": ("BOOLEAN", {"default": True}),
-        }, "optional": {
-            "vae": ("VAE", {"tooltip": "连接视频 VAE 时，参考素材也编码为 H3 潜空间条件；不接时只用于文本编码"}),
-            "reference_images": ("IMAGE", {"tooltip": "每张图作为一个独立图片参考，对应 <Picture 1>、<Picture 2> 等"}),
-            "reference_video": ("IMAGE", {"tooltip": "24 FPS 参考视频，对应 <Video 1>；编辑模式按目标时间切片"}),
-            "reference_video_audio": ("AUDIO", {"tooltip": "参考视频的配套音轨，与视频同步切片"}),
-            "reference_audio": ("AUDIO", {"tooltip": "独立音频素材，不按视频时间裁剪"}),
-            "audio_vae": ("VAE",),
-        }}
+    def define_schema(cls):
+        return io.Schema(
+            node_id="PJ_H3SegmentContext", display_name="PJ H3分段条件准备", category="PJ工具箱/分段采样",
+            inputs=[
+                io.Clip.Input("clip"),
+                io.String.Input("prompt", multiline=True, default=""),
+                io.String.Input("segment_prompts", multiline=True, default="{}",
+                                tooltip='各段补充提示词，例如 {"2":"人物转身"}；段号从 1 开始'),
+                io.Combo.Input("reference_mode", options=["原视频编辑（按时间裁剪）", "素材参考（保持完整）"]),
+                io.Boolean.Input("motion_context", default=True),
+                io.Vae.Input("vae", optional=True),
+                io.Autogrow.Input("ref_images", optional=True, template=io.Autogrow.TemplatePrefix(
+                    input=io.Image.Input("ref_image", tooltip="每个接口对应一张参考图；接入后自动增加下一接口"),
+                    prefix="ref_image_", min=0, max=100)),
+                io.Image.Input("reference_video", optional=True, tooltip="24 FPS 参考视频，编辑模式按目标时间切片"),
+                io.Audio.Input("reference_video_audio", optional=True),
+                io.Audio.Input("reference_audio", optional=True),
+                io.Vae.Input("audio_vae", optional=True),
+                io.Combo.Input("ref_image_size", options=["match", "max"], default="match",
+                               display_name="参考图像尺寸", tooltip="使用官方规则：match 匹配目标像素面积；max 使用参考图像的最大尺寸策略"),
+            ],
+            outputs=[io.Custom("PJ_H3_CONTEXT").Output(display_name="H3分段上下文")],
+        )
 
-    RETURN_TYPES = ("PJ_H3_CONTEXT",)
-    RETURN_NAMES = ("H3分段上下文",)
-    FUNCTION = "prepare"
-    CATEGORY = "PJ工具箱/分段采样"
+    @classmethod
+    def execute(cls, **kwargs):
+        return io.NodeOutput(*cls.prepare(**kwargs))
 
-    def prepare(self, clip, vae=None, prompt="", segment_prompts="{}",
+    @classmethod
+    def prepare(cls, clip, vae=None, prompt="", segment_prompts="{}",
                 reference_mode="原视频编辑（按时间裁剪）", motion_context=True,
                 reference_images=None, reference_video=None, reference_video_audio=None,
-                reference_audio=None, audio_vae=None):
+                reference_audio=None, audio_vae=None, ref_images=None, ref_image_size="match"):
         try:
             prompts = json.loads(segment_prompts or "{}")
         except json.JSONDecodeError as exc:
@@ -45,11 +54,17 @@ class PJ_H3SegmentContext:
             raise ValueError("分段补充提示词的键为从 1 开始的段号，值为提示词文本")
         if reference_video_audio is not None and reference_video is None:
             raise ValueError("配套视频音轨需要连接参考视频；独立音频请连接 reference_audio")
+        images = list(reference_images) if reference_images is not None else []
+        for name in sorted(ref_images or {}, key=lambda name: int(name.rsplit("_", 1)[-1])):
+            image = ref_images[name]
+            if image is not None:
+                images.append(image[0].clone() if image.shape[0] > 1 else image[0])
         return ({
             "clip": clip, "vae": vae, "prompt": prompt,
             "segment_prompts": {int(key): value for key, value in prompts.items()},
             "sync_video": reference_mode == "原视频编辑（按时间裁剪）",
-            "motion_context": motion_context, "reference_images": reference_images,
+            "motion_context": motion_context, "reference_images": images or None,
+            "ref_image_size": ref_image_size,
             "reference_video": reference_video, "reference_video_audio": reference_video_audio,
             "reference_audio": reference_audio, "audio_vae": audio_vae,
         },)
@@ -115,7 +130,7 @@ def prepare_segment_guider(base_guider, context, bounds, video_shape,
             ref_videos={"ref_video_1": video} if video is not None else None,
             ref_video_audios={"ref_video_audio_1": video_audio} if video_audio is not None else None,
             ref_audios={"ref_audio_1": context["reference_audio"]} if context["reference_audio"] is not None else None,
-            ref_image_size="match", **size)
+            ref_image_size=context["ref_image_size"], **size)
     else:
         prepared = MiniMaxH3ImageToVideo.execute(context["clip"], context["vae"], prompt=prompt, **size)
     positive = prepared.result[0]

@@ -1,7 +1,9 @@
+import asyncio
 from pathlib import Path
 import sys
 from types import ModuleType, SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT.parent.parent))
@@ -9,7 +11,9 @@ import comfy.cli_args
 comfy.cli_args.args.cpu = True
 
 import torch
+import nodes
 import comfy.samplers
+from execution import PromptExecutor, validate_prompt
 from comfy.ldm.minimax.model import FRAME_RESCALE, _video_t_grid
 from comfy_extras.nodes_minimax_h3 import video_latent_t
 
@@ -69,6 +73,81 @@ class ContextTests(unittest.TestCase):
 
     def context(self, **kwargs):
         return self.node.prepare(self.clip, self.vae, "global prompt", **kwargs)[0]
+
+    def test_native_autogrow_schema_has_no_batch_socket(self):
+        inputs = self.node.INPUT_TYPES()
+        dynamic = inputs["optional"]["ref_images"]
+        self.assertEqual(dynamic[0], "COMFY_AUTOGROW_V3")
+        self.assertEqual(dynamic[1]["template"]["min"], 0)
+        self.assertEqual(dynamic[1]["template"]["max"], 100)
+        self.assertNotIn("reference_images", inputs["optional"])
+        self.assertEqual(inputs["required"]["ref_image_size"][1]["options"], ["match", "max"])
+
+    def test_independent_images_keep_dimensions_and_numeric_port_order(self):
+        refs = {"ref_image_10": torch.full((1, 96, 32, 3), .9),
+                "ref_image_2": torch.full((1, 32, 64, 3), .5),
+                "ref_image_0": torch.full((1, 64, 32, 3), .1)}
+        context = self.context(ref_images=refs, ref_image_size="max")
+        prepare_segment_guider(self.guider, context, (0, 12, 0, 65), (1, 24, 12, 2, 2))
+        self.assertEqual([tuple(x.shape) for x in self.vae.calls], [(1, 64, 32, 3), (1, 32, 64, 3), (1, 96, 32, 3)])
+        for actual, name in zip(self.vae.calls, ("ref_image_0", "ref_image_2", "ref_image_10")):
+            self.assertTrue(torch.allclose(actual, refs[name], atol=1 / 255 + 1e-6))
+
+    def test_match_and_max_reach_native_reference_sizing(self):
+        image = torch.rand(1, 96, 64, 3)
+        for mode, shape in (("match", (1, 32, 32, 3)), ("max", (1, 96, 64, 3))):
+            with self.subTest(mode=mode):
+                self.vae.calls.clear()
+                context = self.context(ref_images={"ref_image_0": image}, ref_image_size=mode)
+                prepare_segment_guider(self.guider, context, (0, 12, 0, 65), (1, 24, 12, 2, 2))
+                self.assertEqual(tuple(self.vae.calls[0].shape), shape)
+
+    def test_native_executor_expands_dynamic_image_inputs(self):
+        clip = self.clip
+        images = (torch.zeros(1, 32, 64, 3), torch.ones(1, 64, 32, 3))
+        captured = []
+
+        class Source:
+            INPUT_TYPES = classmethod(lambda cls: {"required": {}})
+            RETURN_TYPES = ("CLIP", "IMAGE", "IMAGE")
+            FUNCTION = "run"
+
+            def run(self):
+                return clip, *images
+
+        class Sink:
+            INPUT_TYPES = classmethod(lambda cls: {"required": {"context": ("PJ_H3_CONTEXT",)}})
+            RETURN_TYPES = ()
+            FUNCTION = "run"
+            OUTPUT_NODE = True
+
+            def run(self, context):
+                captured.append(context)
+                return ()
+
+        server = SimpleNamespace(client_id=None, send_sync=lambda *args, **kwargs: None)
+        executor = PromptExecutor(server, cache_args={"ram": 0, "ram_inactive": 0})
+        prompt = {
+            "source": {"class_type": "PJImageTestSource", "inputs": {}},
+            "context": {"class_type": "PJ_H3SegmentContext", "inputs": {
+                "clip": ["source", 0], "prompt": "products", "segment_prompts": "{}",
+                "reference_mode": "原视频编辑（按时间裁剪）", "motion_context": True, "ref_image_size": "max"}},
+            "sink": {"class_type": "PJImageTestSink", "inputs": {"context": ["context", 0]}},
+        }
+        with patch.dict(nodes.NODE_CLASS_MAPPINGS, {"PJImageTestSource": Source, "PJImageTestSink": Sink,
+                                                   "PJ_H3SegmentContext": PJ_H3SegmentContext}):
+            for count in (0, 1, 12):
+                prompt["context"]["inputs"].update({f"ref_images.ref_image_{i}": ["source", 1 + i % 2] for i in range(count)})
+                validated = asyncio.run(validate_prompt("autogrow-test", prompt, None))
+                self.assertTrue(validated[0], validated)
+                executor.execute(prompt, f"autogrow-{count}", execute_outputs=validated[2])
+                self.assertTrue(executor.success, executor.status_messages)
+                actual = captured[-1]["reference_images"]
+                self.assertEqual(len(actual or []), count)
+                self.assertEqual(captured[-1]["ref_image_size"], "max")
+                self.assertIs(captured[-1]["clip"], clip)
+                for index, image in enumerate(actual or []):
+                    self.assertTrue(torch.equal(image, images[index % 2][0]))
 
     def test_rebuild_uses_native_text_node_preserves_guider_policy_and_negative(self):
         context = self.context(segment_prompts='{"2":"turn left"}')
