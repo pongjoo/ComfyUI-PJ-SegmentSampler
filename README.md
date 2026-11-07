@@ -126,6 +126,10 @@ PJ_H3SegmentContext 接收 CLIP、全局提示词和可选分段补充提示词�
 
 自动检查覆盖时间、遮罩、版本、原生采样器遮罩适配及 PromptExecutor 阶段跳过，不以替身代替画质验收。独立前端布局页使用 python tests/serve_dashboard.py 启动，访问 http://127.0.0.1:18765；它不等同完整画布测试。
 
+Windows 本机运行监控使用 PowerShell 7、`nvidia-smi` 和英文性能计数器名称。填写运行任务的 prompt ID 与后端进程 PID；脚本只读队列、历史和日志，每 20 秒记录一次资源，目标任务完成或中断后退出。输出为本地 JSONL、提交快照和结束历史；缺失计数器会记录错误，采样峰值不代表瞬时峰值。`-Once` 只采集一次。
+
+    pwsh -File scripts/monitor_comfyui.ps1 -PromptId TASK_ID -ComfyProcessId PROCESS_ID -LogPath ../../user/comfyui_7188.log -OutputPrefix diagnostics/monitor_run
+
 真实验证使用已有本机权重，请替换模型名和端口。脚本只读取本机队列，另起进程使用原生执行器，不向运行中的服务提交工作流或重启服务：
 
     & '../../../python_embeded/python.exe' -s scripts/validate_h3_repair.py --output-dir diagnostics/preflight --preflight --server-url http://127.0.0.1:7188 --model H3_MODEL.safetensors --clip H3_CLIP.safetensors --vae H3_VAE.safetensors --lora ''

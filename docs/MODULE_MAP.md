@@ -17,6 +17,7 @@
 | 前端 | js/pj_segment_sampler.js | 旧控件迁移、显隐、高级折叠、预览尺寸；按执行摘要更新目标菜单，不决定采样状态 |
 | 阶段示例 | workflows/局部回修_执行阶段示例.json | 原生 ComfySwitchNode 选择输出，未选择的放大/采样分支不执行 |
 | 输出分析 | scripts/analyze_segment_outputs.py | 本地张量/解码数据检查：形状、有限值、变更范围、保护区、时间覆盖；画面指标只报告线索 |
+| 运行监控 | scripts/monitor_comfyui.ps1 | 独立 PowerShell 7 只读本机指定任务、NVIDIA/Windows 资源和日志；记录归输出目录所有，任务结束自动退出，不参与采样 |
 | 真实验证 | scripts/validate_h3_repair.py | 只读本机队列检查，独立原生执行器运行局部候选矩阵、完整潜空间放大后二采联动、长视频接力和完整解码；原始数据写 diagnostics/ |
 | 采样与版本检查 | tests/test_segments.py、test_local_repair.py、test_refine_revision.py、test_revision_requests.py、test_revision_review.py | CPU 小张量、原生接口及失败恢复契约 |
 | 条件与执行检查 | tests/test_h3_context.py、test_context_sampling.py、test_stage_execution.py、test_execution_cache.py、test_zero_overlap.py | 原生 H3 条件构造、长窗口调度、原生 PromptExecutor 惰性分支及三类缓存、零交付重叠 |
