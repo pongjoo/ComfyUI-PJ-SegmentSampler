@@ -10,7 +10,7 @@ import latent_preview
 from .segment_boundaries import restore_preserved
 from .segment_revision import merge_intervals
 from .segment_sampling import generate_noise, segment_guider, slice_mask
-from .pj_h3_context import prepare_segment_guider
+from .pj_h3_context import prepare_segment_conditions
 
 
 def repair_sigmas(guider, scheduler, steps, denoise):
@@ -86,75 +86,76 @@ def repair_segments(noise, guider, sampler, sigmas, baseline, chunks, target_ind
     if not editable:
         return baseline, baseline if denoised_baseline is None else denoised_baseline, []
     written = []
-    for index in targets:
-        bounds = chunks[index]
-        start, end = bounds[:2]
-        delivery_start, delivery_end = deliveries[index][:2]
-        chunk = slice_latent(source, bounds)
-        parts = _streams(chunk["samples"])
-        existing = chunk.get("noise_mask")
-        masks = _streams(existing) if existing is not None and existing.is_nested else [existing]
-        video = parts[0]
-        mask = (comfy.sampler_helpers.prepare_mask(masks[0].float(), video.shape, video.device).clone()
-                if masks[0] is not None else torch.ones(
-                    (video.shape[0], 1, video.shape[2], video.shape[3], video.shape[4]),
-                    device=video.device, dtype=torch.float32))
-        time_edit = torch.zeros((1, 1, end - start, 1, 1), device=video.device, dtype=torch.float32)
-        for left, right in editable:
-            a, b = max(delivery_start, left), min(delivery_end, right)
-            if a < b:
-                time_edit[:, :, a - start:b - start] = 1
-        # Earlier selected windows own intersections, so every time position is replaced once.
-        for left, right in written:
-            a, b = max(start, left), min(end, right)
-            if a < b:
-                time_edit[:, :, a - start:b - start] = 0
-        mask.mul_(time_edit)
-        dtype = torch.promote_types(video.dtype, result[0].dtype)
-        video = video.to(dtype=dtype)
-        retained = result[0][:, :, start:end].to(device=video.device, dtype=dtype)
-        parts[0] = torch.where(mask > 0, video, retained)
-        denoise_masks = [mask]
-        if len(parts) > 1:
-            if not keep_audio:
-                raise ValueError("局部回修当前仅修改视频，请保留原音频")
-            parts[1] = original[1][..., bounds[2]:bounds[3]].to(device=parts[1].device, copy=True)
-            denoise_masks.append(torch.zeros((parts[1].shape[0], 1, 1, parts[1].shape[-1]),
-                                             device=parts[1].device, dtype=torch.float32))
-        sample_input = _join(parts, nested)
-        denoise_mask = _join(denoise_masks, nested)
-        segment_seed = (int(seed) + (int(offsets[index]) if index < len(offsets) else index)) & 0xFFFFFFFFFFFFFFFF
-        noise_full = generate_noise(noise, source, segment_seed)
-        local_noise = slice_latent({"samples": noise_full}, bounds)["samples"]
-        del noise_full
-        local_guider = (segment_guider(guider, bounds, sync_ref_video) if h3_context is None else
-                        prepare_segment_guider(guider, h3_context, bounds, parts[0].shape, segment_index=index))
-        x0_output = {}
-        callback = latent_preview.prepare_callback(local_guider.model_patcher, len(sigmas) - 1, x0_output)
-        sampled = local_guider.sample(local_noise, sample_input, sampler, sigmas,
-                                      denoise_mask=denoise_mask, callback=callback,
-                                      disable_pbar=not comfy.utils.PROGRESS_BAR_ENABLED, seed=segment_seed).cpu()
-        restore_preserved(sampled, sample_input, denoise_mask)
-        sampled_video = _streams(sampled)[0]
-        if "x0" in x0_output:
-            x0 = x0_output["x0"]
-            if nested and not x0.is_nested:
-                x0 = comfy.nested_tensor.NestedTensor(comfy.utils.unpack_latents(x0, [part.shape for part in parts]))
-            x0 = local_guider.model_patcher.model.process_latent_out(x0.cpu())
-            restore_preserved(x0, sample_input, denoise_mask)
-            x0_video = _streams(x0)[0]
-        else:
-            x0_video = sampled_video
-        if not torch.isfinite(sampled_video).all().item() or not torch.isfinite(x0_video).all().item():
-            raise ValueError("局部采样产生非有限值，已保留上一次完整结果；请检查采样与模型设置")
-        # Preserve promoted sampler precision without rounding retained values down.
-        dtype = torch.promote_types(result[0].dtype, sampled_video.dtype)
-        result[0] = result[0].to(dtype=dtype)
-        result[0][:, :, start:end].copy_(sampled_video.to(dtype=dtype))
-        dtype = torch.promote_types(denoised[0].dtype, x0_video.dtype)
-        denoised[0] = denoised[0].to(dtype=dtype)
-        region = denoised[0][:, :, start:end]
-        region.copy_(torch.where(mask.cpu() > 0, x0_video.to(dtype=dtype), region))
-        written.append((delivery_start, delivery_end))
+    with prepare_segment_conditions(h3_context, chunks, original[0].shape, targets) as prepared:
+        for index in targets:
+            bounds = chunks[index]
+            start, end = bounds[:2]
+            delivery_start, delivery_end = deliveries[index][:2]
+            chunk = slice_latent(source, bounds)
+            parts = _streams(chunk["samples"])
+            existing = chunk.get("noise_mask")
+            masks = _streams(existing) if existing is not None and existing.is_nested else [existing]
+            video = parts[0]
+            mask = (comfy.sampler_helpers.prepare_mask(masks[0].float(), video.shape, video.device).clone()
+                    if masks[0] is not None else torch.ones(
+                        (video.shape[0], 1, video.shape[2], video.shape[3], video.shape[4]),
+                        device=video.device, dtype=torch.float32))
+            time_edit = torch.zeros((1, 1, end - start, 1, 1), device=video.device, dtype=torch.float32)
+            for left, right in editable:
+                a, b = max(delivery_start, left), min(delivery_end, right)
+                if a < b:
+                    time_edit[:, :, a - start:b - start] = 1
+            # Earlier selected windows own intersections, so every time position is replaced once.
+            for left, right in written:
+                a, b = max(start, left), min(end, right)
+                if a < b:
+                    time_edit[:, :, a - start:b - start] = 0
+            mask.mul_(time_edit)
+            dtype = torch.promote_types(video.dtype, result[0].dtype)
+            video = video.to(dtype=dtype)
+            retained = result[0][:, :, start:end].to(device=video.device, dtype=dtype)
+            parts[0] = torch.where(mask > 0, video, retained)
+            denoise_masks = [mask]
+            if len(parts) > 1:
+                if not keep_audio:
+                    raise ValueError("局部回修当前仅修改视频，请保留原音频")
+                parts[1] = original[1][..., bounds[2]:bounds[3]].to(device=parts[1].device, copy=True)
+                denoise_masks.append(torch.zeros((parts[1].shape[0], 1, 1, parts[1].shape[-1]),
+                                                 device=parts[1].device, dtype=torch.float32))
+            sample_input = _join(parts, nested)
+            denoise_mask = _join(denoise_masks, nested)
+            segment_seed = (int(seed) + (int(offsets[index]) if index < len(offsets) else index)) & 0xFFFFFFFFFFFFFFFF
+            noise_full = generate_noise(noise, source, segment_seed)
+            local_noise = slice_latent({"samples": noise_full}, bounds)["samples"]
+            del noise_full
+            local_guider = (segment_guider(guider, bounds, sync_ref_video) if h3_context is None else
+                            prepared.guider(guider, index))
+            x0_output = {}
+            callback = latent_preview.prepare_callback(local_guider.model_patcher, len(sigmas) - 1, x0_output)
+            sampled = local_guider.sample(local_noise, sample_input, sampler, sigmas,
+                                          denoise_mask=denoise_mask, callback=callback,
+                                          disable_pbar=not comfy.utils.PROGRESS_BAR_ENABLED, seed=segment_seed).cpu()
+            restore_preserved(sampled, sample_input, denoise_mask)
+            sampled_video = _streams(sampled)[0]
+            if "x0" in x0_output:
+                x0 = x0_output["x0"]
+                if nested and not x0.is_nested:
+                    x0 = comfy.nested_tensor.NestedTensor(comfy.utils.unpack_latents(x0, [part.shape for part in parts]))
+                x0 = local_guider.model_patcher.model.process_latent_out(x0.cpu())
+                restore_preserved(x0, sample_input, denoise_mask)
+                x0_video = _streams(x0)[0]
+            else:
+                x0_video = sampled_video
+            if not torch.isfinite(sampled_video).all().item() or not torch.isfinite(x0_video).all().item():
+                raise ValueError("局部采样产生非有限值，已保留上一次完整结果；请检查采样与模型设置")
+            # Preserve promoted sampler precision without rounding retained values down.
+            dtype = torch.promote_types(result[0].dtype, sampled_video.dtype)
+            result[0] = result[0].to(dtype=dtype)
+            result[0][:, :, start:end].copy_(sampled_video.to(dtype=dtype))
+            dtype = torch.promote_types(denoised[0].dtype, x0_video.dtype)
+            denoised[0] = denoised[0].to(dtype=dtype)
+            region = denoised[0][:, :, start:end]
+            region.copy_(torch.where(mask.cpu() > 0, x0_video.to(dtype=dtype), region))
+            written.append((delivery_start, delivery_end))
     output = dict(source, samples=_join(result, nested))
     return output, dict(source, samples=_join(denoised, nested)), merge_intervals(editable)

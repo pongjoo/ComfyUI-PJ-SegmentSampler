@@ -10,7 +10,7 @@ from .segment_boundaries import constrain_boundaries, restore_preserved
 from .segment_timing import (plan_segments, plan_relay_segments, resolve_plan, segment_seconds,
                             zero_overlap, delivery_chunks)
 from .segment_relay import sample_relay
-from .pj_h3_context import prepare_segment_guider
+from .pj_h3_context import prepare_segment_conditions
 from .segment_local_repair import repair_segments, repair_sigmas, slice_latent
 from .segment_revision import RevisionStore
 from .segment_sampling import (SegmentCache, sampling_signature, fingerprint, generate_noise,
@@ -478,86 +478,87 @@ class PJ_FirstPass_SegmentSampler:
         disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
         if constrain:
             print("[PJ一采] 接缝约束：固定已有重叠内容；缓存缺失的分段将重新生成")
-        for idx, (v_start, v_end, a_start, a_end) in enumerate(chunks):
-            if retained[idx] is not None:
-                sampled_chunks.append(retained[idx])
-                print(f"[PJ分段采样] 第 {idx + 1}/{n_chunks} 段复用缓存")
-                continue
-            chunk_v = full_video[:, :, v_start:v_end].clone()
-            if is_nested and full_audio is not None:
-                chunk_a = full_audio[..., a_start:a_end].clone()
-                chunk_latent_samples = comfy.nested_tensor.NestedTensor((chunk_v, chunk_a))
-            else:
-                chunk_latent_samples = chunk_v
-            bounds = (v_start, v_end, a_start, a_end)
-            chunk_mask = slice_mask(latent_image.get("noise_mask"), bounds)
-            if constrain:
-                sources = [(chunks[i], value) for i, value in enumerate(retained) if value is not None]
-                sources += [(chunks[i], value) for i, value in enumerate(sampled_chunks) if retained[i] is None]
-                chunk_latent_samples, chunk_mask = constrain_boundaries(chunk_latent_samples, chunk_mask, bounds, sources)
-                del sources
-            seg_offset = offsets[idx] if idx < len(offsets) else idx
-            seg_seed = (seed_val + seg_offset) & 0xFFFFFFFFFFFFFFFF
+        pending = [index for index, value in enumerate(retained) if value is None]
+        with prepare_segment_conditions(h3_context, chunks, full_video.shape, pending) as prepared:
+            for idx, (v_start, v_end, a_start, a_end) in enumerate(chunks):
+                if retained[idx] is not None:
+                    sampled_chunks.append(retained[idx])
+                    print(f"[PJ分段采样] 第 {idx + 1}/{n_chunks} 段复用缓存")
+                    continue
+                chunk_v = full_video[:, :, v_start:v_end].clone()
+                if is_nested and full_audio is not None:
+                    chunk_a = full_audio[..., a_start:a_end].clone()
+                    chunk_latent_samples = comfy.nested_tensor.NestedTensor((chunk_v, chunk_a))
+                else:
+                    chunk_latent_samples = chunk_v
+                bounds = (v_start, v_end, a_start, a_end)
+                chunk_mask = slice_mask(latent_image.get("noise_mask"), bounds)
+                if constrain:
+                    sources = [(chunks[i], value) for i, value in enumerate(retained) if value is not None]
+                    sources += [(chunks[i], value) for i, value in enumerate(sampled_chunks) if retained[i] is None]
+                    chunk_latent_samples, chunk_mask = constrain_boundaries(chunk_latent_samples, chunk_mask, bounds, sources)
+                    del sources
+                seg_offset = offsets[idx] if idx < len(offsets) else idx
+                seg_seed = (seed_val + seg_offset) & 0xFFFFFFFFFFFFFFFF
 
-            # Need to sample this segment
-            print(f"\n[PJ一采分段采样器] 🎲 >>> 开始采样第 {idx + 1}/{n_chunks} 段 (视频 [{v_start}:{v_end}], 独立种子: {seg_seed}) ...")
+                # Need to sample this segment
+                print(f"\n[PJ一采分段采样器] 🎲 >>> 开始采样第 {idx + 1}/{n_chunks} 段 (视频 [{v_start}:{v_end}], 独立种子: {seg_seed}) ...")
 
-            # Generate from the full shape so equal seeds share noise at equal absolute positions.
-            segment_noise = generate_noise(noise, latent_image, seg_seed)
-            if is_nested:
-                noise_streams = segment_noise.unbind()
-                chunk_noise = comfy.nested_tensor.NestedTensor((
-                    noise_streams[0][:, :, v_start:v_end].clone(),
-                    noise_streams[1][..., a_start:a_end].clone(),
-                ))
-                del noise_streams
-            else:
-                chunk_noise = segment_noise[:, :, v_start:v_end].clone()
-            del segment_noise
-            if h3_context is None:
-                chunk_guider = segment_guider(guider, bounds, sync_ref_video)
-            else:
-                previous_tail = None
-                if sampled_chunks and not no_overlap:
-                    previous_start, previous_end = chunks[idx - 1][:2]
-                    overlap = min(v_end, previous_end) - v_start
-                    if previous_start <= v_start < previous_end and v_start % 5 == 0 and overlap % 5 == 2:
-                        previous_video = sampled_chunks[-1].unbind()[0] if is_nested else sampled_chunks[-1]
-                        offset = v_start - previous_start
-                        previous_tail = previous_video[:, :, offset:offset + overlap]
-                chunk_guider = prepare_segment_guider(guider, h3_context, bounds, chunk_v.shape,
-                                                       previous_tail=previous_tail, segment_index=idx)
+                # Generate from the full shape so equal seeds share noise at equal absolute positions.
+                segment_noise = generate_noise(noise, latent_image, seg_seed)
+                if is_nested:
+                    noise_streams = segment_noise.unbind()
+                    chunk_noise = comfy.nested_tensor.NestedTensor((
+                        noise_streams[0][:, :, v_start:v_end].clone(),
+                        noise_streams[1][..., a_start:a_end].clone(),
+                    ))
+                    del noise_streams
+                else:
+                    chunk_noise = segment_noise[:, :, v_start:v_end].clone()
+                del segment_noise
+                if h3_context is None:
+                    chunk_guider = segment_guider(guider, bounds, sync_ref_video)
+                else:
+                    previous_tail = None
+                    if sampled_chunks and not no_overlap:
+                        previous_start, previous_end = chunks[idx - 1][:2]
+                        overlap = min(v_end, previous_end) - v_start
+                        if previous_start <= v_start < previous_end and v_start % 5 == 0 and overlap % 5 == 2:
+                            previous_video = sampled_chunks[-1].unbind()[0] if is_nested else sampled_chunks[-1]
+                            offset = v_start - previous_start
+                            previous_tail = previous_video[:, :, offset:offset + overlap]
+                    chunk_guider = prepared.guider(guider, idx, previous_tail)
 
-            chunk_x0_output = {}
-            chunk_callback = latent_preview.prepare_callback(
-                chunk_guider.model_patcher, sigmas.shape[-1] - 1, chunk_x0_output
-            )
-            chunk_out = chunk_guider.sample(
-                chunk_noise,
-                chunk_latent_samples,
-                sampler,
-                sigmas,
-                denoise_mask=chunk_mask,
-                callback=chunk_callback,
-                disable_pbar=disable_pbar,
-                seed=seg_seed,
-            )
+                chunk_x0_output = {}
+                chunk_callback = latent_preview.prepare_callback(
+                    chunk_guider.model_patcher, sigmas.shape[-1] - 1, chunk_x0_output
+                )
+                chunk_out = chunk_guider.sample(
+                    chunk_noise,
+                    chunk_latent_samples,
+                    sampler,
+                    sigmas,
+                    denoise_mask=chunk_mask,
+                    callback=chunk_callback,
+                    disable_pbar=disable_pbar,
+                    seed=seg_seed,
+                )
 
-            # Save to CPU and update cache
-            chunk_out_cpu = chunk_out.to("cpu")
-            restore_preserved(chunk_out_cpu, chunk_latent_samples, chunk_mask)
-            sampled_chunks.append(chunk_out_cpu)
-            if not constrain:
-                self._cache.save(idx, signatures[idx], chunk_out_cpu)
-            print(f"[PJ一采分段采样器] <<< 第 {idx + 1}/{n_chunks} 段采样完成。")
+                # Save to CPU and update cache
+                chunk_out_cpu = chunk_out.to("cpu")
+                restore_preserved(chunk_out_cpu, chunk_latent_samples, chunk_mask)
+                sampled_chunks.append(chunk_out_cpu)
+                if not constrain:
+                    self._cache.save(idx, signatures[idx], chunk_out_cpu)
+                print(f"[PJ一采分段采样器] <<< 第 {idx + 1}/{n_chunks} 段采样完成。")
 
-            # Clean temporary memory
-            del chunk_v, chunk_latent_samples, chunk_out, chunk_x0_output, chunk_guider
-            if "chunk_a" in locals() and chunk_a is not None:
-                del chunk_a
-            if "chunk_noise" in locals() and chunk_noise is not None:
-                del chunk_noise
-            comfy.model_management.soft_empty_cache()
+                # Clean temporary memory
+                del chunk_v, chunk_latent_samples, chunk_out, chunk_x0_output, chunk_guider
+                if "chunk_a" in locals() and chunk_a is not None:
+                    del chunk_a
+                if "chunk_noise" in locals() and chunk_noise is not None:
+                    del chunk_noise
+                comfy.model_management.soft_empty_cache()
 
         if constrain:
             blend_mode = "保留边界"

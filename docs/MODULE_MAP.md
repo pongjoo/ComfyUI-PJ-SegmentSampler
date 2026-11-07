@@ -34,6 +34,8 @@
 
 prepare_segment_guider(base_guider, context, bounds, video_shape, previous_tail=None, segment_index=0) 接收绝对采样边界与当前窗口形状，调用者不得先重复裁剪 guider。运动尾部须相位对齐且为 2+5k 视频潜步，不构造反向多帧引导。未接上下文时继续原有条件切片，不依赖 Easy 私有模块。
 
+采样编排使用 pj_h3_context.prepare_segment_conditions(context, chunks, video_shape, indices) 上下文管理器，先编码待采样窗口并释放编码模型，再以 prepared.guider(base_guider, index, previous_tail) 读取单段条件、追加实时运动尾部。一次执行独占 pj_conditions_* 临时目录，保持原张量精度，成功或异常退出均清理，不缓存跨执行条件。接力/顺序精修传入失效后缀，独立分段和局部回修传入实际目标；窗口与缓存决策仍归采样编排所有。tests/test_condition_preparation.py 覆盖阶段顺序、选择范围、原生条件等价和失败清理。
+
 repair_segments 的 baseline 拥有保留区，initial_latent 可为新放大结果；delivery_bounds 限制交付，editable_ranges 可精确指定一采变更。空间零遮罩与时间保护共同限制采样，内部时间遮罩不写回输出。局部回修保留原音，sampled 和 x0 分别组装，不用 sampled 冒充已有完整 x0。
 
 ## 状态归属

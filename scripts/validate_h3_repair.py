@@ -17,6 +17,7 @@ import sys
 import time
 import urllib.parse
 import urllib.request
+from unittest.mock import patch
 
 import numpy as np
 from PIL import Image, ImageOps
@@ -29,6 +30,7 @@ COMFY_ROOT = ROOT.parent.parent
 def arguments():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--plugin-root", default=str(ROOT), help="Plugin checkout to validate; permits before/after comparisons with the same harness.")
     parser.add_argument("--model", default="海螺/minimax_h3_hybrid_fl2va_ref2va_b25-49-int8.safetensors")
     parser.add_argument("--clip", default="qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors")
     parser.add_argument("--vae", default="minimax_h3_video_vae_int8_convrot.safetensors")
@@ -64,6 +66,7 @@ def arguments():
     parser.add_argument("--relay-smoke", action="store_true", help="Validate native H3 motion-context relay windows instead of local repaint.")
     parser.add_argument("--relay-chunk-seconds", type=float, default=39 / 24,
                         help="Requested relay window duration; backend resolves the H3 frame grid.")
+    parser.add_argument("--trace-conditions", action="store_true", help="Save relay conditions and noise for numerical before/after checks.")
     parser.add_argument("--refine-smoke", action="store_true", help="Validate full latent upscale, second pass, then a linked local update. Requires the installed Easy 3D upscaler node.")
     parser.add_argument("--upscaler-model", default="minimax_h3_latent_upscaler_3d_bf16.safetensors")
     parser.add_argument("--refine-width", type=int, default=640)
@@ -311,9 +314,34 @@ def run_relay_comparison(clip, vae, guider, sampler, sigmas, empty, started, con
     node = PJ_FirstPass_SegmentSampler()
     logging.info("Sampling native H3 motion-context relay with %.3f-second requested windows and 22-frame context",
                  options.relay_chunk_seconds)
-    result, first = node.execute(Noise_RandomNoise(options.seed), guider, sampler, sigmas, empty,
-                                 segment_plan=plan, generation_mode="22帧接力", h3_context=context,
-                                 unload_model_after_sampling=False)
+    phases = []
+    original_sample = type(guider).sample
+    original_encode = clip.encode_from_tokens_scheduled
+
+    def timed(kind, function, *args, **kwargs):
+        begin = time.perf_counter()
+        value = function(*args, **kwargs)
+        phases.append({"kind": kind, "seconds": time.perf_counter() - begin})
+        return value
+
+    def sample(instance, *args, **kwargs):
+        if options.trace_conditions:
+            index = sum(item["kind"] == "sample" for item in phases)
+            saved = {name: [{key: value for key, value in condition.items() if key != "uuid"}
+                            for condition in conditions] for name, conditions in instance.original_conds.items()}
+            torch.save(saved, output / f"conditions-{index}.pt")
+            torch.save(list(args[0].unbind()), output / f"noise-{index}.pt")
+        return timed("sample", original_sample, instance, *args, **kwargs)
+
+    def encode(*args, **kwargs):
+        return timed("encode", original_encode, *args, **kwargs)
+
+    sampling_started = time.perf_counter()
+    with patch.object(type(guider), "sample", sample), patch.object(clip, "encode_from_tokens_scheduled", encode):
+        result, first = node.execute(Noise_RandomNoise(options.seed), guider, sampler, sigmas, empty,
+                                     segment_plan=plan, generation_mode="22帧接力", h3_context=context,
+                                     unload_model_after_sampling=False)
+    sampling_seconds = time.perf_counter() - sampling_started
     video, audio = result["samples"].unbind()
     chunks = plan_relay_segments(video.shape[2], audio.shape[-1], options.relay_chunk_seconds)
     failures, overlap_checks = [], []
@@ -359,6 +387,7 @@ def run_relay_comparison(clip, vae, guider, sampler, sigmas, empty, started, con
               "video_shape": list(video.shape), "audio_shape": list(audio.shape),
               "decoded_frames": frames.shape[0], "quality_clues": quality,
               "elapsed_seconds": time.perf_counter() - started,
+              "sampling_seconds": sampling_seconds, "phases": phases,
               "peak_cuda_allocated_bytes": torch.cuda.max_memory_allocated(),
                "reference_inputs": reference_report(),
               "unconfirmed": ["This smoke test checks the native conditioning path and timeline integrity, not perceptual seam quality."]}
@@ -480,6 +509,9 @@ def run_refine_comparison(vae, guider, sampler, sigmas, empty, baseline, started
 
 if __name__ == "__main__":
     options = arguments()
+    plugin_root = Path(options.plugin_root).resolve()
+    if not (plugin_root / "__init__.py").is_file():
+        raise FileNotFoundError(plugin_root / "__init__.py")
     local_inputs = [options.baseline_file, options.prompt_file, options.reference_video,
                     options.mask_file, *options.reference_image]
     for filename in filter(None, local_inputs):
@@ -530,7 +562,8 @@ if __name__ == "__main__":
     write_json(output / "preflight.json", {"weights": resolved, "queue_empty_at_start": True,
                                            "reference_inputs": reference_report(),
                                            "baseline_file": options.baseline_file,
-                                           "comfy_root": str(COMFY_ROOT), "real_sampling_requested": not options.preflight and not options.executor_smoke_test})
+                                           "comfy_root": str(COMFY_ROOT), "plugin_root": str(plugin_root),
+                                           "real_sampling_requested": not options.preflight and not options.executor_smoke_test})
     if options.preflight:
         print(json.dumps({"weights_found": list(resolved), "output_dir": str(output)}, ensure_ascii=False))
         sys.exit(0)
@@ -546,7 +579,7 @@ if __name__ == "__main__":
     from comfy_extras.nodes_minimax_h3 import MiniMaxH3ImageToVideo
     from analyze_segment_outputs import analyze_outputs, frame_metrics
 
-    spec = importlib.util.spec_from_file_location("pj_h3_validation", ROOT / "__init__.py", submodule_search_locations=[str(ROOT)])
+    spec = importlib.util.spec_from_file_location("pj_h3_validation", plugin_root / "__init__.py", submodule_search_locations=[str(plugin_root)])
     package = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = package
     spec.loader.exec_module(package)

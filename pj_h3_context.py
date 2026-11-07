@@ -1,7 +1,13 @@
 """Rebuild native H3 conditions for one timeline window without decoding its result."""
 
+from contextlib import contextmanager
 import json
+from pathlib import Path
+import tempfile
+import time
 
+import torch
+import comfy.model_management
 import nodes
 from comfy_api.latest import io
 from comfy_extras.nodes_minimax_h3 import MiniMaxH3ImageToVideo, MiniMaxH3ReferenceToVideo
@@ -131,7 +137,11 @@ def motion_keyframes(previous_tail, video_shape):
 def prepare_segment_guider(base_guider, context, bounds, video_shape,
                            previous_tail=None, segment_index=0):
     """Keep the guider policy/negative branch; rebuild positive semantics from raw inputs."""
-    guider = segment_guider(base_guider, bounds, context["sync_video"])
+    positive = _encode_segment_conditions(context, bounds, video_shape, segment_index)
+    return _apply_segment_conditions(base_guider, context, bounds, video_shape, positive, previous_tail)
+
+
+def _encode_segment_conditions(context, bounds, video_shape, segment_index):
     if len(video_shape) != 5 or video_shape[1] != 24 or video_shape[2] != bounds[1] - bounds[0]:
         raise ValueError("H3 分段条件需要当前窗口的原生视频潜空间形状")
     frame_start = frames_for_tokens(bounds[0])
@@ -174,8 +184,11 @@ def prepare_segment_guider(base_guider, context, bounds, video_shape,
             ref_image_size=context["ref_image_size"], **size)
     else:
         prepared = MiniMaxH3ImageToVideo.execute(context["clip"], context["vae"], prompt=prompt, **size)
-    positive = prepared.result[0]
-    del prepared
+    return prepared.result[0]
+
+
+def _apply_segment_conditions(base_guider, context, bounds, video_shape, positive, previous_tail=None):
+    guider = segment_guider(base_guider, bounds, context["sync_video"])
     guides = motion_keyframes(previous_tail, tuple(video_shape)) if previous_tail is not None and context["motion_context"] else []
     templates = guider.original_conds.get("positive") or [{}]
     rebuilt = []
@@ -195,3 +208,56 @@ def prepare_segment_guider(base_guider, context, bounds, video_shape,
             rebuilt.append([embedding, metadata])
     guider.inner_set_conds({"positive": rebuilt})
     return guider
+
+
+def _conditions_to_cpu(value):
+    if isinstance(value, torch.Tensor):
+        return value.detach().to(device="cpu", copy=True)
+    if isinstance(value, dict):
+        return {key: _conditions_to_cpu(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return type(value)(_conditions_to_cpu(item) for item in value)
+    return value
+
+
+class _PreparedSegmentConditions:
+    def __init__(self, directory, context, chunks, video_shape):
+        self.directory = Path(directory)
+        self.context = context
+        self.chunks = chunks
+        self.video_shape = tuple(video_shape)
+
+    def shape(self, index):
+        start, end = self.chunks[index][:2]
+        return (*self.video_shape[:2], end - start, *self.video_shape[3:])
+
+    def guider(self, base_guider, index, previous_tail=None):
+        positive = torch.load(self.directory / f"{index}.pt", map_location="cpu", weights_only=True)
+        return _apply_segment_conditions(base_guider, self.context, self.chunks[index],
+                                         self.shape(index), positive, previous_tail)
+
+
+@contextmanager
+def prepare_segment_conditions(context, chunks, video_shape, indices):
+    """Encode only scheduled windows before sampling; discard all files on exit."""
+    indices = list(indices)
+    if context is None or not indices:
+        yield None
+        return
+    with tempfile.TemporaryDirectory(prefix="pj_conditions_") as directory:
+        prepared = _PreparedSegmentConditions(directory, context, chunks, video_shape)
+        started = time.perf_counter()
+        comfy.model_management.unload_all_models()
+        comfy.model_management.soft_empty_cache()
+        try:
+            for index in indices:
+                comfy.model_management.throw_exception_if_processing_interrupted()
+                print(f"[PJ条件] 预编码第 {index + 1}/{len(chunks)} 段")
+                positive = _encode_segment_conditions(context, chunks[index], prepared.shape(index), index)
+                torch.save(_conditions_to_cpu(positive), prepared.directory / f"{index}.pt")
+                del positive
+        finally:
+            comfy.model_management.unload_all_models()
+            comfy.model_management.soft_empty_cache()
+        print(f"[PJ条件] {len(indices)} 段准备完成（{time.perf_counter() - started:.1f}秒），开始连续采样")
+        yield prepared
