@@ -658,7 +658,7 @@ test('H3 context uses concise native Chinese controls', async () => {
     assert.equal(node.widgets.length, 4);
 });
 
-test('H3 context migrates the old image wire to the first native dynamic port', async () => {
+test('H3 context migrates all old media wires to native dynamic ports', async () => {
     let extension;
     const ctx = vm.createContext({app:{registerExtension(value) {extension=value;}}});
     vm.runInContext(source, ctx);
@@ -668,14 +668,18 @@ test('H3 context migrates the old image wire to the first native dynamic port', 
     await extension.beforeRegisterNodeDef(Node, {name:'PJ_H3SegmentContext'});
     const node = new Node();
     const info = {inputs:[{name:'clip',link:1},{name:'reference_images',type:'IMAGE',link:7},
-        {name:'reference_video',link:8}], widgets_values:['prompt','{}','原视频编辑（按时间裁剪）',true]};
+        {name:'reference_video',link:8}, {name:'reference_video_audio',link:9},
+        {name:'reference_audio',link:10}], widgets_values:['prompt','{}','原视频编辑（按时间裁剪）',true]};
     node.configure(info);
     assert.equal(node.loaded.inputs[1].name, 'ref_images.ref_image_0');
     assert.equal(node.loaded.inputs[1].link, 7);
-    assert.equal(node.loaded.inputs[2].name, 'reference_video');
+    assert.equal(node.loaded.inputs[2].name, 'ref_videos.ref_video_0');
+    assert.equal(node.loaded.inputs[3].name, 'ref_video_audios.ref_video_audio_0');
+    assert.equal(node.loaded.inputs[4].name, 'ref_audios.ref_audio_0');
+    assert.deepEqual(node.loaded.inputs.slice(2).map(input => input.link), [8, 9, 10]);
     assert.deepEqual(node.loaded.widgets_values, ['prompt','{}','原视频编辑（按时间裁剪）',true]);
     node.configure(info);
-    assert.equal(node.loaded.inputs.length, 3);
+    assert.equal(node.loaded.inputs.length, 5);
 });
 
 test('H3 preparation nodes preserve saved custom colors on configure', async () => {

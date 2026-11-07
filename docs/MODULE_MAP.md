@@ -6,7 +6,7 @@
 | 时间规划 | segment_timing.py | 帧/潜步换算、规则解析、zero_overlap、delivery_chunks；区分合法采样窗与交付区，不持有张量 |
 | 规划与预览 | pj_segment_planner.py | PJ_SEGMENT_PLAN、媒体/规则预览、可选 FFmpeg 播放器 |
 | 空间编辑准备 | pj_h3_edit_prepare.py / PJ_H3EditPrepare.prepare | 对齐原视频、目标和 MASK，输出原生 AV LATENT/noise_mask；不拥有 SAM 或 VAE 编码 |
-| H3 条件准备与目标创建 | pj_h3_context.py / PJ_H3SegmentContext.define_schema、execute、prepare、prepare_segment_guider | V3 动态图片接口；execute 通过原生节点创建向下对齐的目标 AV 潜空间和空提示词基础条件，输出上下文/目标/基础条件；上下文保留各图独立尺寸及 match/max 策略，按实际采样窗建立条件；prepare 保持单上下文返回契约 |
+| H3 条件准备与目标创建 | pj_h3_context.py / PJ_H3SegmentContext.define_schema、execute、prepare、prepare_segment_guider | V3 图片/视频/配套音轨/独立音频四组动态接口，按编号排序并配对；execute 通过原生节点创建向下对齐的目标 AV 潜空间和空提示词基础条件；上下文拥有原始媒体引用与策略，逐窗独立裁剪各路视频和配套音轨，按实际尺寸建立条件；prepare 保持单上下文返回及旧单路参数契约 |
 | 采样基础 | segment_sampling.py | 条件/遮罩切片、噪声、按交付范围融合及 SegmentCache；段缓存归采样器实例所有 |
 | 边界保护 | segment_boundaries.py | constrain_boundaries、restore_preserved；空间零遮罩优先，恢复锁定值，无持久状态 |
 | 局部回修 | segment_local_repair.py | repair_sigmas、repair_segments；旧结果拥有保留区，新输入可提供精修中部，仅写交付区，返回完整 sampled/x0 及变更范围 |

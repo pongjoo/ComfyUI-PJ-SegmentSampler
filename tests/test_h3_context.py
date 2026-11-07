@@ -15,7 +15,7 @@ import nodes
 import comfy.samplers
 from execution import PromptExecutor, validate_prompt
 from comfy.ldm.minimax.model import FRAME_RESCALE, _video_t_grid
-from comfy_extras.nodes_minimax_h3 import video_latent_t
+from comfy_extras.nodes_minimax_h3 import MiniMaxH3ReferenceToVideo, video_latent_t
 
 package = ModuleType("pj_h3_context_test")
 package.__path__ = [str(ROOT)]
@@ -85,7 +85,7 @@ class ContextTests(unittest.TestCase):
         self.assertEqual(tuple(audio.shape), (1, 32, 2, 1595))
         self.assertEqual(video.count_nonzero().item(), 0)
         self.assertEqual(audio.count_nonzero().item(), 0)
-        self.assertIs(context["reference_video"], reference)
+        self.assertIs(context["ref_videos"]["ref_video_0"], reference)
         self.assertEqual(context["prompt"], "replace shoes")
         self.assertEqual(self.vae.calls, [])
         self.assertEqual(self.clip.calls, [("", {"images": []})])
@@ -141,19 +141,81 @@ class ContextTests(unittest.TestCase):
                 prepare_segment_guider(self.guider, context, (0, 12, 0, 65), (1, 24, 12, 2, 2))
                 self.assertEqual(tuple(self.vae.calls[0].shape), shape)
 
+    def test_all_reference_groups_use_native_dynamic_ports(self):
+        optional = self.node.INPUT_TYPES()["optional"]
+        for group in ("ref_images", "ref_videos", "ref_video_audios", "ref_audios"):
+            self.assertEqual(optional[group][0], "COMFY_AUTOGROW_V3")
+            self.assertEqual(optional[group][1]["template"]["min"], 0)
+            self.assertEqual(optional[group][1]["template"]["max"], 100)
+        for old in ("reference_video", "reference_video_audio", "reference_audio"):
+            self.assertNotIn(old, optional)
+
+    def test_multiple_edit_videos_pair_by_socket_number_and_slice_each_clock(self):
+        videos = {"ref_video_2": torch.rand(124, 32, 64, 3), "ref_video_0": torch.rand(90, 32, 32, 3)}
+        tracks = {"ref_video_audio_2": {"sample_rate": 48, "waveform": torch.arange(248.).view(1, 1, -1)},
+                  "ref_video_audio_0": {"sample_rate": 24, "waveform": torch.arange(90.).view(1, 1, -1)}}
+        independent = {"ref_audio_10": {"sample_rate": 24, "waveform": torch.ones(1, 1, 30)},
+                       "ref_audio_2": {"sample_rate": 24, "waveform": torch.zeros(1, 1, 25)}}
+        context = self.context(ref_videos=videos, ref_video_audios=tracks, ref_audios=independent,
+                               audio_vae=RecordingAudioVAE())
+        with patch("pj_h3_context_test.pj_h3_context.MiniMaxH3ReferenceToVideo.execute",
+                   wraps=MiniMaxH3ReferenceToVideo.execute) as native:
+            rebuilt = prepare_segment_guider(self.guider, context, (10, 22, 57, 122), (1, 24, 12, 2, 2))
+        passed = native.call_args.kwargs
+        self.assertEqual(list(passed["ref_videos"]), ["ref_video_0", "ref_video_2"])
+        for name, video in videos.items():
+            self.assertTrue(torch.equal(passed["ref_videos"][name], video[34:73]))
+        for name, audio in tracks.items():
+            scale = audio["sample_rate"] // 24
+            self.assertTrue(torch.equal(passed["ref_video_audios"][name]["waveform"],
+                                        audio["waveform"][..., 34 * scale:73 * scale]))
+        self.assertEqual(list(passed["ref_audios"]), ["ref_audio_2", "ref_audio_10"])
+        for name in independent:
+            self.assertIs(passed["ref_audios"][name], independent[name])
+        self.assertEqual([x["kind"] for x in rebuilt.original_conds["positive"][0]["minimax_refs"]],
+                         ["video_audio", "video_audio", "audio", "audio"])
+        self.assertEqual([x.shape[0] for x in self.vae.calls], [39, 39])
+
+    def test_material_videos_keep_independent_lengths_and_sparse_audio_pairing(self):
+        videos = {"ref_video_10": torch.zeros(322, 32, 32, 3), "ref_video_2": torch.ones(90, 32, 32, 3)}
+        audio = {"sample_rate": 24, "waveform": torch.ones(1, 1, 322)}
+        context = self.context(reference_mode="素材参考（保持完整）", ref_videos=videos,
+                               ref_video_audios={"ref_video_audio_10": audio}, audio_vae=RecordingAudioVAE())
+        with patch("pj_h3_context_test.pj_h3_context.MiniMaxH3ReferenceToVideo.execute",
+                   wraps=MiniMaxH3ReferenceToVideo.execute) as native:
+            prepare_segment_guider(self.guider, context, (10, 22, 57, 122), (1, 24, 12, 2, 2))
+        passed = native.call_args.kwargs
+        self.assertEqual(list(passed["ref_videos"]), ["ref_video_2", "ref_video_10"])
+        self.assertEqual([x.shape[0] for x in self.vae.calls], [90, 311])
+        self.assertEqual(list(passed["ref_video_audios"]), ["ref_video_audio_10"])
+        self.assertEqual(passed["ref_video_audios"]["ref_video_audio_10"]["waveform"].shape[-1], 311)
+        self.assertEqual(passed["length"], 311)
+
+    def test_orphan_soundtrack_and_short_second_video_fail_with_socket_context(self):
+        audio = {"sample_rate": 24, "waveform": torch.ones(1, 1, 90)}
+        with self.assertRaisesRegex(ValueError, "ref_video_audio_2.*同编号"):
+            self.context(ref_videos={"ref_video_0": torch.zeros(90, 32, 32, 3)},
+                         ref_video_audios={"ref_video_audio_2": audio})
+        context = self.context(ref_videos={"ref_video_0": torch.zeros(90, 32, 32, 3),
+                                          "ref_video_2": torch.zeros(22, 32, 32, 3)})
+        with self.assertRaisesRegex(ValueError, "第 2 段.*ref_video_2"):
+            prepare_segment_guider(self.guider, context, (10, 22, 57, 122), (1, 24, 12, 2, 2), segment_index=1)
+        self.assertEqual(self.vae.calls, [])
+
     def test_native_executor_expands_dynamic_image_inputs(self):
         clip = self.clip
         images = (torch.zeros(1, 32, 64, 3), torch.ones(1, 64, 32, 3))
         captured = []
         targets = []
+        audio = {"sample_rate": 24, "waveform": torch.ones(1, 1, 90)}
 
         class Source:
             INPUT_TYPES = classmethod(lambda cls: {"required": {}})
-            RETURN_TYPES = ("CLIP", "IMAGE", "IMAGE", "INT", "INT", "INT")
+            RETURN_TYPES = ("CLIP", "IMAGE", "IMAGE", "INT", "INT", "INT", "AUDIO")
             FUNCTION = "run"
 
             def run(self):
-                return clip, *images, 64, 96, 322
+                return clip, *images, 64, 96, 322, audio
 
         class Sink:
             INPUT_TYPES = classmethod(lambda cls: {"required": {"context": ("PJ_H3_CONTEXT",)},
@@ -182,6 +244,10 @@ class ContextTests(unittest.TestCase):
                 if count:
                     prompt["context"]["inputs"].update(width=["source", 3], height=["source", 4], length=["source", 5])
                     prompt["sink"]["inputs"].update(latent=["context", 1], positive=["context", 2])
+                    for group, prefix, source_slot in (("ref_videos", "ref_video", 1),
+                            ("ref_video_audios", "ref_video_audio", 6), ("ref_audios", "ref_audio", 6)):
+                        for index in range(count):
+                            prompt["context"]["inputs"][f"{group}.{prefix}_{index}"] = ["source", source_slot]
                 prompt["context"]["inputs"].update({f"ref_images.ref_image_{i}": ["source", 1 + i % 2] for i in range(count)})
                 validated = asyncio.run(validate_prompt("autogrow-test", prompt, None))
                 self.assertTrue(validated[0], validated)
@@ -195,6 +261,8 @@ class ContextTests(unittest.TestCase):
                     latent, positive = targets[-1]
                     self.assertEqual(tuple(latent["samples"].unbind()[0].shape), (1, 24, 92, 6, 4))
                     self.assertNotIn("minimax_refs", positive[0][1])
+                for group in ("ref_videos", "ref_video_audios", "ref_audios"):
+                    self.assertEqual(len(captured[-1][group]), count)
                 for index, image in enumerate(actual or []):
                     self.assertTrue(torch.equal(image, images[index % 2][0]))
 

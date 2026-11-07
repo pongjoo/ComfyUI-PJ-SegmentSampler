@@ -1071,8 +1071,14 @@ app.registerExtension({
             if (nodeData.name === "PJ_H3SegmentContext") {
                 const configure = nodeType.prototype.configure;
                 nodeType.prototype.configure = function (info) {
+                    const renamed = {
+                        reference_images: "ref_images.ref_image_0",
+                        reference_video: "ref_videos.ref_video_0",
+                        reference_video_audio: "ref_video_audios.ref_video_audio_0",
+                        reference_audio: "ref_audios.ref_audio_0",
+                    };
                     for (const input of info.inputs || []) {
-                        if (input.name === "reference_images") input.name = "ref_images.ref_image_0";
+                        if (renamed[input.name]) input.name = renamed[input.name];
                     }
                     return configure?.apply(this, arguments);
                 };

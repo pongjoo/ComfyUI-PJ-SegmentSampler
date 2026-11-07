@@ -76,7 +76,7 @@ class ContextSamplingTests(unittest.TestCase):
         self.latent = self.empty_latent(107)
         frames = frames_for_tokens(107)
         reference = torch.arange(frames, dtype=torch.float32).view(-1, 1, 1, 1).expand(-1, 32, 32, 3) / 1000
-        self.context = dict(self.context, reference_video=reference)
+        self.context = dict(self.context, ref_videos={"ref_video_0": reference})
         result, _ = self.run_node()
         chunks = plan_relay_segments(107, result["samples"].unbind()[1].shape[-1], 6.)
         self.assertEqual(len(self.vae.calls), len(chunks))

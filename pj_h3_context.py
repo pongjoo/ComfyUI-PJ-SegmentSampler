@@ -26,9 +26,15 @@ class PJ_H3SegmentContext(io.ComfyNode):
                 io.Autogrow.Input("ref_images", optional=True, template=io.Autogrow.TemplatePrefix(
                     input=io.Image.Input("ref_image", tooltip="每个接口对应一张参考图；接入后自动增加下一接口"),
                     prefix="ref_image_", min=0, max=100)),
-                io.Image.Input("reference_video", optional=True, tooltip="24 FPS 参考视频，编辑模式按目标时间切片"),
-                io.Audio.Input("reference_video_audio", optional=True),
-                io.Audio.Input("reference_audio", optional=True),
+                io.Autogrow.Input("ref_videos", optional=True, template=io.Autogrow.TemplatePrefix(
+                    input=io.Image.Input("ref_video", tooltip="24 FPS 视频帧序列；编辑模式下各路视频均按目标时间切片"),
+                    prefix="ref_video_", min=0, max=100)),
+                io.Autogrow.Input("ref_video_audios", optional=True, template=io.Autogrow.TemplatePrefix(
+                    input=io.Audio.Input("ref_video_audio", tooltip="连接同编号参考视频的配套音轨，随该视频同步切片"),
+                    prefix="ref_video_audio_", min=0, max=100)),
+                io.Autogrow.Input("ref_audios", optional=True, template=io.Autogrow.TemplatePrefix(
+                    input=io.Audio.Input("ref_audio", tooltip="独立参考音频，不按目标视频时间切片"),
+                    prefix="ref_audio_", min=0, max=100)),
                 io.Vae.Input("audio_vae", optional=True),
                 io.Combo.Input("ref_image_size", options=["match", "max"], default="match",
                                display_name="参考图像尺寸", tooltip="使用官方规则：match 匹配目标像素面积；max 使用参考图像的最大尺寸策略"),
@@ -59,7 +65,8 @@ class PJ_H3SegmentContext(io.ComfyNode):
     def prepare(cls, clip, vae=None, prompt="", segment_prompts="{}",
                 reference_mode="原视频编辑（按时间裁剪）", motion_context=True,
                 reference_images=None, reference_video=None, reference_video_audio=None,
-                reference_audio=None, audio_vae=None, ref_images=None, ref_image_size="match"):
+                reference_audio=None, audio_vae=None, ref_images=None, ref_image_size="match",
+                ref_videos=None, ref_video_audios=None, ref_audios=None):
         try:
             prompts = json.loads(segment_prompts or "{}")
         except json.JSONDecodeError as exc:
@@ -68,8 +75,12 @@ class PJ_H3SegmentContext(io.ComfyNode):
                 not key.isdecimal() or int(key) < 1 or not isinstance(value, str)
                 for key, value in prompts.items()):
             raise ValueError("分段补充提示词的键为从 1 开始的段号，值为提示词文本")
-        if reference_video_audio is not None and reference_video is None:
-            raise ValueError("配套视频音轨需要连接参考视频；独立音频请连接 reference_audio")
+        videos = _reference_inputs(ref_videos, reference_video, "ref_video")
+        video_audios = _reference_inputs(ref_video_audios, reference_video_audio, "ref_video_audio")
+        audios = _reference_inputs(ref_audios, reference_audio, "ref_audio")
+        for name in video_audios:
+            if "ref_video_" + name.rsplit("_", 1)[-1] not in videos:
+                raise ValueError(f"配套视频音轨 {name} 需要连接同编号参考视频；独立音频请连接独立参考音频接口")
         images = list(reference_images) if reference_images is not None else []
         for name in sorted(ref_images or {}, key=lambda name: int(name.rsplit("_", 1)[-1])):
             image = ref_images[name]
@@ -81,9 +92,19 @@ class PJ_H3SegmentContext(io.ComfyNode):
             "sync_video": reference_mode == "原视频编辑（按时间裁剪）",
             "motion_context": motion_context, "reference_images": images or None,
             "ref_image_size": ref_image_size,
-            "reference_video": reference_video, "reference_video_audio": reference_video_audio,
-            "reference_audio": reference_audio, "audio_vae": audio_vae,
+            "ref_videos": videos, "ref_video_audios": video_audios,
+            "ref_audios": audios, "audio_vae": audio_vae,
         },)
+
+
+def _reference_inputs(dynamic, legacy, prefix):
+    values = {name: value for name, value in (dynamic or {}).items() if value is not None}
+    if legacy is not None:
+        first = f"{prefix}_0"
+        if first in values:
+            raise ValueError(f"{first} 重复输入：请只使用动态接口或旧版单输入参数之一")
+        values[first] = legacy
+    return {name: values[name] for name in sorted(values, key=lambda name: int(name.rsplit("_", 1)[-1]))}
 
 
 def _audio_window(audio, frame_start, frame_end):
@@ -122,30 +143,34 @@ def prepare_segment_guider(base_guider, context, bounds, video_shape,
     if addition:
         prompt = f"{prompt}\n{addition}" if prompt else addition
     images = context["reference_images"]
-    video = context["reference_video"]
-    video_audio = context["reference_video_audio"]
-    if video is not None and context["sync_video"]:
-        end = frame_start + frame_count
-        if video.shape[0] < end:
-            raise ValueError(f"参考视频不足以覆盖第 {segment_index + 1} 段 [{frame_start}:{end}]；续写请改用素材参考或提供完整视频")
-        video = video[frame_start:end]
-        video_audio = _audio_window(video_audio, frame_start, end)
-    elif video is not None and video.shape[0] >= 5:
-        # Match the native reference clip's floor rule for both paired streams.
-        reference_frames = 5 + ((video.shape[0] - 5) // 17) * 17
-        video = video[:reference_frames]
-        video_audio = _audio_window(video_audio, 0, reference_frames)
+    videos, video_audios = {}, {}
+    for name, source in context["ref_videos"].items():
+        audio_name = "ref_video_audio_" + name.rsplit("_", 1)[-1]
+        video_audio = context["ref_video_audios"].get(audio_name)
+        if context["sync_video"]:
+            end = frame_start + frame_count
+            if source.shape[0] < end:
+                raise ValueError(f"参考视频不足以覆盖第 {segment_index + 1} 段 [{frame_start}:{end}]（{name}）；续写请改用素材参考或提供完整视频")
+            video = source[frame_start:end]
+            video_audio = _audio_window(video_audio, frame_start, end)
+        else:
+            # Match each native reference clip's floor rule for its paired streams.
+            reference_frames = frames_for_tokens(tokens_for_frames_floor(source.shape[0]))
+            video = source[:reference_frames]
+            video_audio = _audio_window(video_audio, 0, reference_frames)
+        videos[name] = video
+        if video_audio is not None:
+            video_audios[audio_name] = video_audio
     # The native reference node caps references to its target length. Independent
     # material references must retain their own duration; its empty target is discarded.
-    native_length = max(frame_count, video.shape[0]) if video is not None and not context["sync_video"] else frame_count
+    native_length = max([frame_count] + [video.shape[0] for video in videos.values()])
     size = dict(width=video_shape[-1] * 16, height=video_shape[-2] * 16, length=native_length)
-    if any(value is not None for value in (images, video, context["reference_audio"])):
+    if images or videos or context["ref_audios"]:
         prepared = MiniMaxH3ReferenceToVideo.execute(
             context["clip"], prompt=prompt, vae=context["vae"], audio_vae=context["audio_vae"],
             ref_images={f"ref_image_{i + 1}": image[None] for i, image in enumerate(images)} if images is not None else None,
-            ref_videos={"ref_video_1": video} if video is not None else None,
-            ref_video_audios={"ref_video_audio_1": video_audio} if video_audio is not None else None,
-            ref_audios={"ref_audio_1": context["reference_audio"]} if context["reference_audio"] is not None else None,
+            ref_videos=videos or None, ref_video_audios=video_audios or None,
+            ref_audios=context["ref_audios"] or None,
             ref_image_size=context["ref_image_size"], **size)
     else:
         prepared = MiniMaxH3ImageToVideo.execute(context["clip"], context["vae"], prompt=prompt, **size)
