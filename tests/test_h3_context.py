@@ -74,6 +74,45 @@ class ContextTests(unittest.TestCase):
     def context(self, **kwargs):
         return self.node.prepare(self.clip, self.vae, "global prompt", **kwargs)[0]
 
+    def test_target_outputs_floor_length_without_encoding_full_references(self):
+        reference = torch.zeros(960, 32, 32, 3)
+        image = torch.zeros(1, 32, 64, 3)
+        context, latent, positive = self.node.execute(
+            clip=self.clip, vae=self.vae, prompt="replace shoes", width=64, height=96, length=960,
+            reference_video=reference, ref_images={"ref_image_0": image}).result
+        video, audio = latent["samples"].unbind()
+        self.assertEqual(tuple(video.shape), (1, 24, 282, 6, 4))
+        self.assertEqual(tuple(audio.shape), (1, 32, 2, 1595))
+        self.assertEqual(video.count_nonzero().item(), 0)
+        self.assertEqual(audio.count_nonzero().item(), 0)
+        self.assertIs(context["reference_video"], reference)
+        self.assertEqual(context["prompt"], "replace shoes")
+        self.assertEqual(self.vae.calls, [])
+        self.assertEqual(self.clip.calls, [("", {"images": []})])
+        self.assertNotIn("minimax_refs", positive[0][1])
+        self.assertEqual(len(self.node.prepare(self.clip)), 1)
+
+    def test_target_frame_floor_edges_and_legacy_defaults(self):
+        for frames, tokens in ((5, 2), (21, 2), (22, 7), (322, 92), (328, 97)):
+            with self.subTest(frames=frames):
+                _, latent, _ = self.node.execute(clip=self.clip, width=32, height=32, length=frames).result
+                self.assertEqual(latent["samples"].unbind()[0].shape[2], tokens)
+        inputs = self.node.INPUT_TYPES()
+        for name in ("width", "height", "length"):
+            self.assertIn(name, inputs["optional"])
+        self.assertEqual(list(self.node.RETURN_TYPES), ["PJ_H3_CONTEXT", "LATENT", "CONDITIONING"])
+
+    def test_second_pass_conditions_use_actual_shape_not_target_dimensions(self):
+        context, _, _ = self.node.execute(clip=self.clip, vae=self.vae, width=32, height=32, length=960,
+                                         prompt="replace shoes", segment_prompts='{"2":"preserve logo"}',
+                                         ref_images={"ref_image_0": torch.ones(1, 128, 96, 3)}).result
+        rebuilt = prepare_segment_guider(self.guider, context, (35, 77, 198, 433),
+                                         (1, 24, 42, 8, 6), segment_index=1)
+        self.assertEqual(self.clip.calls[-1][0], "replace shoes\npreserve logo")
+        self.assertEqual(tuple(self.vae.calls[-1].shape), (1, 128, 96, 3))
+        ref = rebuilt.original_conds["positive"][0]["minimax_refs"][0]
+        self.assertEqual((ref["latent_h"], ref["latent_w"]), (8, 6))
+
     def test_native_autogrow_schema_has_no_batch_socket(self):
         inputs = self.node.INPUT_TYPES()
         dynamic = inputs["optional"]["ref_images"]
@@ -106,23 +145,26 @@ class ContextTests(unittest.TestCase):
         clip = self.clip
         images = (torch.zeros(1, 32, 64, 3), torch.ones(1, 64, 32, 3))
         captured = []
+        targets = []
 
         class Source:
             INPUT_TYPES = classmethod(lambda cls: {"required": {}})
-            RETURN_TYPES = ("CLIP", "IMAGE", "IMAGE")
+            RETURN_TYPES = ("CLIP", "IMAGE", "IMAGE", "INT", "INT", "INT")
             FUNCTION = "run"
 
             def run(self):
-                return clip, *images
+                return clip, *images, 64, 96, 322
 
         class Sink:
-            INPUT_TYPES = classmethod(lambda cls: {"required": {"context": ("PJ_H3_CONTEXT",)}})
+            INPUT_TYPES = classmethod(lambda cls: {"required": {"context": ("PJ_H3_CONTEXT",)},
+                "optional": {"latent": ("LATENT",), "positive": ("CONDITIONING",)}})
             RETURN_TYPES = ()
             FUNCTION = "run"
             OUTPUT_NODE = True
 
-            def run(self, context):
+            def run(self, context, latent=None, positive=None):
                 captured.append(context)
+                targets.append((latent, positive))
                 return ()
 
         server = SimpleNamespace(client_id=None, send_sync=lambda *args, **kwargs: None)
@@ -137,6 +179,9 @@ class ContextTests(unittest.TestCase):
         with patch.dict(nodes.NODE_CLASS_MAPPINGS, {"PJImageTestSource": Source, "PJImageTestSink": Sink,
                                                    "PJ_H3SegmentContext": PJ_H3SegmentContext}):
             for count in (0, 1, 12):
+                if count:
+                    prompt["context"]["inputs"].update(width=["source", 3], height=["source", 4], length=["source", 5])
+                    prompt["sink"]["inputs"].update(latent=["context", 1], positive=["context", 2])
                 prompt["context"]["inputs"].update({f"ref_images.ref_image_{i}": ["source", 1 + i % 2] for i in range(count)})
                 validated = asyncio.run(validate_prompt("autogrow-test", prompt, None))
                 self.assertTrue(validated[0], validated)
@@ -146,6 +191,10 @@ class ContextTests(unittest.TestCase):
                 self.assertEqual(len(actual or []), count)
                 self.assertEqual(captured[-1]["ref_image_size"], "max")
                 self.assertIs(captured[-1]["clip"], clip)
+                if count:
+                    latent, positive = targets[-1]
+                    self.assertEqual(tuple(latent["samples"].unbind()[0].shape), (1, 24, 92, 6, 4))
+                    self.assertNotIn("minimax_refs", positive[0][1])
                 for index, image in enumerate(actual or []):
                     self.assertTrue(torch.equal(image, images[index % 2][0]))
 

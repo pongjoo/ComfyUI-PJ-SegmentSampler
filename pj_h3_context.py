@@ -2,11 +2,12 @@
 
 import json
 
+import nodes
 from comfy_api.latest import io
 from comfy_extras.nodes_minimax_h3 import MiniMaxH3ImageToVideo, MiniMaxH3ReferenceToVideo
 
 from .segment_sampling import segment_guider
-from .segment_timing import frames_for_tokens
+from .segment_timing import frames_for_tokens, tokens_for_frames_floor
 
 
 class PJ_H3SegmentContext(io.ComfyNode):
@@ -31,13 +32,28 @@ class PJ_H3SegmentContext(io.ComfyNode):
                 io.Vae.Input("audio_vae", optional=True),
                 io.Combo.Input("ref_image_size", options=["match", "max"], default="match",
                                display_name="参考图像尺寸", tooltip="使用官方规则：match 匹配目标像素面积；max 使用参考图像的最大尺寸策略"),
+                io.Int.Input("width", optional=True, default=1344, min=32, max=nodes.MAX_RESOLUTION,
+                             step=32, display_name="目标宽度"),
+                io.Int.Input("height", optional=True, default=768, min=32, max=nodes.MAX_RESOLUTION,
+                             step=32, display_name="目标高度"),
+                io.Int.Input("length", optional=True, default=124, min=5, max=100000, step=1,
+                             display_name="总帧数", tooltip="24 FPS；按17n+5向下对齐。只决定目标潜空间长度，参考条件仍按段编码"),
             ],
-            outputs=[io.Custom("PJ_H3_CONTEXT").Output(display_name="H3分段上下文")],
+            outputs=[
+                io.Custom("PJ_H3_CONTEXT").Output(display_name="H3分段上下文"),
+                io.Latent.Output(display_name="目标音视频潜空间"),
+                io.Conditioning.Output(display_name="基础正面条件",
+                                       tooltip="连接引导器；实际提示词和参考素材由PJ采样器读取H3分段上下文后逐段编码"),
+            ],
         )
 
     @classmethod
-    def execute(cls, **kwargs):
-        return io.NodeOutput(*cls.prepare(**kwargs))
+    def execute(cls, width=1344, height=768, length=124, **kwargs):
+        context, = cls.prepare(**kwargs)
+        length = frames_for_tokens(tokens_for_frames_floor(length))
+        base = MiniMaxH3ImageToVideo.execute(context["clip"], context["vae"], prompt="",
+                                           width=width, height=height, length=length)
+        return io.NodeOutput(context, base.result[1], base.result[0])
 
     @classmethod
     def prepare(cls, clip, vae=None, prompt="", segment_prompts="{}",

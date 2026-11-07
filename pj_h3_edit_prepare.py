@@ -12,7 +12,7 @@ class PJ_H3EditPrepare:
     @classmethod
     def INPUT_TYPES(cls):
         return {"required": {
-            "av_latent": ("LATENT", {"tooltip": "接 MiniMaxH3ReferenceToVideo 的第2个输出：目标音视频潜空间"}),
+            "av_latent": ("LATENT", {"tooltip": "接PJ H3分段条件准备的目标音视频潜空间，或官方H3参考节点的第2个输出"}),
             "source_latent": ("LATENT", {"tooltip": "原视频以相同尺寸、相同时间范围经H3视频VAE编码的结果"}),
             "edit_mask": ("MASK", {"tooltip": "SAM或手绘遮罩：白色允许编辑，黑色保留原视频。与编码视频同尺寸，逐帧对应；单张遮罩应用于全片"}),
         }}
@@ -25,7 +25,7 @@ class PJ_H3EditPrepare:
     def prepare(self, av_latent, source_latent, edit_mask):
         samples = av_latent["samples"]
         if not samples.is_nested or len(samples.unbind()) != 2:
-            raise ValueError("目标输入需要H3音视频潜空间，请连接 MiniMaxH3ReferenceToVideo 的第2个输出")
+            raise ValueError("目标输入需要H3音视频潜空间，请连接PJ或官方H3节点的目标音视频潜空间输出")
         video, audio = samples.unbind()
         source = source_latent["samples"]
         if video.ndim != 5 or video.shape[1] != 24 or video.shape[2] % 5 != 2:
