@@ -3,7 +3,7 @@
 | 模块 | 实际入口 | 职责和数据归属 |
 |---|---|---|
 | 节点注册 | __init__.py | 五个节点、既有二采别名及前端目录；不持有结果 |
-| 时间规划 | segment_timing.py | 帧/潜步换算、规则解析、zero_overlap、delivery_chunks；区分合法采样窗与交付区，不持有张量 |
+| 时间规划 | segment_timing.py | 帧/潜步换算、规则解析、zero_overlap、delivery_chunks；plan_relay_segments 默认先分配时长再扣接力重叠，complete_timeline=True 用于回修已有时间线；不持有张量 |
 | 规划与预览 | pj_segment_planner.py | PJ_SEGMENT_PLAN、媒体/规则预览、可选 FFmpeg 播放器 |
 | 空间编辑准备 | pj_h3_edit_prepare.py / PJ_H3EditPrepare.prepare | 对齐原视频、目标和 MASK，输出原生 AV LATENT/noise_mask；不拥有 SAM 或 VAE 编码 |
 | H3 条件准备与目标创建 | pj_h3_context.py / PJ_H3SegmentContext.define_schema、execute、prepare、prepare_segment_guider | V3 图片/视频/配套音轨/独立音频四组动态接口，按编号排序并配对；execute 通过原生节点创建向下对齐的目标 AV 潜空间和空提示词基础条件；上下文拥有原始媒体引用与策略，逐窗独立裁剪各路视频和配套音轨，按实际尺寸建立条件；prepare 保持单上下文返回及旧单路参数契约 |
@@ -11,7 +11,7 @@
 | 边界保护 | segment_boundaries.py | constrain_boundaries、restore_preserved；空间零遮罩优先，恢复锁定值，无持久状态 |
 | 局部回修 | segment_local_repair.py | repair_sigmas、repair_segments；旧结果拥有保留区，新输入可提供精修中部，仅写交付区，返回完整 sampled/x0 及变更范围 |
 | 完整版本 | segment_revision.py / RevisionStore | 当前磁盘快照与临时候选；available/load/commit/check_request；原子提交、有限变更历史和过期请求检查，无持久张量 |
-| 顺序接力 | segment_relay.py / sample_relay | 固定 22 帧接力、窗口噪声、可选逐段条件、依赖摘要和后缀失效、CPU 拼合 |
+| 顺序接力 | segment_relay.py / sample_relay | 固定 22 帧接力、窗口噪声、可选逐段条件、依赖摘要和后缀失效；按最终交付边界分配 CPU 拼合结果并裁齐空间遮罩 |
 | 一采编排 | pj_first_pass_sampler.py / execute、execute_with_ui | 原生成、载入基准、局部重绘、完整结果复用；拥有一采段缓存与完整版本，原生入口附带执行摘要 |
 | 二采编排 | pj_segment_sampler.py / execute、execute_with_ui | 常规精修、局部替换、一采变更更新、高清复用；拥有高清快照和已消费一采版本，不修改一采存储 |
 | 前端 | js/pj_segment_sampler.js | 旧控件迁移、显隐、高级折叠、预览尺寸；按执行摘要更新目标菜单，不决定采样状态 |
@@ -44,7 +44,7 @@ repair_segments 的 baseline 拥有保留区，initial_latent 可为新放大结
 
 每个采样器实例独占临时目录，张量写磁盘并以 weights_only=True 加载。SegmentCache 管逐段复用，RevisionStore 管完整提交和请求记录，采样器决定提交时机。无全局张量缓存，不承诺跨重启恢复。
 
-ComfyUI 调用 execute_with_ui，以 IS_CHANGED / NOT_IDEMPOTENT 避免原生输出缓存遮住节点当前版本。普通相同请求通过输入指纹与当前版本复用磁盘快照；execute 的既有元组返回契约不变。执行摘要仅含实际视频潜步数、模式、规则和段数，不加入 LATENT；未提交时保留旧摘要，提交后的卸载错误不撤销新摘要。
+ComfyUI 调用 execute_with_ui，以 IS_CHANGED / NOT_IDEMPOTENT 避免原生输出缓存遮住节点当前版本。普通相同请求通过输入指纹与当前版本复用磁盘快照；execute 的既有元组返回契约不变。执行摘要含实际视频潜步数、模式、规则和段数；接力另记原输入潜步数，以区分重新生成的时长预算与已有结果回修（relay_repair）的完整范围。摘要不加入 LATENT；未提交时保留旧摘要，提交后的卸载错误不撤销新摘要。
 
 pj_revision 仅附在完整结果，记录 lineage、version、视频/音频潜步长度及逐版本变更区间。历史有界，较旧消费者需要全量更新。二采通过 source_result 读取完整一采元数据，不依赖放大器透传；二采保留自己的已消费版本，不跨节点写缓存。
 

@@ -54,7 +54,7 @@ class ContextSamplingTests(unittest.TestCase):
         result, _ = self.run_node()
         video, audio = result["samples"].unbind()
         self.assertGreater(frames_for_tokens(video.shape[2]) / 24, 30)
-        chunks = plan_relay_segments(video.shape[2], audio.shape[-1], 6.)
+        chunks = plan_relay_segments(video.shape[2], audio.shape[-1], 6., complete_timeline=True)
         self.assertEqual(len(self.clip.calls), len(chunks))
         self.assertEqual(self.clip.calls[1][0], "walk forward\nturn left")
         self.assertEqual(self.vae.calls, [])
@@ -69,8 +69,8 @@ class ContextSamplingTests(unittest.TestCase):
                 self.assertEqual(combined.shape[2], 7)
                 self.assertTrue(torch.equal(combined, previous[:, :, -7:]))
                 self.assertEqual([item["resolved_frame_index"] for item in guides], [0, 1, 5, 9, 13, 17, 18])
-        self.assertEqual(video.shape, self.latent["samples"].unbind()[0].shape)
-        self.assertEqual(audio.shape, self.latent["samples"].unbind()[1].shape)
+        self.assertEqual(video.shape, (1, 24, 217, 2, 2))
+        self.assertEqual(audio.shape, (1, 32, 2, 1227))
 
     def test_reference_video_conditions_match_each_absolute_window_without_double_crop(self):
         self.latent = self.empty_latent(107)

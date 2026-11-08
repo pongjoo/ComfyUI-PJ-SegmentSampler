@@ -343,7 +343,8 @@ def run_relay_comparison(clip, vae, guider, sampler, sigmas, empty, started, con
                                      unload_model_after_sampling=False)
     sampling_seconds = time.perf_counter() - sampling_started
     video, audio = result["samples"].unbind()
-    chunks = plan_relay_segments(video.shape[2], audio.shape[-1], options.relay_chunk_seconds)
+    target_video, target_audio = empty["samples"].unbind()
+    chunks = plan_relay_segments(target_video.shape[2], target_audio.shape[-1], options.relay_chunk_seconds)
     failures, overlap_checks = [], []
     previous, written = None, [0, 0]
     # Diagnostic read-only cache inspection verifies actual sampled windows, not only the plan.
@@ -365,9 +366,8 @@ def run_relay_comparison(clip, vae, guider, sampler, sigmas, empty, started, con
                 failures.append(f"Segment {index + 1} stream {stream} differs from its delivered window")
             written[stream] = end
         previous = bounds, window[0]
-    target_video, target_audio = empty["samples"].unbind()
-    if video.shape != target_video.shape or audio.shape != target_audio.shape:
-        failures.append("Relay changed the requested AV timeline shape")
+    if video.shape != target_video[:, :, :chunks[-1][1]].shape or audio.shape != target_audio[..., :chunks[-1][3]].shape:
+        failures.append("Relay does not match the planned AV timeline shape")
     if not all(torch.isfinite(part).all().item() for part in (video, audio)):
         failures.append("Relay contains non-finite values")
     if not torch.equal(video[:, :, :chunks[0][1]], first["samples"].unbind()[0]):

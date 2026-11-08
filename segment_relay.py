@@ -82,8 +82,9 @@ def sample_relay(noise, guider, sampler, sigmas, latent_image, chunks, cache,
             parts = sampled.unbind()
             if first is None:
                 first = sampled
-                assembled = [torch.empty_like(source, device="cpu", dtype=torch.promote_types(source.dtype, part.dtype))
-                             for source, part in zip((video, audio), parts)]
+                assembled = [torch.empty_like(source.narrow(axis, 0, chunks[-1][index * 2 + 1]),
+                                              device="cpu", dtype=torch.promote_types(source.dtype, part.dtype))
+                             for index, (source, part, axis) in enumerate(zip((video, audio), parts, (2, 3)))]
             for stream_index, (part, axis) in enumerate(zip(parts, (2, 3))):
                 start, end = bounds[stream_index * 2:stream_index * 2 + 2]
                 dtype = torch.promote_types(assembled[stream_index].dtype, part.dtype)
@@ -98,4 +99,6 @@ def sample_relay(noise, guider, sampler, sigmas, latent_image, chunks, cache,
             previous_digest = fingerprint(sampled)
 
     output = dict(latent_image, samples=comfy.nested_tensor.NestedTensor(assembled))
+    if "noise_mask" in output:
+        output["noise_mask"] = slice_mask(output["noise_mask"], (0, written[0], 0, written[1]))
     return output, {"samples": first}

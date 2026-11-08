@@ -126,11 +126,11 @@ class SegmentTests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             return node.execute(**args)
 
-    def test_relay_windows_keep_22_frames_and_exact_full_timeline(self):
+    def test_relay_repair_windows_cover_the_existing_timeline(self):
         for total_v in (2, 7, 12, 107, 212, 507):
             total_a = round(frames_for_tokens(total_v) * 40 / 24)
             for seconds in (0.5, 2, 6, 8, 15):
-                chunks = plan_relay_segments(total_v, total_a, seconds)
+                chunks = plan_relay_segments(total_v, total_a, seconds, complete_timeline=True)
                 self.assertEqual(chunks[0][0], 0)
                 self.assertEqual(chunks[-1][1], total_v)
                 self.assertEqual(chunks[-1][3], total_a)
@@ -140,7 +140,58 @@ class SegmentTests(unittest.TestCase):
                     self.assertIn(before[3] - after[2], (36, 37))
                 self.assertTrue(all(start % 5 == 0 and (end - start) % 5 == 2
                                     for start, end, _, _ in chunks))
-        self.assertEqual(plan_relay_segments(107, 603, 8), [(0, 57, 0, 320), (50, 107, 283, 603)])
+        self.assertEqual(plan_relay_segments(107, 603, 8, complete_timeline=True),
+                         [(0, 57, 0, 320), (50, 107, 283, 603)])
+
+    def test_relay_budgets_before_overlap_without_losing_normal_remainder(self):
+        chunks = plan_relay_segments(317, 1793, 15.)
+        self.assertEqual(chunks, [(0, 107, 0, 603), (100, 207, 567, 1170), (200, 307, 1133, 1737)])
+        self.assertEqual(frames_for_tokens(chunks[-1][1]), 362 * 3 - 22 * 2)
+        self.assertEqual(plan_relay_segments(107, 603, 6.),
+                         [(0, 42, 0, 235), (35, 77, 198, 433), (70, 92, 397, 518)])
+        self.assertEqual(plan_relay_segments(72, 405, 15.), [(0, 72, 0, 405)])
+        self.assertEqual(plan_relay_segments(2, 8, 15.), [(0, 2, 0, 8)])
+        self.assertEqual(plan_relay_segments(47, 263, 6.), [(0, 42, 0, 235)])
+
+    def test_relay_45_seconds_trims_masks_and_versions_before_full_second_pass(self):
+        samples = NestedTensor((torch.zeros(1, 24, 317, 2, 2), torch.zeros(1, 32, 2, 1793)))
+        self.latent = {"samples": samples, "noise_mask": NestedTensor([torch.ones_like(part) for part in samples.unbind()])}
+        node = self.node(PJ_FirstPass_SegmentSampler)
+        output, first = self.run_node(node, generation_mode="22帧接力", segment_plan=dict(self.plan, chunk_seconds=15.))
+        video, audio = output["samples"].unbind()
+        self.assertEqual(len(self.guider.calls), 3)
+        self.assertEqual((video.shape[2], audio.shape[-1]), (307, 1737))
+        self.assertEqual([part.shape for part in output["noise_mask"].unbind()], [video.shape, audio.shape])
+        self.assertEqual(output["pj_revision"]["frames"], 1042)
+        self.assertEqual(output["pj_revision"]["changes"][-1]["video"], [[0, 307]])
+        self.assertEqual(output["pj_revision"]["changes"][-1]["audio"], [[0, 1737]])
+        self.assertEqual(node._sampling_summary["n_chunks"], 3)
+        self.assertEqual(node._sampling_summary["input_video_tokens"], 317)
+        self.assertEqual(first["samples"].unbind()[0].shape[2], 107)
+        self.assertTrue(all(torch.isfinite(part).all() for part in (video, audio)))
+        self.assertEqual(self.latent["samples"].unbind()[0].shape[2], 317)
+        self.assertEqual(self.latent["noise_mask"].unbind()[1].shape[-1], 1793)
+        self.guider.calls.clear()
+        refined, _ = self.run_node(self.node(PJ_SegmentSampler), latent_image=output,
+                                   segment_plan=dict(self.plan, overlap_seconds=.92), keep_original_audio=True)
+        self.assertEqual(len(self.guider.calls), 9)
+        self.assertEqual(refined["samples"].unbind()[0].shape, video.shape)
+        self.assertTrue(torch.equal(refined["samples"].unbind()[1], audio))
+
+    def test_relay_local_repair_preserves_short_tail_of_imported_result(self):
+        class FlowSampling(comfy.model_sampling.ModelSamplingDiscreteFlow, comfy.model_sampling.CONST):
+            pass
+        self.guider.model_patcher.get_model_object = lambda name: FlowSampling()
+        node = self.node(PJ_FirstPass_SegmentSampler)
+        result, _ = self.run_node(node, generation_mode="22帧接力", repair_action="仅重绘目标段",
+                                  repair_baseline=self.latent, run_mode="仅重抽第3段", repair_request_id=1)
+        actual = result["samples"].unbind()
+        self.assertEqual(len(self.guider.calls), 1)
+        self.assertEqual(self.guider.calls[0][1].unbind()[0].shape[2], 37)
+        self.assertEqual([part.shape for part in actual], [part.shape for part in self.latent["samples"].unbind()])
+        self.assertTrue(torch.equal(actual[0][:, :, :72], self.latent["samples"].unbind()[0][:, :, :72]))
+        self.assertTrue(torch.any(actual[0][:, :, 92:] != 0))
+        self.assertTrue(torch.equal(actual[1], self.latent["samples"].unbind()[1]))
 
     def test_relay_uses_window_noise_and_deduplicates_av(self):
         node = self.node(PJ_FirstPass_SegmentSampler)
@@ -148,7 +199,7 @@ class SegmentTests(unittest.TestCase):
             output, first = self.run_node(node, generation_mode="22帧接力")
         chunks = plan_relay_segments(107, 603, 6)
         self.assertEqual(len(self.guider.calls), 3)
-        self.assertEqual([c.args[1]["samples"].unbind()[0].shape[2] for c in noise_calls.call_args_list], [42, 42, 37])
+        self.assertEqual([c.args[1]["samples"].unbind()[0].shape[2] for c in noise_calls.call_args_list], [42, 42, 22])
         for i, ((noise, samples, _, options), bounds) in enumerate(zip(self.guider.calls, chunks)):
             streams = samples.unbind()
             expected = self._relay_expected_chunk(node, i)
@@ -163,14 +214,14 @@ class SegmentTests(unittest.TestCase):
                 end = bounds[j * 2 + 1]
                 actual = output["samples"].unbind()[j].narrow(axis, start, end - start)
                 self.assertTrue(torch.equal(actual, expected.unbind()[j].narrow(axis, start - bounds[j * 2], end - start)))
-        self.assertEqual(output["samples"].unbind()[0].shape[2], 107)
-        self.assertEqual(output["samples"].unbind()[1].shape[-1], 603)
+        self.assertEqual(output["samples"].unbind()[0].shape[2], 92)
+        self.assertEqual(output["samples"].unbind()[1].shape[-1], 518)
         self.assertEqual(first["samples"].unbind()[0].shape[2], 42)
 
     def _relay_expected_chunk(self, node, index):
         return node._cache.load(index, node._cache.entries[index])[0]
 
-    def test_relay_long_target_keeps_full_length_and_sample_precision(self):
+    def test_relay_long_target_keeps_delivered_length_and_sample_precision(self):
         self.latent = {"samples": NestedTensor((torch.zeros(1, 24, 212, 2, 2, dtype=torch.bfloat16),
                                                torch.zeros(1, 32, 2, 1198, dtype=torch.bfloat16)))}
         native_sample = self.guider.sample
@@ -178,8 +229,9 @@ class SegmentTests(unittest.TestCase):
             return native_sample(*args, **kwargs).to(dtype=torch.float32)
         with patch.object(self.guider, "sample", side_effect=float_sample):
             result = self.run_node(self.node(PJ_FirstPass_SegmentSampler), generation_mode="22帧接力")[0]["samples"]
-        self.assertEqual(len(self.guider.calls), 6)
-        for actual, source in zip(result.unbind(), self.latent["samples"].unbind()):
+        self.assertEqual(len(self.guider.calls), 5)
+        sources = self.latent["samples"].unbind()
+        for actual, source in zip(result.unbind(), (sources[0][:, :, :182], sources[1][..., :1028])):
             self.assertEqual(actual.shape, source.shape)
             self.assertEqual(actual.dtype, torch.float32)
             self.assertTrue(torch.isfinite(actual).all())
@@ -239,8 +291,8 @@ class SegmentTests(unittest.TestCase):
         self.latent["noise_mask"] = NestedTensor((mask, torch.ones_like(audio)))
         node = self.node(PJ_FirstPass_SegmentSampler)
         out = self.run_node(node, generation_mode="22帧接力", sigmas=torch.tensor([1., 0.5, 0.]))[0]["samples"]
-        self.assertTrue(torch.equal(out.unbind()[0][..., 0], video[..., 0]))
-        self.assertFalse(torch.equal(out.unbind()[0][..., 2:], video[..., 2:]))
+        self.assertTrue(torch.equal(out.unbind()[0][..., 0], video[:, :, :92, :, 0]))
+        self.assertFalse(torch.equal(out.unbind()[0][..., 2:], video[:, :, :92, :, 2:]))
         for i in (1, 2):
             self.assertTrue(torch.all(self.guider.calls[i][1].unbind()[0][..., 0] == 0.25))
 

@@ -460,7 +460,7 @@ test('rule changes discard the executed count but retain the real media length',
         assert.equal(widget(node, 'relay_start_segment').options.max, 5);
         widget(planner, 'chunk_seconds').value = 6;
         refresh(node, true);
-        assert.equal(widget(node, 'relay_start_segment').options.max, 7);
+        assert.equal(widget(node, 'relay_start_segment').options.max, 6);
         widget(node, 'relay_start_segment').value = 12;
         widget(planner, 'chunk_seconds').value = 8;
         refresh(node, true);
@@ -516,7 +516,7 @@ test('changing generation mode keeps media length but does not revive the old co
         assert.equal(choices.includes('仅重抽第8段'), false);
         widget(node, 'generation_mode').value = '22帧接力';
         refresh(node, true);
-        assert.equal(widget(node, 'relay_start_segment').options.max, 7);
+        assert.equal(widget(node, 'relay_start_segment').options.max, 6);
     } finally { delete uiContext.app.graph; }
 });
 
@@ -544,7 +544,7 @@ test('imported whole results provide real length before the first local repair',
         widget(node, 'generation_mode').value = '22帧接力';
         widget(node, 'repair_action').value = '原采样方式';
         refresh(node, true);
-        assert.equal(widget(node, 'relay_start_segment').options.max, 7);
+        assert.equal(widget(node, 'relay_start_segment').options.max, 6);
     } finally { delete uiContext.app.graph; }
 });
 
@@ -552,9 +552,32 @@ test('an old mode or rules cannot replace the current planning count', async () 
     const {node, send} = await executedSampler();
     try {
         send({mode: 'segments', n_chunks: 10});
-        assert.equal(widget(node, 'relay_start_segment').options.max, 7);
+        assert.equal(widget(node, 'relay_start_segment').options.max, 6);
         send({n_chunks: 10, plan: {chunk_seconds: 8}});
-        assert.equal(widget(node, 'relay_start_segment').options.max, 7);
+        assert.equal(widget(node, 'relay_start_segment').options.max, 6);
+    } finally { delete uiContext.app.graph; }
+});
+
+test('relay generation budgets before overlaps while repair covers the delivered result', async () => {
+    const {node, planner, send} = await executedSampler();
+    try {
+        planner.properties.pj_preview_cache = {total_frames: 1076};
+        widget(planner, 'chunk_seconds').value = 15;
+        refresh(node, true);
+        assert.equal(widget(node, 'relay_start_segment').options.max, 3);
+        send({n_chunks: 3, plan: {chunk_seconds: 15}, total_video_tokens: 307, input_video_tokens: 317});
+        widget(planner, 'chunk_seconds').value = 6;
+        refresh(node, true);
+        assert.equal(widget(node, 'relay_start_segment').options.max, 8);
+        widget(node, 'repair_action').value = '仅重绘目标段';
+        refresh(node, true);
+        const choices = widget(node, 'run_mode').options.values;
+        assert.equal(choices.includes('仅重抽第9段'), true);
+        assert.equal(choices.includes('仅重抽第10段'), false);
+        send({mode: 'relay_repair', n_chunks: 9, total_video_tokens: 307, input_video_tokens: 317});
+        widget(node, 'repair_action').value = '原采样方式';
+        refresh(node, true);
+        assert.equal(widget(node, 'relay_start_segment').options.max, 8);
     } finally { delete uiContext.app.graph; }
 });
 

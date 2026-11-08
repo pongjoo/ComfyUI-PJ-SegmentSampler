@@ -150,7 +150,7 @@ class PJ_FirstPass_SegmentSampler:
                 }),
                 "generation_mode": (["分段编辑", "整段采样", "22帧接力"], {
                     "default": "分段编辑",
-                    "tooltip": "接力按规划器目标段长生成，固定22帧重叠；不使用普通切点和重叠设置。未连接规划器时整段采样。",
+                    "tooltip": "先按规划器目标段长切分，再扣除22帧重叠；不为凑满输入总长补段，正常余段仍保留。未连接规划器时整段采样。",
                 }),
                 "relay_action": (["全部生成", "从指定段重做"], {"default": "全部生成"}),
                 "relay_start_segment": ("INT", {
@@ -213,10 +213,12 @@ class PJ_FirstPass_SegmentSampler:
                        total_video_tokens=video.shape[2])
         return {"ui": {"pj_sampling_summary": [summary]}, "result": result}
 
-    def _record_plan(self, chunks, plan, mode):
+    def _record_plan(self, chunks, plan, mode, input_video_tokens=None):
         rules = {key: plan[key] for key in ("split_mode", "chunk_seconds", "overlap_seconds", "num_segments", "custom_cuts")
                  if key in plan} if plan is not None else None
         self._sampling_summary = {"n_chunks": len(chunks), "mode": mode, "plan": rules}
+        if input_video_tokens is not None:
+            self._sampling_summary["input_video_tokens"] = input_video_tokens
 
     def check_lazy_status(self, repair_action="原采样方式", **kwargs):
         if repair_action == "原采样方式":
@@ -259,7 +261,7 @@ class PJ_FirstPass_SegmentSampler:
         streams = samples.unbind() if samples.is_nested else [samples]
         if generation_mode == "22帧接力" and segment_plan is not None:
             chunks = plan_relay_segments(streams[0].shape[2], streams[1].shape[-1] if len(streams) > 1 else 0,
-                                         segment_plan.get("chunk_seconds", 6.0))
+                                         segment_plan.get("chunk_seconds", 6.0), complete_timeline=True)
             deliveries = chunks
         else:
             chunks, fps = resolve_plan(samples, segment_plan, "按秒自动切分", 6.0, 1.5,
@@ -290,8 +292,9 @@ class PJ_FirstPass_SegmentSampler:
                                                 sync_ref_video, h3_context=h3_context, delivery_bounds=deliveries)
         result = self._revisions.commit(output, slice_latent(output, chunks[0]), changes=changes,
                                         fps=fps, request_key=request_key)
-        self._record_plan(chunks, segment_plan, "relay" if generation_mode == "22帧接力" and segment_plan is not None else
-                          "segments" if segment_plan is not None else "full")
+        self._record_plan(chunks, segment_plan, "relay_repair" if generation_mode == "22帧接力" and segment_plan is not None else
+                          "segments" if segment_plan is not None else "full",
+                          input_video_tokens=(self._sampling_summary or {}).get("input_video_tokens"))
         return result
 
     def plan_segments(self, total_v, total_a, split_mode, chunk_seconds, overlap_seconds,
@@ -370,7 +373,7 @@ class PJ_FirstPass_SegmentSampler:
                     or total_v < 2 or total_v % 5 != 2 or full_audio.ndim != 4 or full_audio.shape[1:3] != (32, 2)):
                 raise ValueError("22帧接力需要H3原生音视频潜空间，视频长度为5n+2潜步")
             chunks = plan_relay_segments(total_v, total_a, segment_plan.get("chunk_seconds", chunk_seconds))
-            self._record_plan(chunks, segment_plan, "relay")
+            self._record_plan(chunks, segment_plan, "relay", input_video_tokens=total_v)
             seed = getattr(noise, "seed", base_seed)
             if not isinstance(seed, int):
                 seed = base_seed

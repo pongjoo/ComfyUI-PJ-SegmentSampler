@@ -87,7 +87,8 @@ class AudioValidation:
                                            cache, config["seed"], list(range(len(chunks))),
                                            2 if prefix is not None else 1, True, h3_context=context)
             parts = result["samples"].unbind()
-            if any(part.shape != original.shape or not torch.isfinite(part).all() for part, original in zip(parts, (video, audio))):
+            expected = (video[:, :, :chunks[-1][1]], audio[..., :chunks[-1][3]])
+            if any(part.shape != original.shape or not torch.isfinite(part).all() for part, original in zip(parts, expected)):
                 raise ValueError("Audio relay produced invalid AV tensors")
             if prefix_parts is not None and (not torch.equal(parts[0][:, :, :chunks[0][1]], prefix_parts[0])
                                              or not torch.equal(parts[1][..., :chunks[0][3]], prefix_parts[1])):

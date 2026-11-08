@@ -289,7 +289,7 @@ function currentSamplingSummary(node, planner) {
     const generation = node.widgets?.find(w => w.name === "generation_mode")?.value;
     const local = node.widgets?.find(w => w.name === "repair_action")?.value === "仅重绘目标段";
     const mode = !hasSegmentPlan(node) || (generation === "整段采样" && !local) ? "full" :
-        generation === "22帧接力" ? "relay" : "segments";
+        generation === "22帧接力" ? (local ? "relay_repair" : "relay") : "segments";
     if (summary.mode !== mode || !["split_mode", "chunk_seconds", "overlap_seconds", "num_segments", "custom_cuts"]
         .every(name => summary.plan?.[name] === planner?.widgets?.find(w => w.name === name)?.value)) {
         summary.n_chunks = null;
@@ -307,12 +307,20 @@ function resolveTargetSegmentCount(node) {
     if (originNode) {
         if (node.widgets?.find(w => w.name === "generation_mode")?.value === "22帧接力") {
             const preview = originNode.properties?.pj_preview_cache;
-            if (!actual && preview?.relay_n_chunks) return preview.relay_n_chunks;
+            const local = node.widgets?.find(w => w.name === "repair_action")?.value === "仅重绘目标段";
+            if (!actual && !local && preview?.relay_n_chunks) return preview.relay_n_chunks;
             const frames = preview?.total_frames || 345;
-            const total = actual?.total_video_tokens ?? Math.max(2, Math.floor((frames - 5) / 17) * 5 + 2);
+            const total = (!local ? actual?.input_video_tokens : null) ?? actual?.total_video_tokens ??
+                Math.max(2, Math.floor((frames - 5) / 17) * 5 + 2);
             const seconds = Number(originNode.widgets?.find(w => w.name === "chunk_seconds")?.value ?? 6);
             const window = Math.max(2, Math.floor((seconds * 24 - 5) / 17 + 0.5)) * 5 + 2;
-            return 1 + Math.max(0, Math.ceil((total - window) / (window - 7)));
+            if (local) return 1 + Math.max(0, Math.ceil((total - window) / (window - 7)));
+            const totalFrames = Math.floor(total / 5) * 17 + [0, 1, 5, 9, 13][total % 5];
+            const budget = Math.max(seconds * 24, 39);
+            let count = Math.max(1, Math.ceil(totalFrames / budget));
+            const tail = Math.max(0, Math.floor((totalFrames - (count - 1) * budget - 5) / 17 + 0.5)) * 5 + 2;
+            if (count > 1 && tail <= 7) count--;
+            return count;
         }
         // 次级缓存读取：上游规划器已执行或有预览缓存时直接获取
         if (!actual && originNode.pj_cached_n_chunks) {
