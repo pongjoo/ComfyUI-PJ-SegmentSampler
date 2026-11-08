@@ -143,4 +143,11 @@ diagnostics/ 已加入 Git 忽略规则。脚本另提供 --denoises/--seeds 矩
 
 使用实际素材时加 `--prompt-file 提示词.txt --reference-video 原视频.mp4`，每张产品图分别加 `--reference-image 产品图.jpg`；视频按 24 FPS 读取，可用 `--reference-video-start` 指定起点。参考图须预先组成相同尺寸。`--baseline-file` 接已导出的 `[video, audio]` 张量；配合 `--mask-file` 可读取已有的像素 MASK 张量。未提供遮罩时，报告不将该实验视为完整 SAM 工作流验证。
 
+音频接力对照使用 `scripts/validate_h3_audio.py`：JSON 配置包含 `model/clip/vae/audio_vae`、`width/height/frames`、`steps/scheduler/sampler/seed`、`prompt`，可加 `segment_prompts`、逐张文件路径 `reference_images`、`lora/lora_strength`、`chunk_seconds`。`prefix_file` 可复用第一窗的 `[video, audio]` 张量；`sage_patch: true` 才需要已有 KJNodes。不同对照使用独立空目录。
+
+    & '../../../python_embeded/python.exe' -s scripts/validate_h3_audio.py --config diagnostics/audio_config.json --output-dir diagnostics/audio_run --preflight
+    & '../../../python_embeded/python.exe' -s scripts/validate_h3_audio.py --config diagnostics/audio_config.json --output-dir diagnostics/audio_run
+
+脚本导出完整及逐窗 AV 张量、32 kHz WAV 和结构检查报告，不修改采样算法。它不启动服务、不下载权重；执行期间应保持本机队列空闲。语音识别和人工听辨另行进行，结构检查通过不代表对白正确。节点运行无需安装语音识别依赖。
+
 模块入口见 [模块地图](docs/MODULE_MAP.md)，进度和已验证范围见 [开发台账](docs/DEV_LOG.md)。许可证：[MIT](LICENSE)。
