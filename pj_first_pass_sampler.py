@@ -11,6 +11,8 @@ from .segment_timing import (plan_segments, plan_relay_segments, resolve_plan, s
                             zero_overlap, delivery_chunks)
 from .segment_relay import sample_relay
 from .pj_h3_context import prepare_segment_conditions
+from .segment_script import scene_cut_segments, segment_settings
+from .segment_scenes import scene_deliveries, clip_scene_windows, split_scene_windows, pad_scene_video, same_scene
 from .segment_local_repair import repair_segments, repair_sigmas, slice_latent
 from .segment_revision import RevisionStore
 from .segment_sampling import (SegmentCache, sampling_signature, fingerprint, generate_noise,
@@ -259,15 +261,18 @@ class PJ_FirstPass_SegmentSampler:
             return baseline, saved[1] if saved[1] is not None else dict(baseline)
         samples = baseline["samples"]
         streams = samples.unbind() if samples.is_nested else [samples]
+        cuts = baseline.get("pj_scene_cuts", [])
         if generation_mode == "22帧接力" and segment_plan is not None:
-            chunks = plan_relay_segments(streams[0].shape[2], streams[1].shape[-1] if len(streams) > 1 else 0,
+            chunks = baseline.get("pj_relay_chunks") or plan_relay_segments(streams[0].shape[2], streams[1].shape[-1] if len(streams) > 1 else 0,
                                          segment_plan.get("chunk_seconds", 6.0), complete_timeline=True)
             deliveries = chunks
         else:
             chunks, fps = resolve_plan(samples, segment_plan, "按秒自动切分", 6.0, 1.5,
                                        3, "0-6,4.5-10.5,9-15", fps, False,
                                        full_length=segment_plan is None)
+            chunks = split_scene_windows(chunks, cuts, streams[0].shape[2], streams[1].shape[-1] if len(streams) > 1 else 0)
             deliveries = delivery_chunks(chunks, segment_plan)
+        deliveries = scene_deliveries(chunks, deliveries, cuts)
         if "缺陷秒数" in str(run_mode):
             targets = [i for i, bounds in enumerate(deliveries)
                        if segment_seconds(*bounds[:2], fps)[0] <= target_time_second < segment_seconds(*bounds[:2], fps)[1]][:1]
@@ -372,7 +377,8 @@ class PJ_FirstPass_SegmentSampler:
             if (not is_nested or len(streams) != 2 or full_video.ndim != 5 or full_video.shape[1] != 24
                     or total_v < 2 or total_v % 5 != 2 or full_audio.ndim != 4 or full_audio.shape[1:3] != (32, 2)):
                 raise ValueError("22帧接力需要H3原生音视频潜空间，视频长度为5n+2潜步")
-            chunks = plan_relay_segments(total_v, total_a, segment_plan.get("chunk_seconds", chunk_seconds))
+            chunks = plan_relay_segments(total_v, total_a, segment_plan.get("chunk_seconds", chunk_seconds),
+                                         cut_segments=scene_cut_segments(h3_context))
             self._record_plan(chunks, segment_plan, "relay", input_video_tokens=total_v)
             seed = getattr(noise, "seed", base_seed)
             if not isinstance(seed, int):
@@ -391,11 +397,13 @@ class PJ_FirstPass_SegmentSampler:
             num_segments, custom_cuts, fps, align_51_frames,
             full_length=segment_plan is None or generation_mode == "整段采样" or "不分段" in str(run_mode) or "全量采样" in str(run_mode),
         )
+        cuts = sorted({chunks[index - 1][0] for index in scene_cut_segments(h3_context) if index <= len(chunks)})
+        chunks = clip_scene_windows(chunks, cuts, total_a)
         n_chunks = len(chunks)
         self._record_plan(chunks, segment_plan, "full" if segment_plan is None or generation_mode == "整段采样" or
                           "不分段" in str(run_mode) or "全量采样" in str(run_mode) else "segments")
         no_overlap = zero_overlap(segment_plan)
-        deliveries = delivery_chunks(chunks, segment_plan)
+        deliveries = scene_deliveries(chunks, delivery_chunks(chunks, segment_plan), cuts)
         constrain = boundary_constraints and n_chunks > 1 and not no_overlap
         self._cache.retain(n_chunks)
         context_signature = sampling_signature(guider, sampler, sigmas)
@@ -482,7 +490,7 @@ class PJ_FirstPass_SegmentSampler:
         if constrain:
             print("[PJ一采] 接缝约束：固定已有重叠内容；缓存缺失的分段将重新生成")
         pending = [index for index, value in enumerate(retained) if value is None]
-        with prepare_segment_conditions(h3_context, chunks, full_video.shape, pending) as prepared:
+        with prepare_segment_conditions(h3_context, chunks, full_video.shape, pending, scene_cuts=cuts) as prepared:
             for idx, (v_start, v_end, a_start, a_end) in enumerate(chunks):
                 if retained[idx] is not None:
                     sampled_chunks.append(retained[idx])
@@ -495,12 +503,22 @@ class PJ_FirstPass_SegmentSampler:
                 else:
                     chunk_latent_samples = chunk_v
                 bounds = (v_start, v_end, a_start, a_end)
+                chunk_latent_samples = pad_scene_video(chunk_latent_samples, bounds, cuts)
                 chunk_mask = slice_mask(latent_image.get("noise_mask"), bounds)
+                if prepared is not None:
+                    chunk_latent_samples, chunk_mask = prepared.constrain_audio(chunk_latent_samples, chunk_mask, idx)
                 if constrain:
                     sources = [(chunks[i], value) for i, value in enumerate(retained) if value is not None]
                     sources += [(chunks[i], value) for i, value in enumerate(sampled_chunks) if retained[i] is None]
-                    chunk_latent_samples, chunk_mask = constrain_boundaries(chunk_latent_samples, chunk_mask, bounds, sources)
-                    del sources
+                    video_sources = [(other, value) for other, value in sources if same_scene(v_start, other[0], cuts)]
+                    carry_audio = segment_settings(h3_context, idx).get("audio_transition") != "reset"
+                    streams = None if carry_audio and len(video_sources) == len(sources) else [0]
+                    chunk_latent_samples, chunk_mask = constrain_boundaries(chunk_latent_samples, chunk_mask, bounds, video_sources,
+                                                                           preserve_streams=streams)
+                    if is_nested and carry_audio and len(video_sources) != len(sources):
+                        chunk_latent_samples, chunk_mask = constrain_boundaries(chunk_latent_samples, chunk_mask, bounds, sources,
+                                                                               preserve_streams=[1])
+                    del sources, video_sources
                 seg_offset = offsets[idx] if idx < len(offsets) else idx
                 seg_seed = (seed_val + seg_offset) & 0xFFFFFFFFFFFFFFFF
 
@@ -520,10 +538,10 @@ class PJ_FirstPass_SegmentSampler:
                     chunk_noise = segment_noise[:, :, v_start:v_end].clone()
                 del segment_noise
                 if h3_context is None:
-                    chunk_guider = segment_guider(guider, bounds, sync_ref_video)
+                    chunk_guider = segment_guider(guider, bounds, sync_ref_video, scene_cuts=cuts)
                 else:
                     previous_tail = None
-                    if sampled_chunks and not no_overlap:
+                    if sampled_chunks and not no_overlap and same_scene(v_start, chunks[idx - 1][0], cuts):
                         previous_start, previous_end = chunks[idx - 1][:2]
                         overlap = min(v_end, previous_end) - v_start
                         if previous_start <= v_start < previous_end and v_start % 5 == 0 and overlap % 5 == 2:
@@ -589,16 +607,22 @@ class PJ_FirstPass_SegmentSampler:
         )
 
         # Blend or assemble audio
+        preserve_soundtrack = h3_context is not None and h3_context.get("audio_mode") == "保留指定音轨"
         if chunk_audios and total_a > 0:
             blended_audio = blend_sequence(
-                chunk_audios, audio_intervals, full_audio, blend_mode, is_audio=True,
+                chunk_audios, audio_intervals, full_audio, "保留边界" if preserve_soundtrack else blend_mode, is_audio=True,
                 delivery_intervals=[bounds[2:] for bounds in deliveries],
             )
             result_samples = comfy.nested_tensor.NestedTensor((blended_video, blended_audio))
         else:
             result_samples = blended_video
 
-        restore_preserved(result_samples, latent, latent_image.get("noise_mask"))
+        if preserve_soundtrack and is_nested:
+            original_mask = latent_image.get("noise_mask")
+            video_mask = original_mask.unbind()[0] if original_mask is not None and original_mask.is_nested else original_mask
+            restore_preserved(blended_video, full_video, video_mask)
+        else:
+            restore_preserved(result_samples, latent, latent_image.get("noise_mask"))
 
         if rebuilding:
             for idx, samples in enumerate(sampled_chunks):
@@ -611,4 +635,5 @@ class PJ_FirstPass_SegmentSampler:
 
         print("[PJ一采分段采样器] 全部一采分段生成与融合完成！准备输出结果。\n" + "=" * 65)
         output = dict(latent_image, samples=result_samples)
+        output["pj_scene_cuts"] = cuts
         return self._commit_generation((output, {"samples": sampled_chunks[0]}), fps)

@@ -12,6 +12,7 @@ from .segment_boundaries import constrain_boundaries, restore_preserved
 from .segment_revision import RevisionStore, changed_intervals
 from .segment_local_repair import repair_segments
 from .pj_h3_context import prepare_segment_conditions
+from .segment_scenes import scene_deliveries, split_scene_windows, pad_scene_video, same_scene
 from .segment_sampling import (SegmentCache, sampling_signature, fingerprint, generate_noise,
                                slice_mask, segment_guider, blend_sequence)
 
@@ -263,19 +264,21 @@ class PJ_SegmentSampler:
 
         total_v = full_video.shape[2]
         total_a = full_audio.shape[-1] if full_audio is not None else 0
+        source = source_result if source_result is not None else latent_image
+        cuts = source.get("pj_scene_cuts", [])
 
         chunks, fps = resolve_plan(
             latent, segment_plan, split_mode, chunk_seconds, overlap_seconds,
             num_segments, custom_cuts, fps, align_51_frames,
             full_length=segment_plan is None or "不分段" in str(run_mode) or "全量采样" in str(run_mode),
         )
+        chunks = split_scene_windows(chunks, cuts, total_v, total_a)
         n_chunks = len(chunks)
         rules = {key: segment_plan[key] for key in ("split_mode", "chunk_seconds", "overlap_seconds", "num_segments", "custom_cuts")
                  if key in segment_plan} if segment_plan is not None else None
         self._sampling_summary = {"n_chunks": n_chunks, "plan": rules,
                                   "mode": "full" if segment_plan is None or "不分段" in str(run_mode) or "全量采样" in str(run_mode) else "segments"}
-        deliveries = delivery_chunks(chunks, segment_plan)
-        source = source_result if source_result is not None else latent_image
+        deliveries = scene_deliveries(chunks, delivery_chunks(chunks, segment_plan), cuts)
         source_samples = source["samples"]
         source_video = source_samples.unbind()[0] if source_samples.is_nested else source_samples
         if source_video.shape[2] != total_v:
@@ -292,13 +295,13 @@ class PJ_SegmentSampler:
                                     saved, source_revision, source_stamp, refine_action, run_mode,
                                     target_time_second, custom_rerun_segments, refine_request_id,
                                     repair_boundary_tokens, keep_original_audio, unload_model_after_sampling,
-                                    h3_context, deliveries)
+                                    h3_context, deliveries, cuts)
             if refine_action == "仅重做目标段":
                 raise ValueError("没有已完成的高清结果，不能局部替换；请先完成一次二采")
             if source_revision is None:
                 raise ValueError("更新一采变更需要连接带版本信息的一采结果到 source_result")
         self._cache.retain(n_chunks)
-        context_signature = fingerprint((sampling_signature(guider, sampler, sigmas), h3_context))
+        context_signature = fingerprint((sampling_signature(guider, sampler, sigmas), h3_context, cuts))
 
         print("\n" + "=" * 65)
         print(f"[PJ二采分段采样器] 输入潜空间总计: {total_v} 视频步 (~{segment_seconds(0, total_v, fps)[1]:.2f}s), 音频: {total_a} 步")
@@ -346,6 +349,8 @@ class PJ_SegmentSampler:
                 else:
                     chunk_latent_samples = chunk_v
                 bounds = (v_start, v_end, a_start, a_end)
+                chunk_latent_samples = pad_scene_video(chunk_latent_samples, bounds, cuts)
+                chunk_v = chunk_latent_samples.unbind()[0] if is_nested else chunk_latent_samples
                 chunk_mask = slice_mask(latent_image.get("noise_mask"), bounds)
                 cache_signature = fingerprint(("refine-boundaries-v2", context_signature, bounds, deliveries[idx], zero_overlap(segment_plan), chunk_latent_samples,
                                                chunk_mask, latent_image.get("batch_index"), type(noise),
@@ -384,10 +389,14 @@ class PJ_SegmentSampler:
                     self._cache.retain(idx)
                     rebuilding = True
                     prepared = condition_scope.enter_context(prepare_segment_conditions(
-                        h3_context, chunks, full_video.shape, range(idx, n_chunks)))
+                        h3_context, chunks, full_video.shape, range(idx, n_chunks), scene_cuts=cuts))
+                if prepared is not None and not keep_original_audio:
+                    chunk_latent_samples, chunk_mask = prepared.constrain_audio(chunk_latent_samples, chunk_mask, idx)
+                    if is_nested:
+                        chunk_v, chunk_a = chunk_latent_samples.unbind()
                 sources = [(chunks[i], value.unbind()[0] if is_nested else value)
                            for i, value in enumerate(sampled_chunks)
-                           if max(v_start, chunks[i][0]) < min(v_end, chunks[i][1])]
+                           if same_scene(v_start, chunks[i][0], cuts) and max(v_start, chunks[i][0]) < min(v_end, chunks[i][1])]
                 if sources and not zero_overlap(segment_plan):
                     video_mask = chunk_mask.unbind()[0] if chunk_mask is not None and chunk_mask.is_nested else chunk_mask
                     chunk_v, video_mask = constrain_boundaries(chunk_v, video_mask, bounds, sources)
@@ -416,7 +425,7 @@ class PJ_SegmentSampler:
                     chunk_noise = segment_noise[:, :, v_start:v_end].clone()
                 del segment_noise
                 chunk_guider = (prepared.guider(guider, idx)
-                                if h3_context is not None else segment_guider(guider, bounds, True))
+                                if h3_context is not None else segment_guider(guider, bounds, True, scene_cuts=cuts))
 
                 chunk_x0_output = {}
                 chunk_callback = latent_preview.prepare_callback(
@@ -533,6 +542,8 @@ class PJ_SegmentSampler:
 
         out_denoised = dict(latent_image, samples=result_denoised if result_denoised is not None else result_samples)
         output = dict(latent_image, samples=result_samples, pj_refine_source=source_stamp)
+        output["pj_scene_cuts"] = cuts
+        out_denoised["pj_scene_cuts"] = cuts
         out_denoised["pj_refine_source"] = source_stamp
         result = self._results.commit(output, out_denoised, changes=[(0, total_v)],
                                       audio_changes=[] if keep_original_audio else [(0, total_a)],
@@ -548,7 +559,7 @@ class PJ_SegmentSampler:
 
     def _repair(self, noise, guider, sampler, sigmas, initial, chunks, fps, saved,
                 source_revision, source_stamp, action, run_mode, target_time,
-                custom_targets, request_id, boundary_tokens, keep_audio, unload, h3_context=None, deliveries=None):
+                custom_targets, request_id, boundary_tokens, keep_audio, unload, h3_context=None, deliveries=None, cuts=()):
         baseline, previous_x0 = saved
         deliveries = chunks if deliveries is None else deliveries
         editable = None
@@ -584,7 +595,7 @@ class PJ_SegmentSampler:
                 noise, guider, sampler, sigmas, baseline, chunks, targets, seed,
                 offsets=[0] * len(chunks), boundary_tokens=boundary_tokens,
                 keep_audio=keep_audio, initial_latent=initial, editable_ranges=editable,
-                denoised_baseline=previous_x0, h3_context=h3_context, delivery_bounds=deliveries)
+                denoised_baseline=previous_x0, h3_context=h3_context, delivery_bounds=deliveries, scene_cuts=cuts)
         else:
             output, denoised, changed = dict(baseline), dict(previous_x0), []
         if audio_changes:
@@ -600,6 +611,8 @@ class PJ_SegmentSampler:
         stamp = source_stamp if action == "更新一采变更" else baseline.get("pj_refine_source")
         output["pj_refine_source"] = stamp
         denoised["pj_refine_source"] = stamp
+        output["pj_scene_cuts"] = list(cuts)
+        denoised["pj_scene_cuts"] = list(cuts)
         result = self._results.commit(output, denoised, changes=changed, audio_changes=audio_changes,
                                       fps=fps, request_key=request)
         self._source_stamp = stamp

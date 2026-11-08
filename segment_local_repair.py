@@ -11,6 +11,7 @@ from .segment_boundaries import restore_preserved
 from .segment_revision import merge_intervals
 from .segment_sampling import generate_noise, segment_guider, slice_mask
 from .pj_h3_context import prepare_segment_conditions
+from .segment_scenes import pad_scene_video
 
 
 def repair_sigmas(guider, scheduler, steps, denoise):
@@ -46,13 +47,14 @@ def slice_latent(latent, bounds):
 def repair_segments(noise, guider, sampler, sigmas, baseline, chunks, target_indices,
                     seed, offsets=(), boundary_tokens=2, sync_ref_video=True,
                     keep_audio=True, initial_latent=None, editable_ranges=None,
-                    denoised_baseline=None, h3_context=None, delivery_bounds=None):
+                    denoised_baseline=None, h3_context=None, delivery_bounds=None, scene_cuts=None):
     """Return full samples, full denoised result and editable video intervals.
 
     baseline owns retained output/boundaries; initial_latent optionally provides newer
     segment interiors (for high-resolution refinement). Inputs are never mutated.
     """
     source = baseline if initial_latent is None else initial_latent
+    cuts = baseline.get("pj_scene_cuts", []) if scene_cuts is None else scene_cuts
     original = _streams(baseline["samples"])
     incoming = _streams(source["samples"])
     if len(original) != len(incoming) or any(a.shape != b.shape for a, b in zip(original, incoming)):
@@ -76,8 +78,8 @@ def repair_segments(noise, guider, sampler, sigmas, baseline, chunks, target_ind
     editable = merge_intervals(editable_ranges) if editable_ranges is not None else []
     if editable_ranges is None:
         for start, end in selected:
-            left = start + (boundary_tokens if start > 0 else 0)
-            right = end - (boundary_tokens if end < total_v else 0)
+            left = start + (boundary_tokens if start > 0 and start not in cuts else 0)
+            right = end - (boundary_tokens if end < total_v and end not in cuts else 0)
             if left >= right:
                 raise ValueError("所选分段没有可重绘区域；请减少边界保护潜步或扩大目标范围")
             editable.append((left, right))
@@ -86,7 +88,7 @@ def repair_segments(noise, guider, sampler, sigmas, baseline, chunks, target_ind
     if not editable:
         return baseline, baseline if denoised_baseline is None else denoised_baseline, []
     written = []
-    with prepare_segment_conditions(h3_context, chunks, original[0].shape, targets) as prepared:
+    with prepare_segment_conditions(h3_context, chunks, original[0].shape, targets, scene_cuts=cuts) as prepared:
         for index in targets:
             bounds = chunks[index]
             start, end = bounds[:2]
@@ -122,13 +124,13 @@ def repair_segments(noise, guider, sampler, sigmas, baseline, chunks, target_ind
                 parts[1] = original[1][..., bounds[2]:bounds[3]].to(device=parts[1].device, copy=True)
                 denoise_masks.append(torch.zeros((parts[1].shape[0], 1, 1, parts[1].shape[-1]),
                                                  device=parts[1].device, dtype=torch.float32))
-            sample_input = _join(parts, nested)
+            sample_input = pad_scene_video(_join(parts, nested), bounds, cuts)
             denoise_mask = _join(denoise_masks, nested)
             segment_seed = (int(seed) + (int(offsets[index]) if index < len(offsets) else index)) & 0xFFFFFFFFFFFFFFFF
             noise_full = generate_noise(noise, source, segment_seed)
             local_noise = slice_latent({"samples": noise_full}, bounds)["samples"]
             del noise_full
-            local_guider = (segment_guider(guider, bounds, sync_ref_video) if h3_context is None else
+            local_guider = (segment_guider(guider, bounds, sync_ref_video, scene_cuts=cuts) if h3_context is None else
                             prepared.guider(guider, index))
             x0_output = {}
             callback = latent_preview.prepare_callback(local_guider.model_patcher, len(sigmas) - 1, x0_output)
@@ -151,7 +153,8 @@ def repair_segments(noise, guider, sampler, sigmas, baseline, chunks, target_ind
             # Preserve promoted sampler precision without rounding retained values down.
             dtype = torch.promote_types(result[0].dtype, sampled_video.dtype)
             result[0] = result[0].to(dtype=dtype)
-            result[0][:, :, start:end].copy_(sampled_video.to(dtype=dtype))
+            region = result[0][:, :, start:end]
+            region.copy_(torch.where(mask.cpu() > 0, sampled_video.to(dtype=dtype), region))
             dtype = torch.promote_types(denoised[0].dtype, x0_video.dtype)
             denoised[0] = denoised[0].to(dtype=dtype)
             region = denoised[0][:, :, start:end]

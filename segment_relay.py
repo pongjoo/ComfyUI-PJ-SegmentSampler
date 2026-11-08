@@ -12,6 +12,8 @@ import latent_preview
 from .segment_boundaries import constrain_boundaries, restore_preserved
 from .segment_sampling import fingerprint, generate_noise, sampling_signature, segment_guider, slice_mask
 from .pj_h3_context import prepare_segment_conditions
+from .segment_script import scene_cut_segments, segment_settings
+from .segment_scenes import scene_deliveries, pad_scene_video
 
 
 def sample_relay(noise, guider, sampler, sigmas, latent_image, chunks, cache,
@@ -28,6 +30,9 @@ def sample_relay(noise, guider, sampler, sigmas, latent_image, chunks, cache,
     assembled = None
     written = [0, 0]
     rebuilding = False
+    cut_segments = scene_cut_segments(h3_context)
+    cuts = [bounds[0] for i, bounds in enumerate(chunks, 1) if i in cut_segments]
+    deliveries = scene_deliveries(chunks, chunks, cuts)
 
     with ExitStack() as condition_scope:
         for index, bounds in enumerate(chunks):
@@ -36,6 +41,7 @@ def sample_relay(noise, guider, sampler, sigmas, latent_image, chunks, cache,
                 video[:, :, vs:ve].to(device="cpu", copy=True),
                 audio[..., a_start:a_end].to(device="cpu", copy=True),
             ))
+            samples = pad_scene_video(samples, bounds, cuts)
             mask = slice_mask(latent_image.get("noise_mask"), bounds)
             offset = offsets[index] if index < len(offsets) else index
             segment_seed = (seed + offset) & 0xFFFFFFFFFFFFFFFF
@@ -52,18 +58,24 @@ def sample_relay(noise, guider, sampler, sigmas, latent_image, chunks, cache,
                     cache.retain(index)
                     rebuilding = True
                     prepared = condition_scope.enter_context(prepare_segment_conditions(
-                        h3_context, chunks, video.shape, range(index, len(chunks))))
+                        h3_context, chunks, video.shape, range(index, len(chunks)), scene_cuts=cuts))
+                if prepared is not None:
+                    samples, mask = prepared.constrain_audio(samples, mask, index)
                 if previous is not None:
-                    samples, mask = constrain_boundaries(samples, mask, bounds, [(chunks[index - 1], previous)])
+                    inherited = ([0] if index + 1 not in cut_segments else [])
+                    if segment_settings(h3_context, index).get("audio_transition", "continue") == "continue":
+                        inherited.append(1)
+                    samples, mask = constrain_boundaries(samples, mask, bounds, [(chunks[index - 1], previous)],
+                                                         preserve_streams=inherited)
                 window_latent = dict(latent_image, samples=samples)
                 if mask is not None:
                     window_latent["noise_mask"] = mask
                 chunk_noise = generate_noise(noise, window_latent, segment_seed)
                 if h3_context is None:
-                    chunk_guider = segment_guider(guider, bounds, sync_ref_video)
+                    chunk_guider = segment_guider(guider, bounds, sync_ref_video, scene_cuts=cuts)
                 else:
                     previous_tail = None
-                    if previous is not None:
+                    if previous is not None and index + 1 not in cut_segments:
                         overlap = min(ve, chunks[index - 1][1]) - vs
                         offset = vs - chunks[index - 1][0]
                         previous_tail = previous.unbind()[0][:, :, offset:offset + overlap]
@@ -86,7 +98,8 @@ def sample_relay(noise, guider, sampler, sigmas, latent_image, chunks, cache,
                                               device="cpu", dtype=torch.promote_types(source.dtype, part.dtype))
                              for index, (source, part, axis) in enumerate(zip((video, audio), parts, (2, 3)))]
             for stream_index, (part, axis) in enumerate(zip(parts, (2, 3))):
-                start, end = bounds[stream_index * 2:stream_index * 2 + 2]
+                start = bounds[stream_index * 2]
+                end = deliveries[index][stream_index * 2 + 1]
                 dtype = torch.promote_types(assembled[stream_index].dtype, part.dtype)
                 if assembled[stream_index].dtype != dtype:
                     assembled[stream_index] = assembled[stream_index].to(dtype=dtype)
@@ -99,6 +112,8 @@ def sample_relay(noise, guider, sampler, sigmas, latent_image, chunks, cache,
             previous_digest = fingerprint(sampled)
 
     output = dict(latent_image, samples=comfy.nested_tensor.NestedTensor(assembled))
+    output["pj_scene_cuts"] = cuts
+    output["pj_relay_chunks"] = list(chunks)
     if "noise_mask" in output:
         output["noise_mask"] = slice_mask(output["noise_mask"], (0, written[0], 0, written[1]))
     return output, {"samples": first}

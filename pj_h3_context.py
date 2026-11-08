@@ -1,7 +1,6 @@
 """Rebuild native H3 conditions for one timeline window without decoding its result."""
 
 from contextlib import contextmanager
-import json
 from pathlib import Path
 import tempfile
 import time
@@ -14,6 +13,8 @@ from comfy_extras.nodes_minimax_h3 import MiniMaxH3ImageToVideo, MiniMaxH3Refere
 
 from .segment_sampling import segment_guider
 from .segment_timing import frames_for_tokens, tokens_for_frames_floor
+from .segment_script import parse_segment_prompts, segment_prompt
+from .segment_audio import encode_soundtrack, lock_soundtrack
 
 
 class PJ_H3SegmentContext(io.ComfyNode):
@@ -50,6 +51,10 @@ class PJ_H3SegmentContext(io.ComfyNode):
                              step=32, display_name="目标高度"),
                 io.Int.Input("length", optional=True, default=124, min=5, max=100000, step=1,
                              display_name="总帧数", tooltip="24 FPS；按17n+5向下对齐。只决定目标潜空间长度，参考条件仍按段编码"),
+                io.Combo.Input("audio_mode", options=["参考声音生成", "生成新声音", "保留指定音轨"],
+                               default="参考声音生成", optional=True, display_name="音频用途"),
+                io.Audio.Input("soundtrack", optional=True, display_name="指定音轨",
+                               tooltip="保留模式的完整时间线音轨；最终原声请沿此音频分支连接视频合成"),
             ],
             outputs=[
                 io.Custom("PJ_H3_CONTEXT").Output(display_name="H3分段上下文"),
@@ -65,22 +70,21 @@ class PJ_H3SegmentContext(io.ComfyNode):
         length = frames_for_tokens(tokens_for_frames_floor(length))
         base = MiniMaxH3ImageToVideo.execute(context["clip"], context["vae"], prompt="",
                                            width=width, height=height, length=length)
-        return io.NodeOutput(context, base.result[1], base.result[0])
+        latent = base.result[1]
+        if context["audio_mode"] == "保留指定音轨":
+            context["locked_audio"] = encode_soundtrack(context["audio_vae"], context["soundtrack"], length)
+            samples, mask = lock_soundtrack(latent["samples"], None, context["locked_audio"])
+            latent = dict(latent, samples=samples, noise_mask=mask)
+        return io.NodeOutput(context, latent, base.result[0])
 
     @classmethod
     def prepare(cls, clip, vae=None, prompt="", segment_prompts="{}",
                 reference_mode="原视频编辑（按时间裁剪）", motion_context=True,
                 reference_images=None, reference_video=None, reference_video_audio=None,
                 reference_audio=None, audio_vae=None, ref_images=None, ref_image_size="match",
-                ref_videos=None, ref_video_audios=None, ref_audios=None):
-        try:
-            prompts = json.loads(segment_prompts or "{}")
-        except json.JSONDecodeError as exc:
-            raise ValueError("分段补充提示词需要 JSON 对象，例如 {\"2\":\"人物转身\"}") from exc
-        if not isinstance(prompts, dict) or any(
-                not key.isdecimal() or int(key) < 1 or not isinstance(value, str)
-                for key, value in prompts.items()):
-            raise ValueError("分段补充提示词的键为从 1 开始的段号，值为提示词文本")
+                ref_videos=None, ref_video_audios=None, ref_audios=None,
+                audio_mode="参考声音生成", soundtrack=None):
+        prompts = parse_segment_prompts(segment_prompts)
         videos = _reference_inputs(ref_videos, reference_video, "ref_video")
         video_audios = _reference_inputs(ref_video_audios, reference_video_audio, "ref_video_audio")
         audios = _reference_inputs(ref_audios, reference_audio, "ref_audio")
@@ -94,7 +98,8 @@ class PJ_H3SegmentContext(io.ComfyNode):
                 images.append(image[0].clone() if image.shape[0] > 1 else image[0])
         return ({
             "clip": clip, "vae": vae, "prompt": prompt,
-            "segment_prompts": {int(key): value for key, value in prompts.items()},
+            "segment_prompts": prompts,
+            "audio_mode": audio_mode, "soundtrack": soundtrack,
             "sync_video": reference_mode == "原视频编辑（按时间裁剪）",
             "motion_context": motion_context, "reference_images": images or None,
             "ref_image_size": ref_image_size,
@@ -141,27 +146,28 @@ def prepare_segment_guider(base_guider, context, bounds, video_shape,
     return _apply_segment_conditions(base_guider, context, bounds, video_shape, positive, previous_tail)
 
 
-def _encode_segment_conditions(context, bounds, video_shape, segment_index):
+def _encode_segment_conditions(context, bounds, video_shape, segment_index, scene_cuts=()):
     if len(video_shape) != 5 or video_shape[1] != 24 or video_shape[2] != bounds[1] - bounds[0]:
         raise ValueError("H3 分段条件需要当前窗口的原生视频潜空间形状")
     frame_start = frames_for_tokens(bounds[0])
     frame_count = frames_for_tokens(video_shape[2])
     if bounds[0] % 5 or video_shape[2] % 5 != 2:
         raise ValueError("H3 分段条件需要按 17n+5 帧网格对齐的窗口")
-    prompt = context["prompt"]
-    addition = context["segment_prompts"].get(segment_index + 1, "")
-    if addition:
-        prompt = f"{prompt}\n{addition}" if prompt else addition
+    prompt = segment_prompt(context, segment_index, bounds)
     images = context["reference_images"]
     videos, video_audios = {}, {}
     for name, source in context["ref_videos"].items():
         audio_name = "ref_video_audio_" + name.rsplit("_", 1)[-1]
-        video_audio = context["ref_video_audios"].get(audio_name)
+        video_audio = context["ref_video_audios"].get(audio_name) if context.get("audio_mode", "参考声音生成") == "参考声音生成" else None
         if context["sync_video"]:
             end = frame_start + frame_count
-            if source.shape[0] < end:
-                raise ValueError(f"参考视频不足以覆盖第 {segment_index + 1} 段 [{frame_start}:{end}]（{name}）；续写请改用素材参考或提供完整视频")
-            video = source[frame_start:end]
+            scene_end = next((frames_for_tokens(cut) for cut in scene_cuts if bounds[0] < cut < bounds[1]), end)
+            visual_end = min(end, scene_end)
+            if source.shape[0] < visual_end:
+                raise ValueError(f"参考视频不足以覆盖第 {segment_index + 1} 段 [{frame_start}:{visual_end}]（{name}）；续写请改用素材参考或提供完整视频")
+            video = source[frame_start:visual_end]
+            if visual_end < end:
+                video = torch.cat((video, video[-1:].expand(end - visual_end, -1, -1, -1)))
             video_audio = _audio_window(video_audio, frame_start, end)
         else:
             # Match each native reference clip's floor rule for its paired streams.
@@ -175,20 +181,21 @@ def _encode_segment_conditions(context, bounds, video_shape, segment_index):
     # material references must retain their own duration; its empty target is discarded.
     native_length = max([frame_count] + [video.shape[0] for video in videos.values()])
     size = dict(width=video_shape[-1] * 16, height=video_shape[-2] * 16, length=native_length)
-    if images or videos or context["ref_audios"]:
+    audios = context["ref_audios"] if context.get("audio_mode", "参考声音生成") == "参考声音生成" else {}
+    if images or videos or audios:
         prepared = MiniMaxH3ReferenceToVideo.execute(
             context["clip"], prompt=prompt, vae=context["vae"], audio_vae=context["audio_vae"],
             ref_images={f"ref_image_{i + 1}": image[None] for i, image in enumerate(images)} if images is not None else None,
             ref_videos=videos or None, ref_video_audios=video_audios or None,
-            ref_audios=context["ref_audios"] or None,
+            ref_audios=audios or None,
             ref_image_size=context["ref_image_size"], **size)
     else:
         prepared = MiniMaxH3ImageToVideo.execute(context["clip"], context["vae"], prompt=prompt, **size)
     return prepared.result[0]
 
 
-def _apply_segment_conditions(base_guider, context, bounds, video_shape, positive, previous_tail=None):
-    guider = segment_guider(base_guider, bounds, context["sync_video"])
+def _apply_segment_conditions(base_guider, context, bounds, video_shape, positive, previous_tail=None, scene_cuts=()):
+    guider = segment_guider(base_guider, bounds, context["sync_video"], scene_cuts=scene_cuts)
     guides = motion_keyframes(previous_tail, tuple(video_shape)) if previous_tail is not None and context["motion_context"] else []
     templates = guider.original_conds.get("positive") or [{}]
     rebuilt = []
@@ -221,11 +228,13 @@ def _conditions_to_cpu(value):
 
 
 class _PreparedSegmentConditions:
-    def __init__(self, directory, context, chunks, video_shape):
+    def __init__(self, directory, context, chunks, video_shape, scene_cuts):
         self.directory = Path(directory)
         self.context = context
         self.chunks = chunks
         self.video_shape = tuple(video_shape)
+        self.locked_audio = None
+        self.scene_cuts = scene_cuts
 
     def shape(self, index):
         start, end = self.chunks[index][:2]
@@ -234,26 +243,38 @@ class _PreparedSegmentConditions:
     def guider(self, base_guider, index, previous_tail=None):
         positive = torch.load(self.directory / f"{index}.pt", map_location="cpu", weights_only=True)
         return _apply_segment_conditions(base_guider, self.context, self.chunks[index],
-                                         self.shape(index), positive, previous_tail)
+                                         self.shape(index), positive, previous_tail, self.scene_cuts)
+
+    def constrain_audio(self, samples, mask, index):
+        if self.locked_audio is None:
+            return samples, mask
+        start, end = self.chunks[index][2:]
+        return lock_soundtrack(samples, mask, self.locked_audio[..., start:end])
 
 
 @contextmanager
-def prepare_segment_conditions(context, chunks, video_shape, indices):
+def prepare_segment_conditions(context, chunks, video_shape, indices, scene_cuts=()):
     """Encode only scheduled windows before sampling; discard all files on exit."""
     indices = list(indices)
     if context is None or not indices:
         yield None
         return
     with tempfile.TemporaryDirectory(prefix="pj_conditions_") as directory:
-        prepared = _PreparedSegmentConditions(directory, context, chunks, video_shape)
+        prepared = _PreparedSegmentConditions(directory, context, chunks, video_shape, scene_cuts)
         started = time.perf_counter()
         comfy.model_management.unload_all_models()
         comfy.model_management.soft_empty_cache()
         try:
+            if context.get("audio_mode") == "保留指定音轨":
+                prepared.locked_audio = context.get("locked_audio")
+                if prepared.locked_audio is None or prepared.locked_audio.shape[-1] < max(chunk[3] for chunk in chunks):
+                    prepared.locked_audio = encode_soundtrack(context["audio_vae"], context.get("soundtrack"),
+                                                              frames_for_tokens(video_shape[2]))
             for index in indices:
                 comfy.model_management.throw_exception_if_processing_interrupted()
                 print(f"[PJ条件] 预编码第 {index + 1}/{len(chunks)} 段")
-                positive = _encode_segment_conditions(context, chunks[index], prepared.shape(index), index)
+                positive = (_encode_segment_conditions(context, chunks[index], prepared.shape(index), index, scene_cuts)
+                            if scene_cuts else _encode_segment_conditions(context, chunks[index], prepared.shape(index), index))
                 torch.save(_conditions_to_cpu(positive), prepared.directory / f"{index}.pt")
                 del positive
         finally:

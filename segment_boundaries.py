@@ -5,7 +5,7 @@ import comfy.nested_tensor
 import comfy.sampler_helpers
 
 
-def constrain_boundaries(samples, mask, bounds, sources):
+def constrain_boundaries(samples, mask, bounds, sources, preserve_streams=None):
     """Sources are (absolute AV bounds, samples), in overlap ownership order."""
     intersections = [(other, value) for other, value in sources
                      if max(bounds[0], other[0]) < min(bounds[1], other[1])]
@@ -21,6 +21,8 @@ def constrain_boundaries(samples, mask, bounds, sources):
         start, end = bounds[stream_index * 2:stream_index * 2 + 2]
         parts = [(other[stream_index * 2:stream_index * 2 + 2],
                   value.unbind()[stream_index] if nested else value) for other, value in intersections]
+        if preserve_streams is not None and stream_index not in preserve_streams:
+            parts = []
         dtype = stream.dtype
         for _, value in parts:
             dtype = torch.promote_types(dtype, value.dtype)

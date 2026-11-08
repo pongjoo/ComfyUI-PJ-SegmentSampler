@@ -42,20 +42,21 @@ def delivery_chunks(chunks, plan):
     return delivered
 
 
-def plan_relay_segments(total_v, total_a, chunk_seconds, *, complete_timeline=False):
+def plan_relay_segments(total_v, total_a, chunk_seconds, *, complete_timeline=False, cut_segments=()):
     # A window needs at least one new five-token group beyond its seven-token prefix.
     groups = max(2, math.floor((chunk_seconds * FPS - 5) / 17 + 0.5))
     window = groups * 5 + 2
     total_frames = frames_for_tokens(total_v)
     budget_frames = max(chunk_seconds * FPS, frames_for_tokens(12))
     chunks = []
-    for start in range(0, total_v, window - 7):
+    start = 0
+    while start < total_v:
         length = window
         if not complete_timeline:
             # Budget before overlap removal; do not add windows to replace that loss.
             remaining_frames = total_frames - len(chunks) * budget_frames
             length = min(window, max(0, math.floor((remaining_frames - 5) / 17 + 0.5)) * 5 + 2)
-            if chunks and length <= 7:
+            if chunks and length <= (2 if len(chunks) + 1 in cut_segments else 7):
                 break
         end = min(total_v, start + length)
         audio_start = min(total_a, round(frames_for_tokens(start) * AUDIO_FPS / FPS))
@@ -63,6 +64,7 @@ def plan_relay_segments(total_v, total_a, chunk_seconds, *, complete_timeline=Fa
         chunks.append((start, end, audio_start, audio_end))
         if end == total_v:
             break
+        start += window - (2 if len(chunks) + 1 in cut_segments else 7)
     return chunks
 
 

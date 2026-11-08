@@ -1,6 +1,7 @@
 """Local segment conditioning, disk cache and overlap assembly."""
 
 import copy
+import bisect
 import hashlib
 import math
 import os
@@ -112,7 +113,7 @@ def slice_mask(mask, bounds):
     return mask
 
 
-def _slice_refs(refs, bounds):
+def _slice_refs(refs, bounds, video_end=None):
     vs, ve, a_s, ae = bounds
     result = []
     for ref in refs:
@@ -123,6 +124,9 @@ def _slice_refs(refs, bounds):
             continue
         sliced = dict(ref)
         sliced["latent"] = ref["latent"][:, :, vs:ve].clone()
+        if video_end is not None and video_end < min(ve, ref["latent"].shape[2]):
+            valid = video_end - vs
+            sliced["latent"][:, :, valid:] = sliced["latent"][:, :, valid - 1:valid]
         sliced["latent_t"] = sliced["latent"].shape[2]
         if ref.get("audio_latent") is not None:
             audio = ref["audio_latent"][..., a_s:ae].clone()
@@ -134,7 +138,7 @@ def _slice_refs(refs, bounds):
     return result
 
 
-def _slice_keyframes(keyframes, frame_start, frame_end):
+def _slice_keyframes(keyframes, frame_start, frame_end, visual_end=None):
     result = []
     for keyframe in keyframes:
         origin = keyframe["resolved_frame_index"]
@@ -152,6 +156,13 @@ def _slice_keyframes(keyframes, frame_start, frame_end):
         if video is not None:
             video_end = min(video.shape[2], tokens_for_frames(frame_end - origin))
             sliced["latent"] = video[:, :, video_start:video_end].clone() if video_start < video_end else None
+            if visual_end is not None:
+                valid_end = bisect.bisect_left(range(video.shape[2]), visual_end - origin, key=frames_for_tokens)
+                if valid_end <= video_start:
+                    sliced["latent"] = None
+                elif valid_end < video_end:
+                    valid = valid_end - video_start
+                    sliced["latent"][:, :, valid:] = sliced["latent"][:, :, valid - 1:valid]
         if audio is not None:
             audio_start = round(offset * 40 / 24)
             audio_end = min(audio.shape[-1], round((frame_end - origin) * 40 / 24))
@@ -162,8 +173,10 @@ def _slice_keyframes(keyframes, frame_start, frame_end):
     return result
 
 
-def segment_guider(guider, bounds, sync_refs):
+def segment_guider(guider, bounds, sync_refs, scene_cuts=()):
     frame_start, frame_end = (frames_for_tokens(v) for v in bounds[:2])
+    video_end = next((cut for cut in scene_cuts if bounds[0] < cut < bounds[1]), None)
+    visual_end = frames_for_tokens(video_end) if video_end is not None else None
     raw_conds = {}
     for name, conditions in guider.original_conds.items():
         raw_conds[name] = []
@@ -172,9 +185,9 @@ def segment_guider(guider, bounds, sync_refs):
             embedding = extra.pop("cross_attn", None)
             extra.pop("uuid", None)
             if sync_refs and "minimax_refs" in extra:
-                extra["minimax_refs"] = _slice_refs(extra["minimax_refs"], bounds)
+                extra["minimax_refs"] = _slice_refs(extra["minimax_refs"], bounds, video_end)
             if "minimax_keyframes" in extra:
-                extra["minimax_keyframes"] = _slice_keyframes(extra["minimax_keyframes"], frame_start, frame_end)
+                extra["minimax_keyframes"] = _slice_keyframes(extra["minimax_keyframes"], frame_start, frame_end, visual_end)
             raw_conds[name].append([embedding, extra])
     clone = copy.copy(guider)
     clone.original_conds = {}
