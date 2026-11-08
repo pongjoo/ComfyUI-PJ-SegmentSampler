@@ -63,6 +63,82 @@ function refresh(node, first = false) {
 const widget = (node, name) => node.widgets.find(w => w.name === name);
 const visible = (node, name) => widget(node, name).type !== 'pj_hidden';
 
+function overlapPlanner(seconds = 0.5) {
+    const values = {fps: 30, split_mode: '按秒自动切分', chunk_seconds: 6, overlap_seconds: seconds,
+        num_segments: 3, custom_cuts: '0-6, 5.5-12'};
+    return {properties: {}, inputs: [], outputs: [], widgets: Object.entries(values).map(([name, value]) =>
+        ({name, value, type: 'number', options: name === 'overlap_seconds' ? {max: 10} : {}})),
+        addWidget(type, name, value, callback, options) {
+            if (type === 'combo') assert.ok(Array.isArray(options?.values), 'native combo requires values at creation');
+            const w = {type, name, value, callback, options}; this.widgets.push(w); return w;
+        }};
+}
+
+function refreshPlanner(node) {
+    uiContext.node = node;
+    vm.runInContext('setupPlannerNode(node)', uiContext);
+}
+
+test('overlap frame menu reads legacy seconds without changing saved values or their order', () => {
+    for (const [seconds, label] of [[0, '0 帧（不重叠）'], [0.5, '5 帧'], [0.92, '22 帧'], [1.5, '39 帧'], [10, '243 帧']]) {
+        const node = overlapPlanner(seconds);
+        const original = node.widgets.map(w => [w.name, w.value]);
+        refreshPlanner(node);
+        assert.equal(widget(node, 'pj_overlap_frames').value, label);
+        assert.equal(visible(node, 'overlap_seconds'), false);
+        assert.equal(visible(node, 'pj_overlap_frames'), true);
+        assert.deepEqual(node.widgets.filter(w => w.serialize !== false).map(w => [w.name, w.value]), original);
+        refreshPlanner(node);
+        assert.equal(node.widgets.filter(w => w.name === 'pj_overlap_frames').length, 1);
+    }
+});
+
+test('every overlap menu choice round-trips through the backend seconds field on the H3 clock', () => {
+    const node = overlapPlanner();
+    widget(node, 'overlap_seconds').callback = function () { this.value = Math.round(this.value * 10) / 10; };
+    refreshPlanner(node);
+    const frames = widget(node, 'pj_overlap_frames');
+    assert.deepEqual(Array.from(frames.options.values).slice(0, 5), ['0 帧（不重叠）', '5 帧', '22 帧', '39 帧', '56 帧']);
+    for (const choice of frames.options.values) {
+        node.properties.pj_preview_cache = {n_chunks: 9};
+        frames.callback(choice);
+        assert.equal(frames.value, choice);
+        assert.equal(widget(node, 'fps').value, 30);
+        assert.ok(widget(node, 'overlap_seconds').value <= 10);
+        assert.equal(node.properties.pj_preview_cache, undefined);
+        const saved = node.widgets.filter(w => w.serialize !== false).map(w => w.value);
+        const restored = overlapPlanner(saved[3]); refreshPlanner(restored);
+        assert.equal(widget(restored, 'pj_overlap_frames').value, choice);
+        assert.equal(saved.length, 6);
+    }
+});
+
+test('custom cuts hide overlap and switching planner tabs retains the frame selection', () => {
+    const node = overlapPlanner(); refreshPlanner(node);
+    widget(node, 'pj_overlap_frames').callback('22 帧');
+    const mode = widget(node, 'split_mode');
+    mode.value = '自定义切点'; mode.callback();
+    assert.equal(visible(node, 'pj_overlap_frames'), false);
+    assert.equal(visible(node, 'overlap_seconds'), false);
+    mode.value = '固定分段数'; mode.callback();
+    assert.equal(visible(node, 'pj_overlap_frames'), true);
+    assert.equal(widget(node, 'pj_overlap_frames').value, '22 帧');
+});
+
+test('legacy wired overlap keeps its seconds contract and hides the local frame selector', () => {
+    const node = overlapPlanner();
+    const input = {name: 'overlap_seconds', widget: {name: 'overlap_seconds'}, link: 7};
+    node.inputs.push(input); refreshPlanner(node);
+    assert.equal(input.link, 7);
+    assert.match(input.label, /秒数/);
+    assert.equal(visible(node, 'overlap_seconds'), true);
+    assert.equal(visible(node, 'pj_overlap_frames'), false);
+    assert.equal(widget(node, 'overlap_seconds').value, 0.5);
+    input.link = null; refreshPlanner(node);
+    assert.equal(visible(node, 'overlap_seconds'), false);
+    assert.equal(visible(node, 'pj_overlap_frames'), true);
+});
+
 test('second pass exposes blending only for regenerated audio', () => {
     const node = sampler('全部精修(刷新全部缓存)');
     node.properties.pj_advanced_open = true;

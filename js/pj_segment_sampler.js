@@ -682,6 +682,45 @@ function notifyDownstreamSamplers(plannerNode) {
     }
 }
 
+function plannerOverlapFrames(seconds) {
+    return seconds === 0 ? 0 : Math.max(0, Math.floor((seconds * 24 - 5) / 17 + 0.5)) * 17 + 5;
+}
+
+function setupPlannerOverlap(node, secondsWidget, visible) {
+    if (!secondsWidget || !node.addWidget) return;
+    const inputIndex = node.inputs?.findIndex(input => input.name === "overlap_seconds") ?? -1;
+    const input = node.inputs?.[inputIndex];
+    const connected = inputIndex >= 0 && (node.isInputConnected?.(inputIndex) ?? input.link != null);
+    if (input) input.label = "重叠秒数(外部输入)";
+    secondsWidget.label = "重叠秒数(外部输入)";
+    const maxSeconds = secondsWidget.options?.max ?? 10;
+    const frames = plannerOverlapFrames(Number(secondsWidget.value));
+    const values = [0];
+    for (let value = 5; value <= plannerOverlapFrames(maxSeconds); value += 17) values.push(value);
+    if (!values.includes(frames)) values.push(frames);
+    const label = value => value === 0 ? "0 帧（不重叠）" : `${value} 帧`;
+    let widget = node.widgets.find(w => w.name === "pj_overlap_frames");
+    if (!widget) {
+        widget = node.addWidget("combo", "pj_overlap_frames", label(frames), value => {
+            node.graph?.beforeChange?.();
+            // The legacy seconds field remains the only serialized/backend value.
+            secondsWidget.value = Math.min(parseInt(value, 10) / 24, maxSeconds);
+            secondsWidget.callback?.(secondsWidget.value);
+            node.graph?.afterChange?.();
+            node.setDirtyCanvas?.(true, true);
+        }, {serialize: false, values: values.map(label)});
+        widget.serialize = false;
+        node.widgets.splice(node.widgets.indexOf(widget), 1);
+        node.widgets.splice(node.widgets.indexOf(secondsWidget) + 1, 0, widget);
+    }
+    widget.label = "重叠帧数";
+    widget.options.values = values.sort((a, b) => a - b).map(label);
+    widget.options.tooltip = "H3 24fps 时钟：0 表示不重叠，正值按 17n+5 帧选择。段长或尾段不足时实际重叠会缩短，以分段明细为准；22帧接力使用自身规则。";
+    widget.value = label(frames);
+    toggleWidget(node, secondsWidget, false);
+    toggleWidget(node, widget, visible && !connected);
+}
+
 function setupPlannerNode(node) {
     localizeAndSanitizeCommon(node);
     if (!node.title || node.title.startsWith("PJ_SegmentPlanner")) {
@@ -710,21 +749,19 @@ function setupPlannerNode(node) {
             const mode = modeWidget.value;
             if (mode === "按秒自动切分") {
                 toggleWidget(node, chunkSec, true);
-                toggleWidget(node, overlapSec, true);
                 toggleWidget(node, numSeg, false);
                 toggleWidget(node, customCuts, false);
             } else if (mode === "固定分段数") {
                 toggleWidget(node, chunkSec, false);
-                toggleWidget(node, overlapSec, true);
                 toggleWidget(node, numSeg, true);
                 toggleWidget(node, customCuts, false);
             } else if (mode === "自定义切点") {
                 toggleWidget(node, chunkSec, false);
-                toggleWidget(node, overlapSec, false);
                 toggleWidget(node, numSeg, false);
                 toggleWidget(node, customCuts, true);
             }
         }
+        setupPlannerOverlap(node, overlapSec, ["按秒自动切分", "固定分段数"].includes(modeWidget?.value));
         autoResizeNode(node);
     }
 
@@ -760,6 +797,7 @@ function setupPlannerNode(node) {
         node.onConnectionsChange = function () {
             const res = origOnConn?.apply(this, arguments);
             setTimeout(() => {
+                updatePlannerWidgets();
                 notifyDownstreamSamplers(node);
             }, 100);
             return res;

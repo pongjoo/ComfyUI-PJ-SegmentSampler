@@ -17,7 +17,7 @@
 | 顺序接力 | segment_relay.py / sample_relay | 固定 22 帧接力、窗口噪声、可选逐段条件、依赖摘要和后缀失效；按最终交付边界分配 CPU 拼合结果并裁齐空间遮罩 |
 | 一采编排 | pj_first_pass_sampler.py / execute、execute_with_ui | 原生成、载入基准、局部重绘、完整结果复用；拥有一采段缓存与完整版本，原生入口附带执行摘要 |
 | 二采编排 | pj_segment_sampler.py / execute、execute_with_ui | 常规精修、局部替换、一采变更更新、高清复用；拥有高清快照和已消费一采版本，不修改一采存储 |
-| 前端 | js/pj_segment_sampler.js、pj_mode_tabs.js、pj_segment_prompt_editor.js | 旧控件迁移、用途页签、显隐、高级折叠、预览尺寸；编辑器只写原 segment_prompts，视图偏好归节点属性；页签不序列化为后端参数 |
+| 前端 | js/pj_segment_sampler.js、pj_mode_tabs.js、pj_segment_prompt_editor.js | 旧控件迁移、用途页签、显隐、高级折叠、预览尺寸；规划器帧数选择映射原 overlap_seconds，保留外部秒数连线；编辑器只写原 segment_prompts，视图偏好归节点属性；页签和帧数控件不序列化为后端参数 |
 | 阶段示例 | workflows/局部回修_执行阶段示例.json | 原生 ComfySwitchNode 选择输出，未选择的放大/采样分支不执行 |
 | 输出分析 | scripts/analyze_segment_outputs.py | 本地张量/解码数据检查：形状、有限值、变更范围、保护区、时间覆盖；画面指标只报告线索 |
 | 运行监控 | scripts/monitor_comfyui.ps1 | 独立 PowerShell 7 只读本机指定任务、NVIDIA/Windows 资源和日志；记录归输出目录所有，任务结束自动退出，不参与采样 |
