@@ -618,8 +618,6 @@ function notifyDownstreamSamplers(plannerNode) {
 
 function setupPlannerNode(node) {
     localizeAndSanitizeCommon(node);
-    node.color = "#312e81"; // 现代科技靛蓝 (Indigo)
-    node.bgcolor = "#1e1b4b";
     if (!node.title || node.title.startsWith("PJ_SegmentPlanner")) {
         node.title = "PJ分段规划器 (时序总控/可视播放器)";
     }
@@ -1032,6 +1030,8 @@ app.registerExtension({
             const onNodeCreated = nodeType.prototype.onNodeCreated;
             nodeType.prototype.onNodeCreated = function () {
                 const r = onNodeCreated ? onNodeCreated.apply(this, arguments) : undefined;
+                this.color = "#312e81";
+                this.bgcolor = "#1e1b4b";
                 setupPlannerNode(this);
                 return r;
             };
