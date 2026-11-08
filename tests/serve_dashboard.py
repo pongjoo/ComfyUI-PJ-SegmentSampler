@@ -10,7 +10,10 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         files = {
             "/": (ROOT / "tests/dashboard.html", "text/html; charset=utf-8"),
+            "/purpose": (ROOT / "tests/purpose.html", "text/html; charset=utf-8"),
             "/extensions/pj/pj_segment_sampler.js": (ROOT / "js/pj_segment_sampler.js", "text/javascript; charset=utf-8"),
+            "/extensions/pj/pj_segment_prompt_editor.js": (ROOT / "js/pj_segment_prompt_editor.js", "text/javascript; charset=utf-8"),
+            "/extensions/pj/pj_mode_tabs.js": (ROOT / "js/pj_mode_tabs.js", "text/javascript; charset=utf-8"),
         }
         scripts = {
             "/scripts/app.js": "export const app = window.testApp;",

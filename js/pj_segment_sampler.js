@@ -1,5 +1,7 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
+import { setupSegmentPromptEditor } from "./pj_segment_prompt_editor.js";
+import { modeTabs } from "./pj_mode_tabs.js";
 
 const HIDDEN_TAG = "pj_hidden";
 
@@ -26,6 +28,7 @@ const WIDGET_LABELS = {
     "prompt": "全局提示词",
     "segment_prompts": "各段补充提示词",
     "reference_mode": "参考用途",
+    "audio_mode": "音频用途",
     "motion_context": "前段运动引导",
 
     // 运行重抽与缓存锁
@@ -370,6 +373,27 @@ function syncSamplerSegmentCount(node, isFirstPass) {
         if (!["分段编辑", "整段采样", "22帧接力"].includes(generation.value)) generation.value = "分段编辑";
         if (generation.value === "分段编辑" && String(runModeWidget?.value).includes("不分段")) generation.value = "整段采样";
     }
+    if (action) {
+        const choices = isFirstPass ? [
+            ["整段采样", "整段生成"], ...(planned ? [["22帧接力", "长视频接力"], ["分段编辑", "分段编辑"]] : []),
+            ["仅重绘目标段", "局部重绘"], ["载入回修基准", "载入结果"], ["复用一采结果", "复用结果"],
+        ] : [["常规精修", "常规精修"], ["仅重做目标段", "局部重做"],
+            ["更新一采变更", "更新一采变更"], ["复用高清结果", "复用结果"]];
+        const selected = isFirstPass && action.value === "原采样方式" ?
+            (planned ? generation?.value : "整段采样") : action.value;
+        modeTabs(node, "pj_purpose_tabs", isFirstPass ? "一采用途" : "二采用途", choices, selected, value => {
+            if (isFirstPass && ["整段采样", "22帧接力", "分段编辑"].includes(value)) {
+                action.value = "原采样方式";
+                generation.value = value;
+                if (value !== "整段采样" && String(runModeWidget?.value).includes("不分段")) {
+                    runModeWidget.value = "全部重新采样(刷新全部缓存)";
+                }
+                generation.callback?.();
+            } else action.value = value;
+            action.callback?.();
+            syncSamplerSegmentCount(node, isFirstPass);
+        });
+    }
     if (runModeWidget) {
         const prefix = isFirstPass ? "仅重抽第" : "仅精修第";
         const defectAction = isFirstPass ? "按缺陷秒数重抽 (下方输入秒数)" : "按缺陷秒数精修 (下方输入秒数)";
@@ -403,9 +427,12 @@ function syncSamplerSegmentCount(node, isFirstPass) {
     const runMode = String(runModeWidget?.value || "");
     const relay = planned && !local && !passive && generation?.value === "22帧接力";
     const full = !planned || (!local && (generation?.value === "整段采样" || (isFirstPass && !generation && runMode.includes("不分段"))));
-    toggleWidget(node, generation, planned && !local && !passive);
+    toggleWidget(node, generation, !node.addDOMWidget && planned && !local && !passive);
+    toggleWidget(node, action, !node.addDOMWidget);
     toggleWidget(node, runModeWidget, planned && !relay && !full && !passive);
     if (action) action.label = isFirstPass ? "一采操作" : "二采操作";
+    toggleWidget(node, node.widgets.find(w => w.name === "base_seed"), !passive);
+    toggleWidget(node, node.widgets.find(w => w.name === "keep_original_audio"), action?.value !== "复用高清结果");
     const relayAction = node.widgets.find(w => w.name === "relay_action");
     const relayStart = node.widgets.find(w => w.name === "relay_start_segment");
     if (relayAction && !["全部生成", "从指定段重做"].includes(relayAction.value)) relayAction.value = "全部生成";
@@ -450,16 +477,19 @@ function syncSamplerSegmentCount(node, isFirstPass) {
         (isFirstPass || node.widgets.find(w => w.name === "keep_original_audio")?.value === false);
     for (const name of ["sync_ref_video", "blend_mode", "unload_model_after_sampling"]) {
         toggleWidget(node, node.widgets.find(w => w.name === name),
-            !!node.properties?.pj_advanced_open && (name !== "blend_mode" || showBlend));
+            !!node.properties?.pj_advanced_open && (name !== "blend_mode" || showBlend) &&
+            (!passive || action?.value === "更新一采变更"));
     }
     const repairLabels = {repair_denoise: "局部重绘降噪", repair_steps: "重绘步数", repair_scheduler: "重绘调度器",
         repair_boundary_tokens: "边界保护潜步", repair_request_id: "重绘操作编号", refine_request_id: "精修操作编号"};
     for (const [name, label] of Object.entries(repairLabels)) {
         const w = node.widgets.find(w => w.name === name);
         if (w) w.label = label;
-        toggleWidget(node, w, local && (name === "repair_denoise" || !!node.properties?.pj_advanced_open));
+        toggleWidget(node, w, (local || (!isFirstPass && action?.value === "更新一采变更")) &&
+            (name === "repair_denoise" || !!node.properties?.pj_advanced_open));
     }
     updateSamplerControls(node, isFirstPass);
+    toggleWidget(node, node.widgets.find(w => w.name === "pj_advanced_toggle"), !passive || action?.value === "更新一采变更");
     autoResizeNode(node);
 }
 
@@ -473,8 +503,36 @@ function updateSamplerControls(node, isFirstPass) {
             syncSamplerSegmentCount(node, isFirstPass);
             node.setDirtyCanvas?.(true, true);
         }, { serialize: false });
+        button.serialize = false;
     }
     button.label = node.properties?.pj_advanced_open ? "收起高级设置" : "展开高级设置";
+}
+
+function setupContextModes(node) {
+    setupSegmentPromptEditor(node);
+    function update() {
+        for (const [name, title, choices] of [
+            ["reference_mode", "参考用途", [["原视频编辑（按时间裁剪）", "原视频编辑"], ["素材参考（保持完整）", "素材参考"]]],
+            ["audio_mode", "音频用途", [["生成新声音", "生成声音"], ["参考声音生成", "参考声音"], ["保留指定音轨", "保留音轨"]]],
+        ]) {
+            const widget = node.widgets.find(w => w.name === name);
+            if (!widget) continue;
+            modeTabs(node, `pj_${name}_tabs`, title, choices, widget.value, value => {
+                widget.value = value;
+                widget.callback?.(value);
+            });
+            toggleWidget(node, widget, !node.addDOMWidget);
+        }
+        autoResizeNode(node);
+    }
+    for (const name of ["reference_mode", "audio_mode"]) {
+        const widget = node.widgets.find(w => w.name === name);
+        if (!widget || widget._pjModeWatched) continue;
+        widget._pjModeWatched = true;
+        const callback = widget.callback;
+        widget.callback = function () { const result = callback?.apply(this, arguments); update(); return result; };
+    }
+    update();
 }
 
 // ==========================================
@@ -642,6 +700,12 @@ function setupPlannerNode(node) {
     }
 
     function updatePlannerWidgets() {
+        if (modeWidget) {
+            modeTabs(node, "pj_planner_tabs", "切分规则", [
+                ["按秒自动切分", "按秒"], ["固定分段数", "固定段数"], ["自定义切点", "自定义切点"],
+            ], modeWidget.value, value => { modeWidget.value = value; modeWidget.callback?.(); });
+            toggleWidget(node, modeWidget, !node.addDOMWidget);
+        }
         if (modeWidget) {
             const mode = modeWidget.value;
             if (mode === "按秒自动切分") {
@@ -1096,6 +1160,7 @@ app.registerExtension({
                 nodeType.prototype[event] = function () {
                     const result = original?.apply(this, arguments);
                     localizeAndSanitizeCommon(this);
+                    if (nodeData.name === "PJ_H3SegmentContext") setupContextModes(this);
                     if (event === "onNodeCreated") {
                         this.color = "#134e4a";
                         this.bgcolor = "#042f2e";

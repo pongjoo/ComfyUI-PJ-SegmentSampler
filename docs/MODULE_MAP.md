@@ -9,12 +9,15 @@
 | H3 条件准备与目标创建 | pj_h3_context.py / PJ_H3SegmentContext.define_schema、execute、prepare、prepare_segment_guider | V3 图片/视频/配套音轨/独立音频四组动态接口，按编号排序并配对；execute 通过原生节点创建向下对齐的目标 AV 潜空间和空提示词基础条件；上下文拥有原始媒体引用与策略，逐窗独立裁剪各路视频和配套音轨，按实际尺寸建立条件；prepare 保持单上下文返回及旧单路参数契约 |
 | 采样基础 | segment_sampling.py | 条件/遮罩切片、噪声、按交付范围融合及 SegmentCache；段缓存归采样器实例所有 |
 | 边界保护 | segment_boundaries.py | constrain_boundaries、restore_preserved；空间零遮罩优先，恢复锁定值，无持久状态 |
+| 分段脚本 | segment_script.py | parse_segment_prompts、segment_settings、segment_prompt；兼容文本/结构条目，只编译当前段对白，控制字段不进入语义条件 |
+| 镜头时间边界 | segment_scenes.py | split_scene_windows、clip_scene_windows、scene_deliveries、pad_scene_video；区分合法采样填充与交付边界，不持有状态 |
+| 指定音轨 | segment_audio.py | encode_soundtrack、lock_soundtrack；原生音频 VAE 编码及 AV 音频零遮罩，完整编码归上下文输出/本次条件准备所有 |
 | 局部回修 | segment_local_repair.py | repair_sigmas、repair_segments；旧结果拥有保留区，新输入可提供精修中部，仅写交付区，返回完整 sampled/x0 及变更范围 |
 | 完整版本 | segment_revision.py / RevisionStore | 当前磁盘快照与临时候选；available/load/commit/check_request；原子提交、有限变更历史和过期请求检查，无持久张量 |
 | 顺序接力 | segment_relay.py / sample_relay | 固定 22 帧接力、窗口噪声、可选逐段条件、依赖摘要和后缀失效；按最终交付边界分配 CPU 拼合结果并裁齐空间遮罩 |
 | 一采编排 | pj_first_pass_sampler.py / execute、execute_with_ui | 原生成、载入基准、局部重绘、完整结果复用；拥有一采段缓存与完整版本，原生入口附带执行摘要 |
 | 二采编排 | pj_segment_sampler.py / execute、execute_with_ui | 常规精修、局部替换、一采变更更新、高清复用；拥有高清快照和已消费一采版本，不修改一采存储 |
-| 前端 | js/pj_segment_sampler.js | 旧控件迁移、显隐、高级折叠、预览尺寸；按执行摘要更新目标菜单，不决定采样状态 |
+| 前端 | js/pj_segment_sampler.js、pj_mode_tabs.js、pj_segment_prompt_editor.js | 旧控件迁移、用途页签、显隐、高级折叠、预览尺寸；编辑器只写原 segment_prompts，视图偏好归节点属性；页签不序列化为后端参数 |
 | 阶段示例 | workflows/局部回修_执行阶段示例.json | 原生 ComfySwitchNode 选择输出，未选择的放大/采样分支不执行 |
 | 输出分析 | scripts/analyze_segment_outputs.py | 本地张量/解码数据检查：形状、有限值、变更范围、保护区、时间覆盖；画面指标只报告线索 |
 | 运行监控 | scripts/monitor_comfyui.ps1 | 独立 PowerShell 7 只读本机指定任务、NVIDIA/Windows 资源和日志；记录归输出目录所有，任务结束自动退出，不参与采样 |
@@ -37,6 +40,8 @@
 prepare_segment_guider(base_guider, context, bounds, video_shape, previous_tail=None, segment_index=0) 接收绝对采样边界与当前窗口形状，调用者不得先重复裁剪 guider。运动尾部须相位对齐且为 2+5k 视频潜步，不构造反向多帧引导。未接上下文时继续原有条件切片，不依赖 Easy 私有模块。
 
 采样编排使用 pj_h3_context.prepare_segment_conditions(context, chunks, video_shape, indices) 上下文管理器，先编码待采样窗口并释放编码模型，再以 prepared.guider(base_guider, index, previous_tail) 读取单段条件、追加实时运动尾部。一次执行独占 pj_conditions_* 临时目录，保持原张量精度，成功或异常退出均清理，不缓存跨执行条件。接力/顺序精修传入失效后缀，独立分段和局部回修传入实际目标；窗口与缓存决策仍归采样编排所有。tests/test_condition_preparation.py 覆盖阶段顺序、选择范围、原生条件等价和失败清理。
+
+完整 LATENT 的 pj_scene_cuts 保存绝对视频潜步切点，pj_relay_chunks 保存接力实际窗口；局部回修沿用已有镜头，二采从 source_result 获取切点并重新分窗。可选 scene_cuts 参数使条件准备及 segment_guider 同时隔离右侧填充中的视觉参考/关键帧，音频按自己的连续时间范围处理。音轨锁定通过 prepared.constrain_audio 应用于每窗，不改变模型代码；保留原音的二采与局部回修优先使用输入音频。
 
 repair_segments 的 baseline 拥有保留区，initial_latent 可为新放大结果；delivery_bounds 限制交付，editable_ranges 可精确指定一采变更。空间零遮罩与时间保护共同限制采样，内部时间遮罩不写回输出。局部回修保留原音，sampled 和 x0 分别组装，不用 sampled 冒充已有完整 x0。
 

@@ -3,7 +3,10 @@ import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 import vm from 'node:vm';
 
-const source = readFileSync(new URL('../js/pj_segment_sampler.js', import.meta.url), 'utf8')
+const editorSource = readFileSync(new URL('../js/pj_segment_prompt_editor.js', import.meta.url), 'utf8')
+    .replace(/^export /gm, '');
+const tabsSource = readFileSync(new URL('../js/pj_mode_tabs.js', import.meta.url), 'utf8').replace(/^export /gm, '');
+const source = editorSource + '\n' + tabsSource + '\n' + readFileSync(new URL('../js/pj_segment_sampler.js', import.meta.url), 'utf8')
     .replace(/^import .*;\r?\n/gm, '');
 const context = vm.createContext({ app: { registerExtension() {} } });
 vm.runInContext(source, context);
@@ -272,7 +275,7 @@ test('samplers use one native advanced button and no explanation panel', () => {
 
 test('edit preparer exposes Chinese input labels without extra sampling widgets', async () => {
     let extension;
-    const ctx = vm.createContext({app:{registerExtension(value) {extension=value;}}});
+    const ctx = vm.createContext({app:{registerExtension(value) {extension=value;}}, setTimeout() {}});
     vm.runInContext(source, ctx);
     class Node {
         constructor() {this.inputs = ['av_latent','source_latent','edit_mask'].map(name=>({name}));}
@@ -665,20 +668,27 @@ test('unexecuted planner estimates with floor-aligned duration and accepts zero 
 
 test('H3 context uses concise native Chinese controls', async () => {
     let extension;
-    const ctx = vm.createContext({app:{registerExtension(value) {extension=value;}}});
+    const ctx = vm.createContext({app:{registerExtension(value) {extension=value;}}, setTimeout() {}});
     vm.runInContext(source, ctx);
     class Node {
         constructor() {
             this.inputs = ['clip', 'vae', 'reference_video', 'audio_vae'].map(name => ({name}));
             this.widgets = ['prompt', 'segment_prompts', 'reference_mode', 'motion_context'].map(name => ({name}));
         }
+        addWidget(type, name, value, callback, options) {
+            const widget = {type, name, value, callback, options};
+            this.widgets.push(widget);
+            return widget;
+        }
     }
     await extension.beforeRegisterNodeDef(Node, {name:'PJ_H3SegmentContext'});
     const node = new Node();
     node.onNodeCreated();
     assert.deepEqual(node.inputs.map(i => i.label), ['文本编码器', '视频VAE', '视频参考', '音频VAE']);
-    assert.deepEqual(node.widgets.map(i => i.label), ['全局提示词', '各段补充提示词', '参考用途', '前段运动引导']);
-    assert.equal(node.widgets.length, 4);
+    assert.deepEqual(node.widgets.map(i => i.label), ['全局提示词', '各段补充提示词', '参考用途', '前段运动引导', '编辑分段提示词']);
+    assert.equal(node.widgets[4].options.serialize, false);
+    node.onConfigure();
+    assert.equal(node.widgets.length, 5);
 });
 
 test('H3 context migrates all old media wires to native dynamic ports', async () => {
@@ -707,7 +717,7 @@ test('H3 context migrates all old media wires to native dynamic ports', async ()
 
 test('H3 preparation nodes preserve saved custom colors on configure', async () => {
     let extension;
-    const ctx = vm.createContext({app:{registerExtension(value) {extension=value;}}});
+    const ctx = vm.createContext({app:{registerExtension(value) {extension=value;}}, setTimeout() {}});
     vm.runInContext(source, ctx);
     for (const name of ['PJ_H3SegmentContext', 'PJ_H3EditPrepare']) {
         class Node {constructor() {this.inputs = []; this.widgets = [];}}
