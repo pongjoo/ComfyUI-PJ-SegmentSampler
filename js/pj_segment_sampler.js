@@ -695,9 +695,7 @@ function setupPlannerOverlap(node, secondsWidget, visible) {
     secondsWidget.label = "重叠秒数(外部输入)";
     const maxSeconds = secondsWidget.options?.max ?? 10;
     const frames = plannerOverlapFrames(Number(secondsWidget.value));
-    const values = [0];
-    for (let value = 5; value <= plannerOverlapFrames(maxSeconds); value += 17) values.push(value);
-    if (!values.includes(frames)) values.push(frames);
+    const values = [0, 5, 22, 39];
     const label = value => value === 0 ? "0 帧（不重叠）" : `${value} 帧`;
     let widget = node.widgets.find(w => w.name === "pj_overlap_frames");
     if (!widget) {
@@ -714,7 +712,7 @@ function setupPlannerOverlap(node, secondsWidget, visible) {
         node.widgets.splice(node.widgets.indexOf(secondsWidget) + 1, 0, widget);
     }
     widget.label = "重叠帧数";
-    widget.options.values = values.sort((a, b) => a - b).map(label);
+    widget.options.values = values.map(label);
     widget.options.tooltip = "H3 24fps 时钟：0 表示不重叠，正值按 17n+5 帧选择。段长或尾段不足时实际重叠会缩短，以分段明细为准；22帧接力使用自身规则。";
     widget.value = label(frames);
     toggleWidget(node, secondsWidget, false);

@@ -143,6 +143,17 @@ function openPromptEditor(node) {
         refresh();
         text.focus();
     });
+    const removeSegment = button("删除本段配置", controls, () => {
+        if (promptInputConnected(node) || !selected) return;
+        const prompts = parseSegmentPrompts(read());
+        const keys = segmentKeys(prompts);
+        const index = keys.indexOf(selected);
+        delete prompts[selected];
+        selected = keys[index + 1] || keys[index - 1] || "";
+        setPromptText(node, JSON.stringify(prompts, null, 2));
+        refresh();
+    });
+    removeSegment.title = "只删除当前段的提示词与设置，不删除视频片段，不改变其他段号。";
     const label = element("label", "本段补充提示词", segments);
     const text = element("textarea", "", label);
     text.setAttribute("aria-label", "本段补充提示词");
@@ -236,6 +247,7 @@ function openPromptEditor(node) {
                 if (!keys.length) element("option", "暂无分段", select);
                 select.value = selected;
                 select.disabled = !keys.length;
+                removeSegment.disabled = !keys.length;
                 const value = prompts[selected] ?? "";
                 const entry = typeof value === "string" ? {prompt: value} : value;
                 text.value = entry.prompt || "";

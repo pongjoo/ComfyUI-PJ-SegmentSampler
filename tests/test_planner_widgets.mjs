@@ -85,6 +85,7 @@ test('overlap frame menu reads legacy seconds without changing saved values or t
         const original = node.widgets.map(w => [w.name, w.value]);
         refreshPlanner(node);
         assert.equal(widget(node, 'pj_overlap_frames').value, label);
+        assert.deepEqual(Array.from(widget(node, 'pj_overlap_frames').options.values), ['0 帧（不重叠）', '5 帧', '22 帧', '39 帧']);
         assert.equal(visible(node, 'overlap_seconds'), false);
         assert.equal(visible(node, 'pj_overlap_frames'), true);
         assert.deepEqual(node.widgets.filter(w => w.serialize !== false).map(w => [w.name, w.value]), original);
@@ -98,7 +99,7 @@ test('every overlap menu choice round-trips through the backend seconds field on
     widget(node, 'overlap_seconds').callback = function () { this.value = Math.round(this.value * 10) / 10; };
     refreshPlanner(node);
     const frames = widget(node, 'pj_overlap_frames');
-    assert.deepEqual(Array.from(frames.options.values).slice(0, 5), ['0 帧（不重叠）', '5 帧', '22 帧', '39 帧', '56 帧']);
+    assert.deepEqual(Array.from(frames.options.values), ['0 帧（不重叠）', '5 帧', '22 帧', '39 帧']);
     for (const choice of frames.options.values) {
         node.properties.pj_preview_cache = {n_chunks: 9};
         frames.callback(choice);

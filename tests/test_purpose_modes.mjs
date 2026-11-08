@@ -102,6 +102,39 @@ test('backend-invalid structured fields and ambiguous segment numbers are reject
     }
 });
 
+test('deleting a segment keeps sparse ids, other settings and global prompt through reopening', () => {
+    const ctx = environment();
+    const retained = {prompt: '转身', transition: 'cut', audio_transition: 'reset', dialogue: []};
+    const target = node({prompt: 'global unchanged', segment_prompts: JSON.stringify({'2': '鞋底', '4': '', '08': retained})});
+    open(ctx, target); button(ctx, '分段编辑').click();
+    const select = field(ctx, '当前分段'); select.value = '4'; select.fire('change');
+    button(ctx, '删除本段配置').click();
+    assert.deepEqual(JSON.parse(widget(target, 'segment_prompts').value), {'2': '鞋底', '08': retained});
+    assert.equal(select.value, '08');
+    assert.equal(widget(target, 'prompt').value, 'global unchanged');
+    button(ctx, '完整 JSON').click();
+    assert.deepEqual(JSON.parse(field(ctx, '各段补充提示词 JSON').value), {'2': '鞋底', '08': retained});
+    button(ctx, '关闭').click(); open(ctx, target); button(ctx, '分段编辑').click();
+    assert.deepEqual(field(ctx, '当前分段').children.map(option => option.value), ['2', '08']);
+});
+
+test('deleting all segment settings leaves an empty script that can add again and respects external input', () => {
+    const ctx = environment(); const target = node({segment_prompts: '{"3":{"prompt":"x","dialogue":[]}}'});
+    open(ctx, target); button(ctx, '分段编辑').click();
+    target.inputs = [{name: 'segment_prompts', link: 17}]; target.onConnectionsChange();
+    const before = widget(target, 'segment_prompts').value;
+    button(ctx, '删除本段配置').click();
+    assert.equal(widget(target, 'segment_prompts').value, before);
+    target.inputs[0].link = null; target.onConnectionsChange();
+    button(ctx, '删除本段配置').click();
+    assert.equal(widget(target, 'segment_prompts').value, '{}');
+    assert.equal(button(ctx, '删除本段配置').disabled, true);
+    assert.equal(field(ctx, '本段补充提示词').disabled, true);
+    button(ctx, '添加分段').click();
+    assert.deepEqual(JSON.parse(widget(target, 'segment_prompts').value), {'1': ''});
+    assert.equal(button(ctx, '删除本段配置').disabled, false);
+});
+
 test('purpose tabs preserve native widget order, wire ids and hidden parameter values', () => {
     const ctx = environment();
     const target = node({generation_mode: '整段采样', repair_action: '原采样方式', run_mode: '整段全量采样(一采不分段)',
