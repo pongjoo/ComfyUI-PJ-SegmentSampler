@@ -264,7 +264,9 @@ class PJ_FirstPass_SegmentSampler:
         cuts = baseline.get("pj_scene_cuts", [])
         if generation_mode == "22帧接力" and segment_plan is not None:
             chunks = baseline.get("pj_relay_chunks") or plan_relay_segments(streams[0].shape[2], streams[1].shape[-1] if len(streams) > 1 else 0,
-                                         segment_plan.get("chunk_seconds", 6.0), complete_timeline=True)
+                                         segment_plan.get("chunk_seconds", 6.0), complete_timeline=True,
+                                         split_mode=segment_plan.get("split_mode", "按秒自动切分"),
+                                         num_segments=segment_plan.get("num_segments", 3), custom_cuts=segment_plan.get("custom_cuts", ""))
             deliveries = chunks
         else:
             chunks, fps = resolve_plan(samples, segment_plan, "按秒自动切分", 6.0, 1.5,
@@ -378,7 +380,10 @@ class PJ_FirstPass_SegmentSampler:
                     or total_v < 2 or total_v % 5 != 2 or full_audio.ndim != 4 or full_audio.shape[1:3] != (32, 2)):
                 raise ValueError("22帧接力需要H3原生音视频潜空间，视频长度为5n+2潜步")
             chunks = plan_relay_segments(total_v, total_a, segment_plan.get("chunk_seconds", chunk_seconds),
-                                         cut_segments=scene_cut_segments(h3_context))
+                                         cut_segments=scene_cut_segments(h3_context),
+                                         split_mode=segment_plan.get("split_mode", split_mode),
+                                         num_segments=segment_plan.get("num_segments", num_segments),
+                                         custom_cuts=segment_plan.get("custom_cuts", custom_cuts))
             self._record_plan(chunks, segment_plan, "relay", input_video_tokens=total_v)
             seed = getattr(noise, "seed", base_seed)
             if not isinstance(seed, int):

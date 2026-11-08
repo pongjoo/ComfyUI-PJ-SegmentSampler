@@ -42,11 +42,50 @@ def delivery_chunks(chunks, plan):
     return delivered
 
 
-def plan_relay_segments(total_v, total_a, chunk_seconds, *, complete_timeline=False, cut_segments=()):
+def plan_relay_segments(total_v, total_a, chunk_seconds, *, complete_timeline=False, cut_segments=(),
+                        split_mode="按秒自动切分", num_segments=3, custom_cuts=""):
+    if complete_timeline and split_mode in ("固定分段数", "fixed_segments", "自定义切点", "custom", "custom_cuts"):
+        return plan_segments(total_v, total_a, split_mode, chunk_seconds, 22 / FPS, num_segments, custom_cuts)
+    total_frames = frames_for_tokens(total_v)
+    budgets = None
+    if split_mode in ("固定分段数", "fixed_segments"):
+        count = max(1, int(num_segments))
+        budgets = [total_frames / count] * count
+    elif split_mode in ("自定义切点", "custom", "custom_cuts"):
+        ranges = parse_custom_ranges(custom_cuts)
+        cursor = 0.0
+        for index, (start, end) in enumerate(ranges, 1):
+            if not math.isclose(start, cursor, abs_tol=1e-6, rel_tol=0):
+                raise ValueError(f"接力自定义第{index}段应从{cursor:g}秒开始，实际为{start:g}秒；区间必须从0连续排列，不能遗漏、重叠或倒序")
+            cursor = end
+        if tokens_for_frames_floor(cursor * FPS) != total_v:
+            raise ValueError(f"接力自定义末端{cursor:g}秒未覆盖完整输入预算（H3对齐后{total_frames}帧/{total_frames / FPS:.3f}秒）；请补齐或调整最后一段")
+        budgets = [(end - start) * FPS for start, end in ranges]
+    elif split_mode not in ("按秒自动切分", "auto_by_seconds"):
+        raise ValueError(f"未知接力规划模式: {split_mode}")
+
+    if budgets is not None:
+        chunks = []
+        start = 0
+        for index, budget in enumerate(budgets):
+            length = max(0, math.floor((budget - 5) / 17 + 0.5)) * 5 + 2
+            end = min(total_v, start + length)
+            inherited = 2 if index + 1 in cut_segments else 7
+            if end <= start or (index and end - start <= inherited):
+                raise ValueError(f"接力第{index + 1}段对齐后没有新增画面；请减少段数或合并过短区间")
+            audio_start = min(total_a, round(frames_for_tokens(start) * AUDIO_FPS / FPS))
+            audio_end = total_a if end == total_v else min(total_a, round(frames_for_tokens(end) * AUDIO_FPS / FPS))
+            chunks.append((start, end, audio_start, audio_end))
+            if index + 1 < len(budgets):
+                overlap = 2 if index + 2 in cut_segments else 7
+                if end - start <= overlap:
+                    raise ValueError(f"接力第{index + 1}段不足以提供下一段所需的边界；请减少段数或合并过短区间")
+                start = end - overlap
+        return chunks
+
     # A window needs at least one new five-token group beyond its seven-token prefix.
     groups = max(2, math.floor((chunk_seconds * FPS - 5) / 17 + 0.5))
     window = groups * 5 + 2
-    total_frames = frames_for_tokens(total_v)
     budget_frames = max(chunk_seconds * FPS, frames_for_tokens(12))
     chunks = []
     start = 0
@@ -66,6 +105,19 @@ def plan_relay_segments(total_v, total_a, chunk_seconds, *, complete_timeline=Fa
             break
         start += window - (2 if len(chunks) + 1 in cut_segments else 7)
     return chunks
+
+
+def parse_custom_ranges(custom_cuts):
+    ranges = []
+    for pair in custom_cuts.split(","):
+        try:
+            start, end = map(float, pair.strip().split("-"))
+        except ValueError as exc:
+            raise ValueError(f"无效自定义切点 {pair!r}，请使用 0-6,6-12 格式") from exc
+        if not (math.isfinite(start) and math.isfinite(end) and 0 <= start < end):
+            raise ValueError(f"无效自定义区间 {pair!r}：需要有限的非负起点且结束晚于开始")
+        ranges.append((start, end))
+    return ranges
 
 
 def plan_segments(total_v, total_a, split_mode, chunk_seconds, overlap_seconds,
@@ -107,13 +159,7 @@ def plan_segments(total_v, total_a, split_mode, chunk_seconds, overlap_seconds,
             chunks.append(interval(start, end))
     elif split_mode in ("自定义切点", "custom", "custom_cuts"):
         duration = frames_for_tokens(total_v) / fps
-        for pair in custom_cuts.split(","):
-            try:
-                start_sec, end_sec = map(float, pair.strip().split("-"))
-            except ValueError as exc:
-                raise ValueError(f"无效自定义切点 {pair!r}，请使用 0-6, 4.5-10.5 格式") from exc
-            if not (math.isfinite(start_sec) and math.isfinite(end_sec) and 0 <= start_sec < end_sec):
-                raise ValueError(f"无效自定义区间 {pair!r}：需要有限的非负起点且结束晚于开始")
+        for start_sec, end_sec in parse_custom_ranges(custom_cuts):
             if start_sec >= duration:
                 continue
             start = min(total_groups, math.floor(start_sec * fps / frame_step + 0.5)) * step

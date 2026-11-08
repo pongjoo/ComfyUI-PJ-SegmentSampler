@@ -184,7 +184,7 @@ class PJ_SegmentPlanner:
                     {
                         "default": "0-6, 4.5-10.5, 9-15",
                         "multiline": False,
-                        "tooltip": "参考秒数范围，如：0-6, 4.5-10.5, 9-15；后端将起止位置就近对齐到H3合法网格",
+                        "tooltip": "普通分段仅处理所填范围；22帧接力需从0连续覆盖输入预算，如0-15,15-30,30-45，各段时长对齐H3后扣重叠、不补尾。缺口、重叠或倒序会报错。",
                     },
                 ),
             },
@@ -264,7 +264,23 @@ class PJ_SegmentPlanner:
         no_overlap = zero_overlap(rules)
 
         n_chunks = len(chunks)
-        relay_n_chunks = len(plan_relay_segments(total_v, total_a, chunk_seconds))
+        relay_preview = {"chunks": [], "n_chunks": 0, "error": ""}
+        try:
+            relay_chunks = plan_relay_segments(total_v, total_a, chunk_seconds, split_mode=split_mode,
+                                               num_segments=num_segments, custom_cuts=custom_cuts)
+        except ValueError as exc:
+            # Ordinary custom ranges may be partial; only relay requires a complete budget.
+            relay_preview["error"] = str(exc)
+        else:
+            for index, (start, end, _, _) in enumerate(relay_chunks):
+                first, last = frames_for_tokens(start), frames_for_tokens(end)
+                overlap = frames_for_tokens(relay_chunks[index - 1][1]) - first if index else 0
+                relay_preview["chunks"].append(dict(segment=index + 1, start_frame=first, end_frame=last,
+                    start_sec=round(first / FPS, 2), end_sec=round(last / FPS, 2),
+                    duration_sec=round((last - first) / FPS, 2), overlap_frames=overlap,
+                    overlap_seconds=round(overlap / FPS, 3)))
+            relay_preview.update(n_chunks=len(relay_chunks), total_frames=frames_for_tokens(relay_chunks[-1][1]))
+        relay_n_chunks = relay_preview["n_chunks"]
 
         # 3. 组织人类可读的明细文本与结构化分段信息
         chunks_sec_info = []
@@ -338,6 +354,7 @@ class PJ_SegmentPlanner:
             "chunks_sec_info": chunks_sec_info,
             "n_chunks": n_chunks,
             "relay_n_chunks": relay_n_chunks,
+            "relay_preview": relay_preview,
             "effective_seconds": round(effective_seconds, 2),
             "total_frames": total_frames,
             "total_v": total_v,
@@ -366,6 +383,7 @@ class PJ_SegmentPlanner:
                 "effective_seconds": round(effective_seconds, 2),
                 "n_chunks": n_chunks,
                 "relay_n_chunks": relay_n_chunks,
+                "relay_preview": relay_preview,
                 "chunks": chunks_sec_info,
                 "zero_overlap": no_overlap,
                 "summary": summary_text,

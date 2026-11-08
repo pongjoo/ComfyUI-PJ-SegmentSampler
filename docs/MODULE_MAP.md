@@ -3,8 +3,8 @@
 | 模块 | 实际入口 | 职责和数据归属 |
 |---|---|---|
 | 节点注册 | __init__.py | 五个节点、既有二采别名及前端目录；不持有结果 |
-| 时间规划 | segment_timing.py | 帧/潜步换算、规则解析、zero_overlap、delivery_chunks；plan_relay_segments 默认先分配时长再扣接力重叠，complete_timeline=True 用于回修已有时间线；不持有张量 |
-| 规划与预览 | pj_segment_planner.py | PJ_SEGMENT_PLAN、媒体/规则预览、可选 FFmpeg 播放器 |
+| 时间规划 | segment_timing.py | 帧/潜步换算、规则解析、zero_overlap、delivery_chunks；plan_relay_segments 接收按秒/固定段数/自定义预算，连续覆盖校验后扣接力重叠，complete_timeline=True 用于回修已有时间线；不持有张量 |
+| 规划与预览 | pj_segment_planner.py | PJ_SEGMENT_PLAN、媒体/规则预览、可选 FFmpeg 播放器；relay_preview 独立记录接力窗口或错误，不覆盖普通分段字段 |
 | 空间编辑准备 | pj_h3_edit_prepare.py / PJ_H3EditPrepare.prepare | 对齐原视频、目标和 MASK，输出原生 AV LATENT/noise_mask；不拥有 SAM 或 VAE 编码 |
 | H3 条件准备与目标创建 | pj_h3_context.py / PJ_H3SegmentContext.define_schema、execute、prepare、prepare_segment_guider | V3 图片/视频/配套音轨/独立音频四组动态接口，按编号排序并配对；execute 通过原生节点创建向下对齐的目标 AV 潜空间和空提示词基础条件；上下文拥有原始媒体引用与策略，逐窗独立裁剪各路视频和配套音轨，按实际尺寸建立条件；prepare 保持单上下文返回及旧单路参数契约 |
 | 采样基础 | segment_sampling.py | 条件/遮罩切片、噪声、按交付范围融合及 SegmentCache；段缓存归采样器实例所有 |

@@ -473,6 +473,61 @@ test('relay count uses relay preview, not normal planning count', () => {
     } finally {delete uiContext.app.graph;}
 });
 
+test('relay fixed count and custom ranges ignore hidden chunk duration', () => {
+    const planner = overlapPlanner();
+    planner.type = 'PJ_SegmentPlanner';
+    uiContext.app.graph = {links: {1: {origin_id: 10}}, getNodeById() {return planner;}};
+    try {
+        const node = relayWidgets(sampler('智能缓存(仅重跑未锁定分段)', true));
+        widget(planner, 'num_segments').value = 3;
+        widget(planner, 'custom_cuts').value = '0-7,7-9';
+        for (const seconds of [4, 6, 15, 30]) {
+            widget(planner, 'chunk_seconds').value = seconds;
+            for (const [mode, count] of [['固定分段数', 3], ['自定义切点', 2]]) {
+                widget(planner, 'split_mode').value = mode;
+                refresh(node, true);
+                assert.equal(widget(node, 'relay_start_segment').options.max, count);
+            }
+        }
+    } finally {delete uiContext.app.graph;}
+});
+
+test('changing planner rules clears old preview cards as well as cached count', () => {
+    const node = overlapPlanner();
+    const content = {textContent: 'old four segments'};
+    node.widgets.push({name: 'pj_planner_dashboard', pjContent: content});
+    refreshPlanner(node);
+    node.properties.pj_preview_cache = {n_chunks: 4};
+    widget(node, 'num_segments').value = 3;
+    widget(node, 'num_segments').callback();
+    assert.equal(node.properties.pj_preview_cache, undefined);
+    assert.match(content.textContent, /规划已变更/);
+});
+
+test('relay dashboard does not replace ordinary consumer count and rejects old preview', () => {
+    const element = () => ({style: {}, children: [], appendChild(child) {this.children.push(child);}});
+    const planner = {type: 'PJ_SegmentPlanner', properties: {}, outputs: [],
+        widgets: [{name: 'pj_planner_dashboard', pjContent: element()}]};
+    const first = relayWidgets(sampler('全部重新采样(刷新全部缓存)', true));
+    first.type = 'PJ_FirstPass_SegmentSampler';
+    const graph = {_nodes: [planner, first], links: {1: {origin_id: 10}}, getNodeById() {return planner;}};
+    const dashboardContext = vm.createContext({app: {registerExtension() {}, graph},
+        document: {createElement: element}, setTimeout() {}, planner});
+    vm.runInContext(source, dashboardContext);
+    vm.runInContext('notifyDownstreamSamplers = () => {};', dashboardContext);
+    const data = {n_chunks: 4, has_media: true, total_frames: 1076, effective_seconds: 44.83, fps: 24,
+        chunks: [], relay_preview: {n_chunks: 3, total_frames: 1042, chunks: [], error: ''}};
+    dashboardContext.data = data;
+    vm.runInContext('renderPlannerDashboard(planner, data)', dashboardContext);
+    assert.equal(planner.pj_cached_n_chunks, 4);
+    let content = planner.widgets[0].pjContent;
+    assert.match(content.children[0].innerHTML, /接力预览: 3/);
+    delete data.relay_preview;
+    content.children = [];
+    vm.runInContext('renderPlannerDashboard(planner, data)', dashboardContext);
+    assert.match(content.children[1].textContent, /更新接力预览/);
+});
+
 async function executedSampler(first = true, generation = '22帧接力') {
     const rules = {split_mode: '按秒自动切分', chunk_seconds: 6, overlap_seconds: 0.5,
         num_segments: 3, custom_cuts: '0-6, 4.5-10.5, 9-15'};

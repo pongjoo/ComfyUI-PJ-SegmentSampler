@@ -312,6 +312,14 @@ function resolveTargetSegmentCount(node) {
             const preview = originNode.properties?.pj_preview_cache;
             const local = node.widgets?.find(w => w.name === "repair_action")?.value === "仅重绘目标段";
             if (!actual && !local && preview?.relay_n_chunks) return preview.relay_n_chunks;
+            const split = originNode.widgets?.find(w => w.name === "split_mode")?.value;
+            if (["固定分段数", "fixed_segments"].includes(split)) {
+                return Math.max(1, Number(originNode.widgets.find(w => w.name === "num_segments")?.value ?? 3));
+            }
+            if (["自定义切点", "custom", "custom_cuts"].includes(split)) {
+                return Math.max(1, String(originNode.widgets.find(w => w.name === "custom_cuts")?.value ?? "")
+                    .split(",").filter(s => s.includes("-")).length);
+            }
             const frames = preview?.total_frames || 345;
             const total = (!local ? actual?.input_video_tokens : null) ?? actual?.total_video_tokens ??
                 Math.max(2, Math.floor((frames - 5) / 17) * 5 + 2);
@@ -624,6 +632,10 @@ function attachSamplerHandlers(node, isFirstPass) {
                 }
                 if (isFirstPass) updateFirstPassVisibility(node);
                 else updateSecondPassVisibility(node);
+                if (isFirstPass && ["generation_mode", "repair_action"].includes(this.name)) {
+                    const planner = getUpstreamPlannerNode(node);
+                    if (planner?.properties?.pj_preview_cache) renderPlannerDashboard(planner, planner.properties.pj_preview_cache);
+                }
                 return res;
             };
         }
@@ -733,7 +745,7 @@ function setupPlannerNode(node) {
     if (customCuts) {
         customCuts.label = "处理时间范围(秒)";
         customCuts.options = customCuts.options || {};
-        customCuts.options.tooltip = "例如5-10表示只处理此范围，输出仍保持完整长度；未覆盖区域保留输入，空潜空间不会自动补生成。";
+        customCuts.options.tooltip = "普通分段：只处理所填范围，其他区域保留输入。22帧接力：填写从0连续覆盖完整输入预算的范围，例如0-15,15-30,30-45；各段时长对齐后扣接力重叠，不补尾段。";
     }
 
     function updatePlannerWidgets() {
@@ -780,8 +792,11 @@ function setupPlannerNode(node) {
                 const res = orig?.apply(this, arguments);
                 delete node.pj_cached_n_chunks;
                 if (node.properties) delete node.properties.pj_preview_cache;
+                const dashboard = node.widgets.find(w => w.name === "pj_planner_dashboard");
+                if (dashboard?.pjContent) dashboard.pjContent.textContent = "规划已变更，请执行更新预览。";
                 updatePlannerWidgets();
                 notifyDownstreamSamplers(node);
+                if (node.properties?.pj_preview_cache) renderPlannerDashboard(node, node.properties.pj_preview_cache);
                 return res;
             };
         }
@@ -809,6 +824,16 @@ function setupPlannerNode(node) {
 function renderPlannerDashboard(node, data) {
     if (!data) return;
     node.pj_cached_n_chunks = data.n_chunks;
+    const relay = app.graph?._nodes?.some(target => target.type === "PJ_FirstPass_SegmentSampler" &&
+        target.widgets?.find(w => w.name === "generation_mode")?.value === "22帧接力" &&
+        (target.widgets?.find(w => w.name === "repair_action")?.value ?? "原采样方式") === "原采样方式" &&
+        getUpstreamPlannerNode(target) === node);
+    if (relay) {
+        const preview = data.relay_preview ?? {chunks: [], n_chunks: 0, error: "请执行规划器，更新接力预览。"};
+        data = {...data, chunks: preview.chunks, n_chunks: preview.n_chunks,
+            has_video: false,
+            timing_note: preview.error || `22帧接力预览：预计交付 ${preview.total_frames} 帧 / ${(preview.total_frames / 24).toFixed(2)} 秒，不补重叠损失尾段。镜头脚本切镜时以一采实际执行为准。`};
+    }
 
     let widget = node.widgets?.find(w => w.name === "pj_planner_dashboard");
     if (!widget) {
@@ -870,8 +895,8 @@ function renderPlannerDashboard(node, data) {
     topBanner.style.fontSize = "12px";
     topBanner.style.fontWeight = "bold";
     topBanner.innerHTML = `
-        <span style="color: #38bdf8;">${isReference ? '📐 规则参考时长: ' : '🎬 媒体总时长: '}${data.effective_seconds}s (${data.total_frames}帧)</span>
-        <span style="color: #34d399;">📐 规划切分: ${data.n_chunks} 个分段</span>
+        <span style="color: #38bdf8;">${isReference ? '📐 规则参考时长: ' : relay ? '🎬 输入预算: ' : '🎬 媒体总时长: '}${data.effective_seconds}s (${data.total_frames}帧)</span>
+        <span style="color: #34d399;">📐 ${relay ? '接力预览' : '规划切分'}: ${data.n_chunks} 个分段</span>
         <span style="color: #fbbf24;">⚡ ${data.fps} FPS</span>
     `;
     container.appendChild(topBanner);
@@ -919,6 +944,8 @@ function renderPlannerDashboard(node, data) {
         tipEl.style.lineHeight = "1.5";
         if (isReference) {
             tipEl.innerHTML = `💡 <b>规则待命模式</b>：当前规划器未直连潜空间或视频，已按参考时长生成预览规则。实际采样时一采与二采将以其各自输入的潜空间长度自动动态切分！<br><span style="color:#60a5fa;">（若需100%物理潜步预览或启用播放器，可直接将潜空间或视频接入上方端口）</span>`;
+        } else if (relay) {
+            tipEl.textContent = "接力明细显示预计成片位置；原素材播放器不能代表生成后的画面。";
         } else {
             tipEl.innerHTML = `💡 <b>提示</b>：连接上方 <code>images</code> 与 <code>audio</code> 端口后，此处将自动渲染内置试听播放器，支持精准截取任意分段一键试听！`;
         }
@@ -934,7 +961,7 @@ function renderPlannerDashboard(node, data) {
     listTitle.style.fontSize = "11px";
     listTitle.style.color = "#94a3b8";
 
-    listTitle.innerHTML = `<span>📋 分段时序明细 (点击按钮精准播放对应分段):</span>`;
+    listTitle.textContent = relay ? "📋 接力分段明细（预计成片位置）:" : "📋 分段时序明细 (点击按钮精准播放对应分段):";
 
     if (videoEl) {
         const fullLoopBtn = document.createElement("button");
